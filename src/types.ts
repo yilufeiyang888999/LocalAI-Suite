@@ -1,0 +1,184 @@
+export type BackendType = 'CUDA' | 'CPUx86';
+
+export interface HardwareInfo {
+  gpu_list: GpuInfo[];
+  gpu_name: string;
+  gpu_vram_gb: number;
+  gpu_count: number;
+  has_gpu: boolean;
+  cpu: CpuInfo;
+  memory: MemoryInfo;
+  disk: DiskInfo;
+  backend: BackendType;
+  needs_manual_tier: boolean;
+  summary: string;
+}
+
+export interface GpuInfo {
+  index: number;
+  vendor: string;
+  name: string;
+  vram_gb: number;
+  driver_version: string;
+  bandwidth_gbs?: number | null;
+}
+
+export interface CpuInfo {
+  name: string;
+  cores: number;
+  threads: number;
+  arch: string;
+}
+
+export interface MemoryInfo {
+  total_gb: number;
+  available_gb: number;
+}
+
+export interface DiskInfo {
+  install_path: string;
+  available_gb: number;
+}
+
+export type Scene = 'chat' | 'writing' | 'coding' | 'knowledge' | 'roleplay';
+
+export interface ModelMetadata {
+  id: string;
+  name: string;
+  author: string;
+  base_model: string;
+  display_compression: string;
+  vram_required_gb: number;
+  file_size_mb: number;
+  context_length: number;
+  recommended_scene: Scene[];
+  chinese_score: number;
+  speed_rating: number;
+  architecture: string;
+  license: string;
+  is_installed: boolean;
+  local_path?: string | null;
+}
+
+export interface RecommendedModel {
+  model: ModelMetadata;
+  rank: 'primary' | 'alternative';
+  score: number;
+  reason: string;
+  speed_label: string;
+  quality_label: string;
+}
+
+export type DownloadStatus = 'pending' | 'downloading' | 'paused' | 'verifying' | 'failed' | 'completed' | 'cancelled';
+
+export interface DownloadProgress {
+  task_id: string;
+  model_id: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+  speed_bps: number;
+  status: DownloadStatus;
+  current_step: string;
+}
+
+export interface EngineInfo {
+  backend: BackendType;
+  version: string;
+  executable_path: string;
+  message: string;
+}
+
+export type MirrorSource = 'auto' | 'model_scope' | 'hf_mirror' | { custom: string };
+
+export interface AppSettings {
+  install_dir: string;
+  download_speed_limit?: number | null;
+  mirror_source: MirrorSource;
+  proxy?: string | null;
+  log_level: string;
+  autostart?: boolean;
+  extra_launch_args?: string | null;
+  service_host?: string;
+  service_port?: number;
+  llama_server_path?: string | null;
+  local_model_path?: string | null;
+  instance_id: string;
+}
+
+export interface InstalledModelInfo {
+  model_id: string;
+  name: string;
+  local_path: string;
+  file_size_mb: number;
+  source: 'builtin' | 'imported' | string;
+  is_current: boolean;
+  update_available: boolean;
+}
+
+export interface UpdateProgress {
+  model_id: string;
+  phase: 'downloading' | 'verifying' | 'switching' | 'starting' | 'completed' | 'rolled_back' | 'failed' | string;
+  downloaded_bytes: number;
+  total_bytes: number;
+  message: string;
+}
+
+export interface ImportedModelInfo {
+  model_id: string;
+  name: string;
+  local_path: string;
+  file_size_mb: number;
+  estimated_vram_gb: number;
+  message: string;
+}
+
+export interface ServiceInfo {
+  model_id?: string | null;
+  port?: number | null;
+  host?: string | null;
+  status: 'stopped' | 'starting' | 'running' | 'failed';
+  safe_mode: boolean;
+  message: string;
+}
+
+export interface DiagnoseResult {
+  issue_id: string;
+  title: string;
+  description: string;
+  auto_level: 'full_auto' | 'semi_auto' | 'manual_guide';
+  fixable: boolean;
+  ok: boolean;
+}
+
+export interface LowVramFixResult {
+  message: string;
+  switched: boolean;
+  suggested_model_id?: string | null;
+  service?: ServiceInfo | null;
+}
+
+export interface CatalogRefreshResult {
+  updated: boolean;
+  version: number;
+  model_count: number;
+  message: string;
+}
+
+export type RolePreset = 'daily_assistant' | 'writing' | 'coding';
+
+export interface ChatSession {
+  id: string;
+  name: string;
+  model_id: string;
+  role_preset: RolePreset;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatMessage {
+  id?: string;
+  session_id?: string;
+  role: 'user' | 'assistant';
+  content: string;
+  created_at?: string;
+}

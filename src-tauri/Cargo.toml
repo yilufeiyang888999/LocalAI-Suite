@@ -1,0 +1,42 @@
+[package]
+name = "local-ai-installer"
+version = "0.1.0"
+description = "本地AI模型一键部署助手"
+authors = ["Local AI Installer"]
+edition = "2021"
+
+[lib]
+name = "local_ai_installer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.2", features = [] }
+tauri-plugin-dialog = "2.2"
+tauri-plugin-opener = "2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.42", features = ["process", "sync", "time", "rt-multi-thread", "macros"] }
+sysinfo = "0.33"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+dirs = "5.0"
+portpicker = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+ed25519-dalek = "2"
+base64 = "0.22"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[target.'cfg(windows)'.dependencies]
+wmi = "0.15"
+windows = { version = "0.58", features = ["Win32_Foundation"] }

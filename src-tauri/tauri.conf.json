@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "本地AI模型一键部署助手",
+  "version": "0.1.0",
+  "identifier": "com.localai.installer",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "本地AI模型一键部署助手",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 960,
+        "minHeight": 640
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico"],
+    "windows": {
+      "wix": {
+        "language": ["zh-CN"]
+      },
+      "nsis": {
+        "installerHooks": "./installer-hooks.nsh"
+      }
+    }
+  }
+}

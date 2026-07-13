@@ -1,0 +1,380 @@
+use std::{
+    fs::File,
+    io::copy,
+    path::{Path, PathBuf},
+};
+
+use futures_util::StreamExt;
+use reqwest::{header, Client, StatusCode};
+use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
+use tokio::{fs, io::AsyncWriteExt};
+use zip::ZipArchive;
+
+use crate::{
+    app_state::AppState,
+    error::{AppError, AppResult},
+    settings::save_settings,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineInfo {
+    pub backend: String,
+    pub version: String,
+    pub executable_path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnsureEngineRequest {
+    pub backend: String,
+}
+
+struct EnginePackage {
+    backend: &'static str,
+    version: &'static str,
+    file_name: &'static str,
+    urls: &'static [&'static str],
+    extra_archives: &'static [EngineArchive],
+    executable_name: &'static str,
+    sha256: &'static str,
+}
+
+struct EngineArchive {
+    file_name: &'static str,
+    urls: &'static [&'static str],
+    sha256: &'static str,
+}
+
+#[tauri::command]
+pub async fn ensure_engine_ready(
+    request: EnsureEngineRequest,
+    _app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<EngineInfo> {
+    let package = engine_package(&request.backend);
+    tracing::info!(backend = %package.backend, version = %package.version, "engine preparation requested");
+    let (data_dir, install_dir) = {
+        let inner = state.inner.lock().expect("state lock poisoned");
+        (inner.data_dir.clone(), inner.settings.install_dir.clone())
+    };
+
+    let engine_dir = install_dir.join("engine");
+    let backend_dir = engine_dir.join("backends");
+    let executable_path = backend_dir.join(package.executable_name);
+
+    if !executable_path.exists() {
+        tracing::info!(file = %package.file_name, "engine not present; downloading package");
+        fs::create_dir_all(&backend_dir).await?;
+        let package_path = engine_dir.join(package.file_name);
+        download_archive(package.urls, package.sha256, package.file_name, &package_path).await?;
+        extract_engine_package(package, &package_path, &backend_dir).await?;
+        for archive in package.extra_archives {
+            let archive_path = engine_dir.join(archive.file_name);
+            download_archive(archive.urls, archive.sha256, archive.file_name, &archive_path).await?;
+            extract_dependency_archive(&archive_path, &backend_dir).await?;
+        }
+    }
+
+    if !executable_path.exists() {
+        return Err(AppError::Message(
+            "AI运行引擎文件暂时找不到，请重新安装运行引擎。".to_string(),
+        ));
+    }
+
+    fs::write(
+        engine_dir.join("current_backend.txt"),
+        package.executable_name,
+    )
+    .await?;
+    fs::write(
+        engine_dir.join("versions.json"),
+        serde_json::json!({
+            "current_backend": package.backend,
+            "version": package.version,
+            "executable": package.executable_name,
+            "source": package.urls[0],
+        })
+        .to_string(),
+    )
+    .await?;
+
+    {
+        let mut inner = state.inner.lock().expect("state lock poisoned");
+        inner.settings.llama_server_path = Some(executable_path.clone());
+        save_settings(&data_dir, &inner.settings)?;
+    }
+
+    tracing::info!(backend = %package.backend, version = %package.version, "engine ready");
+    Ok(EngineInfo {
+        backend: package.backend.to_string(),
+        version: package.version.to_string(),
+        executable_path: executable_path.to_string_lossy().to_string(),
+        message: "AI运行引擎已准备好。".to_string(),
+    })
+}
+
+fn engine_package(backend: &str) -> &'static EnginePackage {
+    static CPU_URLS: [&str; 2] = [
+        "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
+        "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
+    ];
+    static CUDA_URLS: [&str; 2] = [
+        "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
+        "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
+    ];
+    static CUDA_RUNTIME_URLS: [&str; 2] = [
+        "https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
+        "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
+    ];
+    static CPU: EnginePackage = EnginePackage {
+        backend: "CPUx86",
+        version: "b9837",
+        file_name: "llama-b9837-bin-win-cpu-x64.zip",
+        urls: &CPU_URLS,
+        extra_archives: &[],
+        executable_name: "llama-server-cpu.exe",
+        sha256: "d53a9a0107c088d57592e4a43bf56ec3e3d274e9e45413d7d5c9bec583d173fd",
+    };
+    static CUDA_EXTRA: [EngineArchive; 1] = [EngineArchive {
+        file_name: "cudart-llama-bin-win-cuda-12.4-x64.zip",
+        urls: &CUDA_RUNTIME_URLS,
+        sha256: "4d3a95c9c6c5ed34341b581c83ba84e8de4d2f4dbaff567b9446d5136055691f",
+    }];
+    static CUDA: EnginePackage = EnginePackage {
+        backend: "CUDA",
+        version: "b9837",
+        file_name: "llama-b9837-bin-win-cuda-12.4-x64.zip",
+        urls: &CUDA_URLS,
+        extra_archives: &CUDA_EXTRA,
+        executable_name: "llama-server-cuda.exe",
+        sha256: "4b21072c3352f88e9faa03175dd218fec64379346059b18d6e7d4b739d213f48",
+    };
+
+    if backend.eq_ignore_ascii_case("cuda") {
+        &CUDA
+    } else {
+        &CPU
+    }
+}
+
+async fn download_archive(urls: &[&str], sha256: &str, file_name: &str, package_path: &Path) -> AppResult<()> {
+    let mut last_error = "当前网络无法连接运行引擎下载源，请稍后重试。".to_string();
+    for url in urls {
+        match try_download_archive_with_retry(url, sha256, file_name, package_path).await {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    Err(AppError::Message(last_error))
+}
+
+async fn try_download_archive_with_retry(url: &str, sha256: &str, file_name: &str, package_path: &Path) -> AppResult<()> {
+    let mut last_error = "当前网络无法连接运行引擎下载源，请稍后重试。".to_string();
+    for attempt in 0..3 {
+        match try_download_archive(url, sha256, file_name, package_path).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = error.to_string();
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_secs(2_u64.pow(attempt + 1))).await;
+                }
+            }
+        }
+    }
+    Err(AppError::Message(last_error))
+}
+
+async fn try_download_archive(url: &str, sha256: &str, file_name: &str, package_path: &Path) -> AppResult<()> {
+    if !url.starts_with("https://") || url.contains("placeholder") {
+        return Err(AppError::Message("运行引擎下载源尚未配置。".to_string()));
+    }
+
+    let tmp_path = package_path.with_extension("zip.tmp");
+    let client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(60 * 30))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|_| AppError::Message("运行引擎下载组件暂时没能启动，请稍后再试。".to_string()))?;
+
+    // Resume from a partial `.tmp` left by an interrupted attempt or mirror.
+    // All URLs point at the same release asset, so bytes are interchangeable.
+    let existing = fs::metadata(&tmp_path)
+        .await
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let mut request = client.get(url);
+    if existing > 0 {
+        request = request.header(header::RANGE, format!("bytes={}-", existing));
+    }
+    let response = request.send().await.map_err(|_| {
+        AppError::Message("当前网络无法连接运行引擎下载源，请稍后重试。".to_string())
+    })?;
+
+    if !(response.status().is_success() || response.status() == StatusCode::PARTIAL_CONTENT) {
+        return Err(AppError::Message(
+            "运行引擎下载源暂时不可用，请稍后重试。".to_string(),
+        ));
+    }
+
+    // 206 means the server honored the range: append. Anything else (including a
+    // 200 that ignored our range) starts the file over.
+    let mut file = if response.status() == StatusCode::PARTIAL_CONTENT {
+        fs::OpenOptions::new().append(true).open(&tmp_path).await?
+    } else {
+        fs::File::create(&tmp_path).await?
+    };
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|_| AppError::Message("运行引擎下载中断了，请稍后重试。".to_string()))?;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+
+    // A verification failure means the bytes on disk are unusable (corrupt or a
+    // botched resume), so drop the `.tmp` to force a clean re-download next time.
+    if let Err(error) = verify_sha256(&tmp_path, sha256).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(error);
+    }
+    if let Err(error) = crate::manifest::verify_file(&format!("engine:{}", file_name), &tmp_path).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(error);
+    }
+
+    if package_path.exists() {
+        fs::remove_file(package_path).await?;
+    }
+    fs::rename(&tmp_path, package_path).await?;
+    Ok(())
+}
+
+async fn verify_sha256(path: &Path, expected: &str) -> AppResult<()> {
+    if !crate::hash::is_configured(expected) {
+        return Err(AppError::Message(
+            "运行引擎校验信息尚未配置，请先补充真实校验值。".to_string(),
+        ));
+    }
+
+    let actual = crate::hash::file_sha256_hex(path).await?;
+    if !crate::hash::matches(expected, &actual) {
+        return Err(AppError::Message(
+            "运行引擎文件检查不通过，请重新下载。".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn extract_engine_package(
+    package: &EnginePackage,
+    package_path: &Path,
+    backend_dir: &Path,
+) -> AppResult<()> {
+    let package_path = package_path.to_path_buf();
+    let backend_dir = backend_dir.to_path_buf();
+    let executable_name = package.executable_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        extract_zip_blocking(&package_path, &backend_dir, &executable_name)
+    })
+    .await
+    .map_err(|_| AppError::Message("运行引擎解压失败，请稍后重试。".to_string()))?
+}
+
+async fn extract_dependency_archive(package_path: &Path, backend_dir: &Path) -> AppResult<()> {
+    let package_path = package_path.to_path_buf();
+    let backend_dir = backend_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        extract_dependency_zip_blocking(&package_path, &backend_dir)
+    })
+    .await
+    .map_err(|_| AppError::Message("运行引擎依赖解压失败，请稍后重试。".to_string()))?
+}
+
+fn extract_dependency_zip_blocking(package_path: &Path, backend_dir: &Path) -> AppResult<()> {
+    std::fs::create_dir_all(backend_dir)?;
+    let file = File::open(package_path)?;
+    let mut archive = ZipArchive::new(file)
+        .map_err(|_| AppError::Message("运行引擎依赖包暂时无法打开，请重新下载。".to_string()))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|_| {
+            AppError::Message("运行引擎依赖包暂时无法读取，请重新下载。".to_string())
+        })?;
+        if entry.is_dir() {
+            continue;
+        }
+
+        let Some(name) = PathBuf::from(entry.name())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if !name.to_ascii_lowercase().ends_with(".dll") {
+            continue;
+        }
+
+        let output_path = backend_dir.join(name);
+        let mut output = File::create(output_path)?;
+        copy(&mut entry, &mut output)?;
+    }
+
+    Ok(())
+}
+
+fn extract_zip_blocking(
+    package_path: &Path,
+    backend_dir: &Path,
+    executable_name: &str,
+) -> AppResult<()> {
+    std::fs::create_dir_all(backend_dir)?;
+    let file = File::open(package_path)?;
+    let mut archive = ZipArchive::new(file)
+        .map_err(|_| AppError::Message("运行引擎压缩包暂时无法打开，请重新下载。".to_string()))?;
+    let mut found_server = false;
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|_| {
+            AppError::Message("运行引擎压缩包暂时无法读取，请重新下载。".to_string())
+        })?;
+        if entry.is_dir() {
+            continue;
+        }
+
+        let Some(name) = PathBuf::from(entry.name())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let lower_name = name.to_ascii_lowercase();
+        let should_extract = lower_name.ends_with(".dll")
+            || lower_name == "ggml-metal.metal"
+            || lower_name == "ggml-cuda.dll"
+            || lower_name == "llama-server.exe";
+        if !should_extract {
+            continue;
+        }
+
+        let output_name = if lower_name == "llama-server.exe" {
+            found_server = true;
+            executable_name.to_string()
+        } else {
+            name
+        };
+        let output_path = backend_dir.join(output_name);
+        let mut output = File::create(output_path)?;
+        copy(&mut entry, &mut output)?;
+    }
+
+    if !found_server {
+        return Err(AppError::Message(
+            "运行引擎包里没有找到可启动文件，请稍后重试。".to_string(),
+        ));
+    }
+    Ok(())
+}
