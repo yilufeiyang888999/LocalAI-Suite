@@ -1,4 +1,4 @@
-export type BackendType = 'CUDA' | 'CPUx86';
+export type BackendType = 'CUDA' | 'Vulkan' | 'CPUx86';
 
 export interface HardwareInfo {
   gpu_list: GpuInfo[];
@@ -102,6 +102,7 @@ export interface AppSettings {
   service_port?: number;
   llama_server_path?: string | null;
   local_model_path?: string | null;
+  ai_display_name?: string | null;
   instance_id: string;
 }
 
@@ -129,6 +130,35 @@ export interface ImportedModelInfo {
   local_path: string;
   file_size_mb: number;
   estimated_vram_gb: number;
+  message: string;
+}
+
+export interface UninstallResult {
+  model_id: string;
+  source: 'builtin' | 'imported' | string;
+  deleted_chat_sessions: number;
+  cleared_current_model: boolean;
+  message: string;
+}
+
+export interface DataPaths {
+  data_dir: string;
+  install_dir: string;
+  logs_dir: string;
+}
+
+export interface ClearChatResult {
+  deleted_sessions: number;
+  message: string;
+}
+
+export interface UninstallAllResult {
+  removed_count: number;
+  failed_count: number;
+  message: string;
+}
+
+export interface ResetResult {
   message: string;
 }
 

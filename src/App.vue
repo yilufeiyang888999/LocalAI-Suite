@@ -9,6 +9,7 @@ import InstalledModels from './components/InstalledModels.vue';
 import SettingsPanel from './components/SettingsPanel.vue';
 import DiagnosticsPanel from './components/DiagnosticsPanel.vue';
 import ChatView from './components/ChatView.vue';
+import ThirdPartyConnect from './components/ThirdPartyConnect.vue';
 import {
   ensureEngineReady,
   getHardwareInfo,
@@ -16,6 +17,7 @@ import {
   getDownloadProgress,
   getServiceStatus,
   getSettings,
+  importLocalModel,
   listInstalledModels,
   recoverService,
   runDiagnose,
@@ -26,10 +28,13 @@ import {
   resumeDownload,
   cancelDownload,
   startModelService,
+  stopModelService,
   switchInstalledModel,
+  uninstallModel,
   updateInstalledModel
 } from './api/tauri';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import type {
   AppSettings,
   DiagnoseResult,
@@ -59,6 +64,8 @@ const installedModelsLoading = ref(false);
 const switchingModelPath = ref<string | null>(null);
 const updatingModelId = ref<string | null>(null);
 const updateMessage = ref<string | null>(null);
+const uninstallingModelId = ref<string | null>(null);
+const importingLocalModel = ref(false);
 const restoringGpu = ref(false);
 const diagnoseResults = ref<DiagnoseResult[]>([]);
 const diagnoseLoading = ref(false);
@@ -279,6 +286,65 @@ async function updateModel(model: InstalledModelInfo) {
   }
 }
 
+async function stopService() {
+  serviceMessage.value = '正在停止AI服务。';
+  try {
+    service.value = await stopModelService();
+    serviceMessage.value = service.value.message;
+  } catch (error) {
+    serviceMessage.value = String(error);
+    service.value = await getServiceStatus();
+  }
+}
+
+async function startCurrentModel(model: InstalledModelInfo) {
+  serviceMessage.value = `正在启动 ${model.name}。`;
+  try {
+    await prepareEngineAndStart(model.model_id);
+    await loadInstalledModels();
+  } catch (error) {
+    serviceMessage.value = String(error);
+    service.value = await getServiceStatus();
+  }
+}
+
+async function uninstallModelAndRefresh(model: InstalledModelInfo, deleteChatHistory: boolean) {
+  if (uninstallingModelId.value) return;
+  uninstallingModelId.value = model.model_id;
+  serviceMessage.value = `正在卸载 ${model.name}。`;
+  try {
+    const result = await uninstallModel(model.model_id, deleteChatHistory, model.local_path);
+    serviceMessage.value = result.message;
+    settings.value = await getSettings();
+    await loadInstalledModels();
+  } catch (error) {
+    serviceMessage.value = String(error);
+  } finally {
+    uninstallingModelId.value = null;
+  }
+}
+
+async function importLocalGguf() {
+  if (importingLocalModel.value) return;
+  const selected = await openFileDialog({
+    multiple: false,
+    filters: [{ name: '模型文件', extensions: ['gguf'] }]
+  });
+  if (typeof selected !== 'string') return;
+  importingLocalModel.value = true;
+  serviceMessage.value = '正在导入本地模型文件。';
+  try {
+    const imported = await importLocalModel(selected);
+    serviceMessage.value = imported.message;
+    settings.value = await getSettings();
+    await loadInstalledModels();
+  } catch (error) {
+    serviceMessage.value = String(error);
+  } finally {
+    importingLocalModel.value = false;
+  }
+}
+
 async function tryStartService(modelId: string) {
   try {
     service.value = await startModelService(modelId);
@@ -318,6 +384,14 @@ async function restartService() {
     serviceMessage.value = String(error);
     service.value = await getServiceStatus();
   }
+}
+
+async function handleDataChanged() {
+  // After batch data-mgmt operations (clear all chat, uninstall all, reset)
+  // refresh everything the UI reads from disk/DB so state doesn't go stale.
+  settings.value = await getSettings();
+  await loadInstalledModels();
+  service.value = await getServiceStatus();
 }
 
 async function runChecks() {
@@ -409,10 +483,16 @@ async function handleFix(issueId: string) {
           :switching-path="switchingModelPath"
           :updating-id="updatingModelId"
           :update-message="updateMessage"
+          :uninstalling-id="uninstallingModelId"
+          :importing="importingLocalModel"
           :service="service"
           @refresh="loadInstalledModels"
           @switch="switchModel"
           @update="updateModel"
+          @stop="stopService"
+          @start="startCurrentModel"
+          @uninstall="uninstallModelAndRefresh"
+          @import="importLocalGguf"
         />
         <ChatView
           :service="service"
@@ -421,9 +501,15 @@ async function handleFix(issueId: string) {
           @restore-gpu="restoreGpuAcceleration"
           @restart-service="restartService"
         />
+        <ThirdPartyConnect :service="service" :settings="settings" />
       </div>
       <aside class="side-flow">
-        <SettingsPanel :settings="settings" @saved="settings = $event; loadInstalledModels()" />
+        <SettingsPanel
+          :settings="settings"
+          :model-id="service?.model_id ?? null"
+          @saved="settings = $event; loadInstalledModels()"
+          @data-changed="handleDataChanged"
+        />
         <DiagnosticsPanel
           :results="diagnoseResults"
           :loading="diagnoseLoading"

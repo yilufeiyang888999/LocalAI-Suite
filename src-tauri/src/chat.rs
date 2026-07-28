@@ -313,6 +313,29 @@ fn delete_messages(connection: &Connection, session_id: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Delete every chat session bound to a given model, along with all their
+/// messages. Used by the uninstall flow when the user opts in to also wiping
+/// chat history for the model being removed. Returns the number of sessions
+/// that were removed (0 is a normal outcome — no sessions ever existed).
+pub fn delete_chat_sessions_for_model(
+    db_path: &std::path::Path,
+    model_id: &str,
+) -> AppResult<u32> {
+    let connection = Connection::open(db_path)?;
+    // Wipe messages first so we don't leave orphans if the second statement
+    // fails partway. Runs as one SQL statement with a subquery, no explicit tx.
+    connection.execute(
+        "DELETE FROM chat_messages
+         WHERE session_id IN (SELECT id FROM chat_sessions WHERE model_id = ?1)",
+        [model_id],
+    )?;
+    let deleted = connection.execute(
+        "DELETE FROM chat_sessions WHERE model_id = ?1",
+        [model_id],
+    )?;
+    Ok(deleted as u32)
+}
+
 fn ensure_session_exists(connection: &Connection, session_id: &str) -> AppResult<()> {
     let exists = connection
         .query_row(
@@ -466,5 +489,51 @@ mod tests {
 
         assert!(query_sessions(&conn).unwrap().is_empty());
         assert!(query_messages(&conn, &session.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_all_sessions_for_a_model_leaves_other_models_alone() {
+        let temp = TempDb::new();
+
+        // Two sessions for the model being uninstalled, one for an untouched model.
+        let mut targeted_a = sample_session();
+        targeted_a.model_id = "target-model".to_string();
+        let mut targeted_b = sample_session();
+        targeted_b.id = Uuid::new_v4().to_string();
+        targeted_b.model_id = "target-model".to_string();
+        let mut other = sample_session();
+        other.id = Uuid::new_v4().to_string();
+        other.model_id = "keep-model".to_string();
+
+        {
+            let conn = temp.open();
+            for session in [&targeted_a, &targeted_b, &other] {
+                insert_session(&conn, session).unwrap();
+                insert_message(
+                    &conn,
+                    &ChatMessage {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: session.id.clone(),
+                        role: MessageRole::User,
+                        content: "hi".to_string(),
+                        created_at: "2026-07-01T00:00:00Z".to_string(),
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        let removed = delete_chat_sessions_for_model(&temp.db, "target-model").unwrap();
+        assert_eq!(removed, 2);
+
+        let conn = temp.open();
+        let remaining = query_sessions(&conn).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].model_id, "keep-model");
+        // Messages for the untouched session must survive.
+        assert_eq!(query_messages(&conn, &other.id).unwrap().len(), 1);
+        // And messages for the wiped sessions must be gone.
+        assert!(query_messages(&conn, &targeted_a.id).unwrap().is_empty());
+        assert!(query_messages(&conn, &targeted_b.id).unwrap().is_empty());
     }
 }

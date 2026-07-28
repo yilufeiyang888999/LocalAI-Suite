@@ -4,6 +4,8 @@ import type {
   CatalogRefreshResult,
   ChatMessage,
   ChatSession,
+  ClearChatResult,
+  DataPaths,
   DiagnoseResult,
   DownloadProgress,
   EngineInfo,
@@ -12,9 +14,12 @@ import type {
   InstalledModelInfo,
   LowVramFixResult,
   RecommendedModel,
+  ResetResult,
   RolePreset,
   Scene,
-  ServiceInfo
+  ServiceInfo,
+  UninstallAllResult,
+  UninstallResult
 } from '../types';
 
 export function getHardwareInfo() {
@@ -105,6 +110,26 @@ export function switchInstalledModel(path: string) {
 
 export function updateInstalledModel(modelId: string) {
   return invoke<ServiceInfo>('update_installed_model', { modelId });
+}
+
+export function uninstallModel(modelId: string, deleteChatHistory: boolean, localPath?: string) {
+  return invoke<UninstallResult>('uninstall_model', { modelId, deleteChatHistory, localPath });
+}
+
+export function getDataPaths() {
+  return invoke<DataPaths>('get_data_paths');
+}
+
+export function clearAllChatRecords() {
+  return invoke<ClearChatResult>('clear_all_chat_records');
+}
+
+export function uninstallAllModels() {
+  return invoke<UninstallAllResult>('uninstall_all_models');
+}
+
+export function resetToFactory() {
+  return invoke<ResetResult>('reset_to_factory');
 }
 
 export function importLocalModel(path: string) {

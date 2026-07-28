@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
+import { confirm } from '@tauri-apps/plugin-dialog';
 import {
   clearChatContext,
   createChatSession,
@@ -31,6 +32,12 @@ const loadingHistory = ref(false);
 const error = ref<string | null>(null);
 const temperature = ref(0.7);
 let abortController: AbortController | null = null;
+
+// The AI's self-reported name — opt-in. Empty unless the user set a custom
+// name in settings, in which case systemPromptFor prepends an identity clause.
+// Left empty, no identity is injected and the model answers "who are you" on
+// its own (correct for architecture-derived models like Qwen-based finetunes).
+const aiIdentity = computed(() => props.settings?.ai_display_name?.trim() || '');
 
 const lanIp = ref<string | null>(null);
 onMounted(async () => {
@@ -147,7 +154,7 @@ async function renameCurrent(session: ChatSession) {
 }
 
 async function removeSession(session: ChatSession) {
-  if (!window.confirm(`确定删除对话「${session.name}」及其聊天记录吗？`)) return;
+  if (!(await confirm(`确定删除对话「${session.name}」及其聊天记录吗？`, { title: '删除对话', kind: 'warning' }))) return;
   try {
     await deleteChatSession(session.id);
     sessions.value = sessions.value.filter((item) => item.id !== session.id);
@@ -174,7 +181,7 @@ async function selectRole(role: RolePreset) {
 
 async function clearContext() {
   if (!currentSession.value) return;
-  if (!window.confirm('清空当前对话上下文？历史消息会保留，但AI会忘记之前的内容。')) return;
+  if (!(await confirm('清空当前对话上下文？历史消息会保留，但AI会忘记之前的内容。', { title: '清空上下文', kind: 'warning' }))) return;
   try {
     await clearChatContext(currentSession.value.id);
     messages.value = [];
@@ -230,7 +237,7 @@ async function send() {
       signal: abortController.signal,
       body: JSON.stringify({
         model: props.service.model_id ?? 'local-model',
-        messages: [{ role: 'system', content: systemPromptFor(currentRole.value) }, ...priorTurns],
+        messages: [{ role: 'system', content: systemPromptFor(currentRole.value, aiIdentity.value) }, ...priorTurns],
         temperature: temperature.value,
         stream: true
       })

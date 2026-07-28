@@ -6,7 +6,7 @@ use sysinfo::Disks;
 use crate::{
     app_state::AppState,
     error::{AppError, AppResult},
-    hardware::detect_hardware,
+    hardware::{detect_hardware, parse_driver_version},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +151,11 @@ fn eval_port(default_free: bool) -> DiagnoseResult {
 }
 
 fn eval_driver(has_gpu: bool, driver_version: Option<f64>, min: f64) -> DiagnoseResult {
+    // With Vulkan as the default GPU backend, acceleration only needs the
+    // driver's Vulkan ICD (bundled with modern NVIDIA/AMD/Intel drivers), not the
+    // CUDA 12.4 runtime's driver floor. So this check never fails the launch — a
+    // low driver is just an informational nudge; if acceleration can't start we
+    // still fall back to CPU automatically.
     let (ok, description) = if !has_gpu {
         (
             true,
@@ -158,20 +163,20 @@ fn eval_driver(has_gpu: bool, driver_version: Option<f64>, min: f64) -> Diagnose
         )
     } else {
         match driver_version {
-            Some(version) if version >= min => (
+            Some(version) if version < min => (
                 true,
-                "显卡驱动版本满足显卡加速要求。".to_string(),
-            ),
-            Some(version) => (
-                false,
                 format!(
-                    "显卡驱动版本偏低（{:.2}），显卡加速可能用不了，可到显卡官网升级驱动；在此之前会自动使用更稳妥的 CPU 模式。",
+                    "显卡驱动版本较早（{:.2}）。当前使用通用显卡加速（Vulkan），一般仍可正常加速；如果加速用不上，建议到显卡官网升级驱动，在此之前会自动使用更稳妥的 CPU 模式。",
                     version
                 ),
             ),
+            Some(_) => (
+                true,
+                "显卡驱动版本满足显卡加速要求。".to_string(),
+            ),
             None => (
                 true,
-                "检测到独立显卡，但暂时没读到驱动版本；若显卡加速启动失败会自动切换 CPU 模式。".to_string(),
+                "检测到独立显卡，将尝试通用显卡加速；若启动失败会自动切换 CPU 模式。".to_string(),
             ),
         }
     };
@@ -179,7 +184,8 @@ fn eval_driver(has_gpu: bool, driver_version: Option<f64>, min: f64) -> Diagnose
         issue_id: "gpu_driver".to_string(),
         title: "显卡驱动版本检查".to_string(),
         description,
-        // Driver upgrade needs the user (§3.7.2 C级).
+        // Driver upgrade needs the user (§3.7.2 C级), but Vulkan means it's never
+        // a hard blocker — this stays informational.
         auto_level: AutoLevel::ManualGuide,
         fixable: !ok,
         ok,
@@ -217,6 +223,14 @@ fn eval_vram(has_gpu: bool, vram_gb: f64, smallest_need_gb: f64, safe_mode: bool
             true,
             "显卡加速暂时没用上，正在以更稳妥的 CPU 模式运行；显存充足时可尝试恢复显卡加速。".to_string(),
         )
+    } else if vram_gb <= 0.0 {
+        // Non-NVIDIA (AMD/Intel) cards: VRAM isn't reliably readable, so this is
+        // informational rather than a failure — the launch tries acceleration and
+        // falls back to CPU automatically if VRAM turns out to be too small.
+        (
+            true,
+            "检测到显卡但暂时读不到显存大小，将尝试显卡加速；如果显存不足会自动改用更省资源的方式或 CPU 模式。".to_string(),
+        )
     } else if vram_gb >= smallest_need_gb {
         (
             true,
@@ -243,14 +257,6 @@ fn eval_vram(has_gpu: bool, vram_gb: f64, smallest_need_gb: f64, safe_mode: bool
 }
 
 // --- Impure helpers ---------------------------------------------------------
-
-fn parse_driver_version(raw: &str) -> Option<f64> {
-    let raw = raw.trim();
-    let mut parts = raw.split('.');
-    let major = parts.next()?;
-    let minor = parts.next().unwrap_or("0");
-    format!("{}.{}", major, minor).parse::<f64>().ok()
-}
 
 fn count_backend_dlls(install_dir: &Path) -> usize {
     let backend_dir = install_dir.join("engine").join("backends");
@@ -315,15 +321,18 @@ mod tests {
     }
 
     #[test]
-    fn driver_check_handles_gpu_absence_and_versions() {
+    fn driver_check_is_informational_only() {
+        // No GPU: ok, not fixable.
         assert!(eval_driver(false, None, MIN_NVIDIA_DRIVER).ok);
+        // Recent driver: ok.
         assert!(eval_driver(true, Some(552.44), MIN_NVIDIA_DRIVER).ok);
 
+        // A driver below the old CUDA floor no longer fails — Vulkan doesn't need
+        // it, so this is informational (ok, never fixable).
         let low = eval_driver(true, Some(537.58), MIN_NVIDIA_DRIVER);
-        assert!(!low.ok && low.fixable);
-        assert_eq!(low.auto_level, AutoLevel::ManualGuide);
+        assert!(low.ok && !low.fixable);
 
-        // Unknown version must not hard-fail.
+        // Unknown version must not hard-fail either.
         assert!(eval_driver(true, None, MIN_NVIDIA_DRIVER).ok);
     }
 
@@ -341,16 +350,12 @@ mod tests {
         assert!(eval_vram(false, 0.0, SMALLEST_VRAM_NEED_GB, false).ok);
         assert!(eval_vram(true, 8.0, SMALLEST_VRAM_NEED_GB, false).ok);
         assert!(eval_vram(true, 8.0, SMALLEST_VRAM_NEED_GB, true).ok);
+        // GPU present but VRAM unknown (AMD/Intel): informational, not a failure.
+        let unknown = eval_vram(true, 0.0, SMALLEST_VRAM_NEED_GB, false);
+        assert!(unknown.ok && !unknown.fixable);
+        // Known-small NVIDIA VRAM still flags for the auto smaller-model fix.
         let small = eval_vram(true, 1.0, SMALLEST_VRAM_NEED_GB, false);
         assert!(!small.ok);
         assert_eq!(small.auto_level, AutoLevel::FullAuto);
-    }
-
-    #[test]
-    fn driver_version_parsing() {
-        assert_eq!(parse_driver_version("551.86"), Some(551.86));
-        assert_eq!(parse_driver_version(" 552.44 "), Some(552.44));
-        assert_eq!(parse_driver_version("551.86.01"), Some(551.86));
-        assert_eq!(parse_driver_version("n/a"), None);
     }
 }

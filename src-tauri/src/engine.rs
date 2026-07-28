@@ -63,23 +63,23 @@ pub async fn ensure_engine_ready(
     let backend_dir = engine_dir.join("backends");
     let executable_path = backend_dir.join(package.executable_name);
 
-    if !executable_path.exists() {
-        tracing::info!(file = %package.file_name, "engine not present; downloading package");
-        fs::create_dir_all(&backend_dir).await?;
-        let package_path = engine_dir.join(package.file_name);
-        download_archive(package.urls, package.sha256, package.file_name, &package_path).await?;
-        extract_engine_package(package, &package_path, &backend_dir).await?;
-        for archive in package.extra_archives {
-            let archive_path = engine_dir.join(archive.file_name);
-            download_archive(archive.urls, archive.sha256, archive.file_name, &archive_path).await?;
-            extract_dependency_archive(&archive_path, &backend_dir).await?;
-        }
-    }
+    prepare_package(package, &engine_dir, &backend_dir).await?;
 
     if !executable_path.exists() {
         return Err(AppError::Message(
             "AI运行引擎文件暂时找不到，请重新安装运行引擎。".to_string(),
         ));
+    }
+
+    // A GPU backend can still fail to launch on a given machine (missing Vulkan
+    // ICD, driver too old for the CUDA build, etc.), in which case the service
+    // falls back to CPU safe mode — which needs `llama-server-cpu.exe` present.
+    // Prepare the small CPU package alongside so that fallback actually works.
+    // Best-effort: a CPU download failure must not block a working GPU backend.
+    if package.backend != CPU.backend {
+        if let Err(error) = prepare_package(&CPU, &engine_dir, &backend_dir).await {
+            tracing::warn!(error = %error, "failed to prepare CPU fallback engine alongside GPU backend");
+        }
     }
 
     fs::write(
@@ -114,48 +114,107 @@ pub async fn ensure_engine_ready(
     })
 }
 
-fn engine_package(backend: &str) -> &'static EnginePackage {
-    static CPU_URLS: [&str; 2] = [
-        "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
-        "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
-    ];
-    static CUDA_URLS: [&str; 2] = [
-        "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
-        "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
-    ];
-    static CUDA_RUNTIME_URLS: [&str; 2] = [
-        "https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
-        "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
-    ];
-    static CPU: EnginePackage = EnginePackage {
-        backend: "CPUx86",
-        version: "b9837",
-        file_name: "llama-b9837-bin-win-cpu-x64.zip",
-        urls: &CPU_URLS,
-        extra_archives: &[],
-        executable_name: "llama-server-cpu.exe",
-        sha256: "d53a9a0107c088d57592e4a43bf56ec3e3d274e9e45413d7d5c9bec583d173fd",
-    };
-    static CUDA_EXTRA: [EngineArchive; 1] = [EngineArchive {
-        file_name: "cudart-llama-bin-win-cuda-12.4-x64.zip",
-        urls: &CUDA_RUNTIME_URLS,
-        sha256: "4d3a95c9c6c5ed34341b581c83ba84e8de4d2f4dbaff567b9446d5136055691f",
-    }];
-    static CUDA: EnginePackage = EnginePackage {
-        backend: "CUDA",
-        version: "b9837",
-        file_name: "llama-b9837-bin-win-cuda-12.4-x64.zip",
-        urls: &CUDA_URLS,
-        extra_archives: &CUDA_EXTRA,
-        executable_name: "llama-server-cuda.exe",
-        sha256: "4b21072c3352f88e9faa03175dd218fec64379346059b18d6e7d4b739d213f48",
-    };
+static CPU_URLS: [&str; 2] = [
+    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
+    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
+];
+static CUDA_URLS: [&str; 2] = [
+    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
+    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
+];
+static CUDA_RUNTIME_URLS: [&str; 2] = [
+    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
+];
+static VULKAN_URLS: [&str; 2] = [
+    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-vulkan-x64.zip",
+    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-vulkan-x64.zip",
+];
+static CPU: EnginePackage = EnginePackage {
+    backend: "CPUx86",
+    version: "b9837",
+    file_name: "llama-b9837-bin-win-cpu-x64.zip",
+    urls: &CPU_URLS,
+    extra_archives: &[],
+    executable_name: "llama-server-cpu.exe",
+    sha256: "d53a9a0107c088d57592e4a43bf56ec3e3d274e9e45413d7d5c9bec583d173fd",
+};
+static CUDA_EXTRA: [EngineArchive; 1] = [EngineArchive {
+    file_name: "cudart-llama-bin-win-cuda-12.4-x64.zip",
+    urls: &CUDA_RUNTIME_URLS,
+    sha256: "8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+}];
+static CUDA: EnginePackage = EnginePackage {
+    backend: "CUDA",
+    version: "b9837",
+    file_name: "llama-b9837-bin-win-cuda-12.4-x64.zip",
+    urls: &CUDA_URLS,
+    extra_archives: &CUDA_EXTRA,
+    executable_name: "llama-server-cuda.exe",
+    sha256: "4b21072c3352f88e9faa03175dd218fec64379346059b18d6e7d4b739d213f48",
+};
+// Vulkan is the default GPU backend: it relies only on the driver's Vulkan
+// ICD (bundled with modern NVIDIA/AMD/Intel drivers), so it dodges the CUDA
+// 12.4 runtime's driver floor and covers all three vendors from one package.
+static VULKAN: EnginePackage = EnginePackage {
+    backend: "Vulkan",
+    version: "b9837",
+    file_name: "llama-b9837-bin-win-vulkan-x64.zip",
+    urls: &VULKAN_URLS,
+    extra_archives: &[],
+    executable_name: "llama-server-vulkan.exe",
+    sha256: "2bec9f5c97f9b9f83974375c551853afc30477e6391fb970e834c12558f44719",
+};
 
-    if backend.eq_ignore_ascii_case("cuda") {
+fn engine_package(backend: &str) -> &'static EnginePackage {
+    if backend.eq_ignore_ascii_case("vulkan") {
+        &VULKAN
+    } else if backend.eq_ignore_ascii_case("cuda") {
         &CUDA
     } else {
         &CPU
     }
+}
+
+/// Every engine archive that ships with the app, as `(file_id, sha256)` pairs
+/// (`file_id` is `engine:<zip name>`). This is the single source of truth the
+/// offline manifest signer reads, so the signed manifest can never drift from
+/// the hashes the downloader actually enforces.
+pub fn engine_manifest_entries() -> Vec<(String, String)> {
+    let mut entries = vec![
+        (format!("engine:{}", CPU.file_name), CPU.sha256.to_string()),
+        (format!("engine:{}", VULKAN.file_name), VULKAN.sha256.to_string()),
+        (format!("engine:{}", CUDA.file_name), CUDA.sha256.to_string()),
+    ];
+    for extra in CUDA.extra_archives {
+        entries.push((format!("engine:{}", extra.file_name), extra.sha256.to_string()));
+    }
+    entries
+}
+
+// Download + extract one engine package (and any dependency archives such as
+// the CUDA runtime). No-op if the target executable is already present.
+async fn prepare_package(
+    package: &EnginePackage,
+    engine_dir: &Path,
+    backend_dir: &Path,
+) -> AppResult<()> {
+    let executable_path = backend_dir.join(package.executable_name);
+    if executable_path.exists() {
+        return Ok(());
+    }
+
+    tracing::info!(file = %package.file_name, "engine not present; downloading package");
+    fs::create_dir_all(backend_dir).await?;
+    let package_path = engine_dir.join(package.file_name);
+    download_archive(package.urls, package.sha256, package.file_name, &package_path).await?;
+    extract_engine_package(package, &package_path, backend_dir).await?;
+    for archive in package.extra_archives {
+        let archive_path = engine_dir.join(archive.file_name);
+        download_archive(archive.urls, archive.sha256, archive.file_name, &archive_path).await?;
+        extract_dependency_archive(&archive_path, backend_dir).await?;
+    }
+    Ok(())
 }
 
 async fn download_archive(urls: &[&str], sha256: &str, file_name: &str, package_path: &Path) -> AppResult<()> {

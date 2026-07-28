@@ -41,6 +41,7 @@ pub enum GpuVendor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BackendType {
     CUDA,
+    Vulkan,
     CPUx86,
 }
 
@@ -136,15 +137,15 @@ pub(crate) fn detect_hardware() -> HardwareInfo {
         .or_else(|| gpu_list.first())
         .map(|gpu| gpu.name.clone())
         .unwrap_or_else(|| "未检测到独立显卡".to_string());
-    // `has_gpu` means "GPU acceleration is usable"; MVP only auto-uses NVIDIA,
-    // so AMD/Intel-only machines report CPU mode (but their card is still shown).
-    let has_gpu = has_nvidia;
-    let backend = if has_nvidia {
-        BackendType::CUDA
-    } else {
-        BackendType::CPUx86
-    };
-    let needs_manual_tier = !has_nvidia || gpu_vram_gb <= 0.0;
+    // `has_gpu` means "GPU acceleration is usable". With Vulkan as the default
+    // GPU backend we can drive any real adapter (NVIDIA/AMD/Intel; virtual/remote
+    // displays already filtered out), so any detected GPU enables acceleration.
+    let has_gpu = has_other_gpu;
+    let backend = select_backend(&gpu_list);
+    // Reliable VRAM only comes from nvidia-smi. When it's unknown (no NVIDIA card
+    // or read failed) we ask the user to pick a hardware tier so recommendations
+    // don't over-reach on an unknown AMD/Intel card.
+    let needs_manual_tier = gpu_vram_gb <= 0.0;
     let summary = if has_nvidia {
         format!(
             "你的电脑是 {}，约 {:.1}GB 显卡内存，可以优先尝试显卡加速运行本地AI。",
@@ -152,7 +153,7 @@ pub(crate) fn detect_hardware() -> HardwareInfo {
         )
     } else if has_other_gpu {
         format!(
-            "检测到 {}，但当前版本只自动支持 NVIDIA 显卡加速，将以 CPU 模式运行，速度会较慢。",
+            "检测到 {}，将尝试通用显卡加速运行本地AI；如果加速用不上会自动改用更稳妥的 CPU 模式。",
             gpu_name
         )
     } else {
@@ -208,7 +209,6 @@ fn detect_nvidia_gpus() -> Vec<GpuInfo> {
     ]);
     crate::proc::hide_console(&mut command);
     let output = command.output();
-
     let Ok(output) = output else {
         return Vec::new();
     };
@@ -236,6 +236,37 @@ fn detect_nvidia_gpus() -> Vec<GpuInfo> {
             })
         })
         .collect()
+}
+
+/// Query the free VRAM (in GB) of the primary NVIDIA GPU (index 0).
+///
+/// Returns `None` when nvidia-smi is unavailable or the output can't be parsed.
+/// This is used by `cuda_launch_params` to compute offload parameters based on
+/// *actual* free VRAM rather than the total VRAM stored in `GpuInfo.vram_gb`,
+/// preventing the "pretend success via shared-memory spill" scenario where
+/// llama.cpp overcommits VRAM and silently degrades.
+pub fn nvidia_free_vram_gb() -> Option<f64> {
+    let mut command = Command::new("nvidia-smi");
+    command.args([
+        "--query-gpu=memory.free",
+        "--format=csv,noheader,nounits",
+    ]);
+    crate::proc::hide_console(&mut command);
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_free_vram_gb(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse the free-VRAM (GB) of GPU 0 from `nvidia-smi --query-gpu=memory.free`
+/// output. Handles both the `nounits` form ("1234") and a stray " MiB" suffix.
+/// Pure function so the parsing is unit-testable without invoking nvidia-smi.
+fn parse_free_vram_gb(stdout: &str) -> Option<f64> {
+    let line = stdout.lines().next()?;
+    let num_str = line.trim().trim_end_matches("MiB").trim();
+    let free_mib = num_str.parse::<f64>().ok()?;
+    Some(free_mib / 1024.0)
 }
 
 // Memory bandwidth (GB/s) by GPU model, per tech doc §3.1.4. Keys are matched
@@ -297,6 +328,46 @@ pub fn estimate_tokens_per_second(bandwidth_gbs: u32, weight_gb: f64) -> f64 {
     // Real llama.cpp decode reaches ~70% of the theoretical roofline in practice.
     const EFFICIENCY: f64 = 0.7;
     f64::from(bandwidth_gbs) / weight_gb * EFFICIENCY
+}
+
+/// Windows NVIDIA driver floor for the bundled CUDA 12.4 `llama.cpp` build. An
+/// NVIDIA card whose driver meets this can take the faster native CUDA engine;
+/// older NVIDIA drivers and all AMD/Intel cards fall back to the universal Vulkan
+/// backend. CPU stays the safety net if the chosen GPU backend fails to launch
+/// (see `service.rs`).
+const CUDA_MIN_NVIDIA_DRIVER: f64 = 551.78;
+
+/// Pick the engine backend from the detected GPUs: NVIDIA with a CUDA-capable
+/// driver takes the CUDA fast lane, any other real GPU takes Vulkan, and no GPU
+/// runs on CPU. Only nvidia-smi-sourced entries (`vram_gb > 0`) carry a
+/// trustworthy NVIDIA branch driver version, so a WMI-only NVIDIA card (when
+/// nvidia-smi is unavailable) conservatively falls back to Vulkan.
+fn select_backend(gpus: &[GpuInfo]) -> BackendType {
+    if gpus.is_empty() {
+        return BackendType::CPUx86;
+    }
+    let cuda_capable = gpus.iter().any(|gpu| {
+        matches!(gpu.vendor, GpuVendor::NVIDIA)
+            && gpu.vram_gb > 0.0
+            && parse_driver_version(&gpu.driver_version)
+                .is_some_and(|version| version >= CUDA_MIN_NVIDIA_DRIVER)
+    });
+    if cuda_capable {
+        BackendType::CUDA
+    } else {
+        BackendType::Vulkan
+    }
+}
+
+/// Parse an NVIDIA driver version like `551.86` (or `551.86.01`) into a
+/// `major.minor` float for threshold comparison. Returns `None` when the string
+/// isn't a recognizable version (e.g. `n/a`).
+pub(crate) fn parse_driver_version(raw: &str) -> Option<f64> {
+    let raw = raw.trim();
+    let mut parts = raw.split('.');
+    let major = parts.next()?;
+    let minor = parts.next().unwrap_or("0");
+    format!("{}.{}", major, minor).parse::<f64>().ok()
 }
 
 /// True for virtual / remote-desktop display adapters that aren't real GPUs
@@ -565,5 +636,74 @@ mod tests {
         // Missing inputs degrade to zero rather than dividing by zero.
         assert_eq!(estimate_tokens_per_second(0, 4.0), 0.0);
         assert_eq!(estimate_tokens_per_second(448, 0.0), 0.0);
+    }
+
+    fn nvidia(name: &str, vram_gb: f64, driver: &str) -> GpuInfo {
+        GpuInfo {
+            index: 0,
+            bandwidth_gbs: lookup_bandwidth(&GpuVendor::NVIDIA, name),
+            vendor: GpuVendor::NVIDIA,
+            name: name.to_string(),
+            vram_gb,
+            driver_version: driver.to_string(),
+        }
+    }
+
+    #[test]
+    fn driver_version_parsing() {
+        assert_eq!(parse_driver_version("551.86"), Some(551.86));
+        assert_eq!(parse_driver_version(" 552.44 "), Some(552.44));
+        assert_eq!(parse_driver_version("551.86.01"), Some(551.86));
+        assert_eq!(parse_driver_version("n/a"), None);
+    }
+
+    #[test]
+    fn free_vram_parsing() {
+        // nounits form (what --format=csv,noheader,nounits produces).
+        assert_eq!(parse_free_vram_gb("1024\n"), Some(1.0));
+        assert_eq!(parse_free_vram_gb(" 5218 "), Some(5218.0 / 1024.0));
+        // Defensive: a stray "MiB" suffix from a differently-formatted build.
+        assert_eq!(parse_free_vram_gb("2048 MiB"), Some(2.0));
+        // Multi-GPU: only GPU 0 (first line) is taken.
+        assert_eq!(parse_free_vram_gb("8192\n4096\n"), Some(8.0));
+        // Garbage / empty → None so the caller falls back to total VRAM.
+        assert_eq!(parse_free_vram_gb(""), None);
+        assert_eq!(parse_free_vram_gb("[N/A]"), None);
+    }
+
+    #[test]
+    fn no_gpu_selects_cpu() {
+        assert!(matches!(select_backend(&[]), BackendType::CPUx86));
+    }
+
+    #[test]
+    fn nvidia_with_capable_driver_takes_cuda_fast_lane() {
+        // NVIDIA card from nvidia-smi (accurate VRAM) with a driver at/above the
+        // CUDA 12.4 floor uses the native CUDA engine.
+        let gpus = vec![nvidia("NVIDIA GeForce RTX 4070", 12.0, "552.44")];
+        assert!(matches!(select_backend(&gpus), BackendType::CUDA));
+    }
+
+    #[test]
+    fn nvidia_with_old_driver_falls_back_to_vulkan() {
+        // Driver below the CUDA 12.4 floor (e.g. the R535-era 539.72) can't run the
+        // bundled CUDA build, so use the universal Vulkan backend instead.
+        let gpus = vec![nvidia("NVIDIA Tesla P100-PCIE-16GB", 16.0, "539.72")];
+        assert!(matches!(select_backend(&gpus), BackendType::Vulkan));
+    }
+
+    #[test]
+    fn nvidia_without_smi_vram_is_untrusted_and_uses_vulkan() {
+        // A WMI-only NVIDIA entry (nvidia-smi unavailable) has no reliable VRAM and
+        // a Windows display-driver version string, not the NVIDIA branch version —
+        // don't trust it for the CUDA gate.
+        let gpus = vec![nvidia("NVIDIA GeForce RTX 4070", 0.0, "31.0.15.5222")];
+        assert!(matches!(select_backend(&gpus), BackendType::Vulkan));
+    }
+
+    #[test]
+    fn amd_and_intel_use_vulkan() {
+        assert!(matches!(select_backend(&[gpu("AMD Radeon RX 7900 XTX", 0.0)]), BackendType::Vulkan));
+        assert!(matches!(select_backend(&[gpu("Intel(R) Arc(TM) A770", 0.0)]), BackendType::Vulkan));
     }
 }

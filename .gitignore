@@ -13,5 +13,11 @@ Thumbs.db
 # 日志
 *.log
 
+# 签名私钥（绝不提交）
+localai-signing-key.json
+*.signing-key.json
+.localai-signing/
+private/
+
 # Claude Code 本地目录
 .claude/

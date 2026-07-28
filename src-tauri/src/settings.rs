@@ -25,6 +25,11 @@ pub struct AppSettings {
     pub service_port: u16,
     pub llama_server_path: Option<PathBuf>,
     pub local_model_path: Option<PathBuf>,
+    /// User-chosen name the AI reports for itself. Empty/None → derive from the
+    /// model id in the frontend. Prevents finetunes from hallucinating an
+    /// upstream vendor identity.
+    #[serde(default)]
+    pub ai_display_name: Option<String>,
     pub instance_id: String,
 }
 
@@ -63,6 +68,7 @@ impl Default for AppSettings {
             service_port: default_service_port(),
             llama_server_path: None,
             local_model_path: None,
+            ai_display_name: None,
             instance_id: Uuid::new_v4().to_string(),
         }
     }

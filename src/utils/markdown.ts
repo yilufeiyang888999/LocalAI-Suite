@@ -105,14 +105,53 @@ export function parseMessage(content: string): MessageBlock[] {
   return blocks;
 }
 
-/** System prompt injected per role preset (§3.6.3). */
-export function systemPromptFor(role: string): string {
+/**
+ * Turn a model id into a human-friendly display name, e.g.
+ * `ornith-1.0-9b` → `Ornith-1.0-9B`. Used only as the placeholder hint for the
+ * "AI display name" setting, so the user can see what the name would look like.
+ * The identity clause itself is opt-in and never auto-derives from this.
+ */
+export function displayNameFromModelId(modelId: string | null | undefined): string {
+  if (!modelId) return 'AI助手';
+  const cleaned = modelId.trim();
+  if (!cleaned) return 'AI助手';
+  return cleaned
+    .split('-')
+    .map((segment) => {
+      if (!segment) return segment;
+      // Pure size/quant tokens (9b, 8x7b, q4, q8, k, m …) read best fully upper-cased.
+      if (/^[0-9]*[a-z]$/i.test(segment) || /^q[0-9]/i.test(segment)) {
+        return segment.toUpperCase();
+      }
+      // Otherwise just capitalise a leading letter (keeps version dots intact).
+      return /^[a-z]/.test(segment) ? segment[0].toUpperCase() + segment.slice(1) : segment;
+    })
+    .join('-');
+}
+
+/**
+ * System prompt injected per role preset (§3.6.3). If the user has set a custom
+ * name for the AI, an identity clause is prepended so it introduces itself by
+ * that name. This is opt-in: with no custom name, `identity` is falsy and the
+ * clause is skipped entirely — the model answers "who are you" however its
+ * training decides (which for a Qwen-derived model is legitimately "Qwen").
+ * The wording is neutral and does not force the model to deny its lineage.
+ */
+export function systemPromptFor(role: string, identity?: string | null): string {
+  let base: string;
   switch (role) {
     case 'writing':
-      return '你是一名中文写作助手，擅长撰写文案、报告和邮件，语言流畅、得体、条理清晰。';
+      base = '你是一名中文写作助手，擅长撰写文案、报告和邮件，语言流畅、得体、条理清晰。';
+      break;
     case 'coding':
-      return '你是一名编程助手，擅长解释、生成和调试代码。回答时给出清晰、可运行的代码示例，并用中文说明。';
+      base = '你是一名编程助手，擅长解释、生成和调试代码。回答时给出清晰、可运行的代码示例，并用中文说明。';
+      break;
     default:
-      return '你是一个友好的AI助手，用通俗易懂的中文回答用户问题。';
+      base = '你是一个友好的AI助手，用通俗易懂的中文回答用户问题。';
+      break;
   }
+
+  const name = identity?.trim();
+  if (!name) return base;
+  return `你的名字是${name}，一个在本地运行的AI助手。当被问到你叫什么、你是谁时，可以称自己为${name}。\n${base}`;
 }

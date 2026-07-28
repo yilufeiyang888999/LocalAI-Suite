@@ -268,9 +268,26 @@ async fn stream_source(
     let mut downloaded = 0u64;
     let mut stream = response.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk
-            .map_err(|_| AppError::Message("下载中断了，正在重试。".to_string()))?;
+    // Idle timeout: a stalled source (TCP alive but the server stops sending
+    // bytes) would otherwise hang on `stream.next()` until the 60-minute request
+    // timeout. Bounding each chunk wait lets us fail fast and retry / switch
+    // sources when no data arrives for a while.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    loop {
+        let next = tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await;
+        let chunk = match next {
+            // A chunk arrived.
+            Ok(Some(chunk)) => chunk
+                .map_err(|_| AppError::Message("下载中断了，正在重试。".to_string()))?,
+            // Stream ended cleanly.
+            Ok(None) => break,
+            // No data for IDLE_TIMEOUT: treat as a stalled source.
+            Err(_) => {
+                return Err(AppError::Message(
+                    "下载停滞了（长时间没有数据），正在重试或切换线路。".to_string(),
+                ))
+            }
+        };
         file.write_all(&chunk).await?;
         downloaded += chunk.len() as u64;
         emit_update(app, model_id, "downloading", downloaded, total, "正在下载新版本模型文件");

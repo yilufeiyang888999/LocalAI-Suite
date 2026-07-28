@@ -27,10 +27,18 @@ pub struct ServiceInfo {
 
 /// Concrete `llama-server` launch tuning. `n_gpu_layers` is `None` for CPU-only
 /// launches; `Some(n)` offloads `n` transformer layers (999 = offload all).
+/// `parallel` is the number of llama.cpp slots — we pin it to 1 for the desktop
+/// single-user case so the KV cache isn't multiplied across idle slots (the
+/// default of 4 blows past small VRAM budgets). `kv_quant` requests an 8-bit KV
+/// cache (`--cache-type-k/v q8_0` + `--flash-attn`), which roughly halves the
+/// per-token KV footprint so a larger context fits — only enabled when fp16
+/// can't hold the target context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LaunchParams {
     n_gpu_layers: Option<u32>,
     ctx_size: u32,
+    parallel: u32,
+    kv_quant: bool,
 }
 
 /// Default CUDA tuning when the model or VRAM is unknown — matches the old
@@ -38,23 +46,109 @@ struct LaunchParams {
 const DEFAULT_CUDA_PARAMS: LaunchParams = LaunchParams {
     n_gpu_layers: Some(24),
     ctx_size: 4096,
+    parallel: 1,
+    kv_quant: false,
 };
 
-/// Pick GPU offload + context size from available VRAM relative to the model's
-/// requirement. More headroom → offload everything with a larger context;
-/// tighter VRAM → offload fewer layers and shrink the context to avoid a CUDA
-/// out-of-memory launch failure.
-fn cuda_launch_params(available_vram_gb: f64, model_required_gb: f64) -> LaunchParams {
-    if available_vram_gb >= model_required_gb + 1.5 {
-        LaunchParams { n_gpu_layers: Some(999), ctx_size: 4096 }
-    } else if available_vram_gb >= model_required_gb {
-        LaunchParams { n_gpu_layers: Some(999), ctx_size: 3072 }
-    } else if available_vram_gb >= model_required_gb * 0.7 {
-        LaunchParams { n_gpu_layers: Some(20), ctx_size: 3072 }
-    } else if available_vram_gb >= model_required_gb * 0.5 {
-        LaunchParams { n_gpu_layers: Some(12), ctx_size: 2048 }
+/// Health-check budget for a GPU launch. The first GPU cold start can be slow:
+/// Windows Defender scans the large CUDA DLLs (`ggml-cuda.dll` is ~565MB), and
+/// CUDA may JIT-compile kernels for a newer GPU arch not precompiled in the
+/// build (both results get cached, so later starts are fast). 90s was too tight
+/// and misfired as a failure — falling back to CPU on a perfectly usable GPU.
+const GPU_STARTUP_TIMEOUT_SECS: u64 = 180;
+
+/// Health-check budget for a CPU launch (and CPU safe-mode fallback). CPU has no
+/// JIT step, so the original tighter budget is fine.
+const CPU_STARTUP_TIMEOUT_SECS: u64 = 90;
+
+/// Runtime reserve on top of model weights + KV cache, in GB. Matches the
+/// `0.5GB` run reserve in the VRAM formula, plus an extra `0.8GB` safety pad for
+/// GPU compute buffers / driver overhead so we don't launch right at the edge
+/// and spill into shared system memory (which tanks throughput).
+const GPU_OVERHEAD_GB: f64 = 0.5 + 0.8;
+
+/// Round a context length down to a multiple of 2048, with a 2048 floor.
+fn round_ctx(ctx: f64) -> u32 {
+    let stepped = (ctx / 2048.0).floor() as u32 * 2048;
+    stepped.max(2048)
+}
+
+/// Choose GPU offload, context size, and KV-cache precision by inverting the
+/// project's VRAM formula against the *actual* available VRAM, rather than a
+/// fixed small context. The formula (see CLAUDE.md) is:
+///
+/// ```text
+/// VRAM = weight + KV + reserve
+/// KV   = 0.000008 × active_params(B) × ctx × kv_factor
+/// ```
+///
+/// so given a VRAM budget we solve for the largest `ctx` that fits. fp16 KV is
+/// preferred for stability; we only drop to an 8-bit KV cache (`kv_factor` 0.5)
+/// when fp16 can't hold the target context. When even the weights barely fit we
+/// fall back to partial offload with a small context (the old tiered behavior).
+///
+/// `weight_gb` is model weights (params × bpp), `active_params_billions` drives
+/// the KV size, and `max_context` caps the context at the model's trained limit.
+fn cuda_launch_params(
+    available_vram_gb: f64,
+    weight_gb: f64,
+    active_params_billions: f64,
+    max_context: u32,
+) -> LaunchParams {
+    let target = max_context.max(2048) as f64;
+    // Per-token KV footprint in GB at fp16 (kv_factor = 1.0).
+    let kv_per_token_fp16 = 0.000008 * active_params_billions;
+    let budget = available_vram_gb - weight_gb - GPU_OVERHEAD_GB;
+
+    // Weights don't fit (or barely) with any usable KV headroom: keep the old
+    // partial-offload tiers so a low-VRAM GPU still starts, just with a small
+    // context and an 8-bit KV cache to squeeze what we can.
+    if budget <= 0.0 || kv_per_token_fp16 <= 0.0 {
+        let (layers, ctx) = if available_vram_gb >= weight_gb * 0.7 {
+            (20, 3072)
+        } else if available_vram_gb >= weight_gb * 0.5 {
+            (12, 2048)
+        } else {
+            (8, 2048)
+        };
+        return LaunchParams {
+            n_gpu_layers: Some(layers),
+            ctx_size: ctx,
+            parallel: 1,
+            kv_quant: true,
+        };
+    }
+
+    // Prefer an fp16 KV cache when it holds the target context: for the app's
+    // core case — short chats at a moderate context — fp16 is fastest, because
+    // q8 KV adds a per-token dequant cost and its flash-attention win only pays
+    // off at long contexts. Only drop to q8 (which this build pairs with flash
+    // attention) when fp16 can't fit the target — e.g. an advanced user raised
+    // `--ctx-size` well past the default — trading a little short-prompt speed
+    // for the long-context throughput q8 + flash attention provides.
+    let max_ctx_fp16 = budget / kv_per_token_fp16;
+    if max_ctx_fp16 >= target {
+        return LaunchParams {
+            n_gpu_layers: Some(999),
+            ctx_size: target as u32,
+            parallel: 1,
+            kv_quant: false,
+        };
+    }
+
+    // fp16 falls short: use q8 KV (half the footprint + flash attention) to
+    // reach the target, or the largest context q8 allows if even that's tight.
+    let max_ctx_q8 = budget / (kv_per_token_fp16 * 0.5);
+    let ctx_size = if max_ctx_q8 >= target {
+        target as u32
     } else {
-        LaunchParams { n_gpu_layers: Some(8), ctx_size: 2048 }
+        round_ctx(max_ctx_q8)
+    };
+    LaunchParams {
+        n_gpu_layers: Some(999),
+        ctx_size,
+        parallel: 1,
+        kv_quant: true,
     }
 }
 
@@ -62,6 +156,16 @@ fn cuda_launch_params(available_vram_gb: f64, model_required_gb: f64) -> LaunchP
 enum EngineBackend {
     Cpu,
     Cuda,
+    Vulkan,
+}
+
+impl EngineBackend {
+    /// Whether this backend offloads layers to the GPU (Vulkan or CUDA), so it
+    /// should be launched with VRAM-tiered `-ngl` params and can fall back to CPU
+    /// safe mode on failure.
+    fn is_gpu(self) -> bool {
+        matches!(self, EngineBackend::Cuda | EngineBackend::Vulkan)
+    }
 }
 
 #[tauri::command]
@@ -80,7 +184,41 @@ pub async fn start_service_core(
     app: &AppHandle,
     state: &AppState,
 ) -> AppResult<ServiceInfo> {
+    // Resolve engine/model paths first: this can fail (missing engine or model
+    // file) and must return *before* the guard below flips status to Starting,
+    // otherwise a resolve failure would leave the service stuck in Starting.
     let (server_path, model_path, install_dir) = resolve_paths(state)?;
+
+    // ---- Guard: kill any existing process and prevent concurrent starts ----
+    //
+    // Without this, a second call to start_service_core (e.g. from a frontend
+    // double-click or a race between switchModel and an auto-recovery) would
+    // spawn a duplicate llama-server whose Child handle overwrites the first
+    // one's in set_running — but on Windows, dropping the Child does NOT kill
+    // the process, so it becomes an orphan holding the port and VRAM.
+    //
+    // We do this *synchronously* before any `.await` point so the Mutex scope
+    // is atomic: the first task to reach this sets status=Starting, and any
+    // concurrent task sees it and bails.
+    {
+        let mut inner = state.inner.lock().expect("state lock poisoned");
+        if inner.service.status == ServiceStatus::Starting {
+            return Err(AppError::Message(
+                "AI服务正在启动中，请稍候。".to_string(),
+            ));
+        }
+        // Kill any existing process (whether spawned this session or reattached).
+        if let Some(mut child) = inner.service.process.take() {
+            let _ = child.kill();
+        } else if let Some(pid) = inner.service.pid {
+            kill_pid(pid);
+        }
+        inner.service.pid = None;
+        inner.service.status = ServiceStatus::Starting;
+        inner.service.model_id = Some(model_id.to_string());
+        // Keep host/port — they are needed for the restarting_same_address
+        // check below and will be overwritten by set_starting later.
+    }
     let (host, extra_args) = {
         let inner = state.inner.lock().expect("state lock poisoned");
         let host = inner.settings.service_host.clone();
@@ -109,7 +247,12 @@ pub async fn start_service_core(
 
     // Fail early with a friendly message if the fixed port is already taken,
     // rather than letting llama-server fail to bind and time out the health check.
-    if configured_port != 0 && !restarting_same_address && !is_port_available(&host, port) {
+    // We poll briefly rather than checking once: when we (or the update flow) just
+    // killed the previous server, the OS may not have released the port yet — a
+    // single immediate check would misfire and wrongly report "port taken" (which
+    // made model updates always roll back). A genuinely external holder stays
+    // taken past the wait window.
+    if configured_port != 0 && !restarting_same_address && !wait_for_port_available(&host, port).await {
         let info = set_failed(
             app,
             state,
@@ -118,27 +261,47 @@ pub async fn start_service_core(
         return Err(AppError::Message(info.message));
     }
 
-    let params = if backend == EngineBackend::Cuda {
+    let params = if backend.is_gpu() {
         let hw = tokio::task::spawn_blocking(crate::hardware::detect_hardware)
             .await
             .unwrap_or_else(|_| crate::hardware::fallback_hardware());
-        let vram = hw.gpu_list.iter().map(|g| g.vram_gb).fold(0.0_f64, f64::max);
+        let total_vram = hw.gpu_list.iter().map(|g| g.vram_gb).fold(0.0_f64, f64::max);
+        // Compute offload params from *free* VRAM, not total: other processes
+        // (or a model we just stopped whose VRAM hasn't been reclaimed yet) may
+        // hold much of the card. Using total VRAM here makes llama.cpp overcommit
+        // and spill to shared system memory — a slow "pretend success" instead of
+        // a proper partial-offload or CPU fallback. Fall back to total when
+        // nvidia-smi can't report free VRAM (no worse than the old behavior).
+        let vram = tokio::task::spawn_blocking(crate::hardware::nvidia_free_vram_gb)
+            .await
+            .ok()
+            .flatten()
+            .filter(|free| *free > 0.0)
+            .unwrap_or(total_vram);
+        tracing::info!(total_vram_gb = total_vram, usable_vram_gb = vram, "computing GPU launch params from usable VRAM");
         let data_dir = {
             let inner = state.inner.lock().expect("state lock poisoned");
             inner.data_dir.clone()
         };
-        let model_required = crate::catalog::effective_models(&data_dir)
-            .iter()
-            .find(|m| m.id == model_id)
-            .map(|m| m.vram_required_gb)
-            .unwrap_or(0.0);
-        if vram > 0.0 {
-            cuda_launch_params(vram, model_required)
-        } else {
-            DEFAULT_CUDA_PARAMS
+        let model = crate::catalog::effective_models(&data_dir)
+            .into_iter()
+            .find(|m| m.id == model_id);
+        match (vram > 0.0, model) {
+            (true, Some(m)) => {
+                // Weights in GB and active params (billions) drive the VRAM
+                // formula; active_parameters covers MoE, else the full count.
+                let weight_gb = (m.parameters_raw as f64) * m.quant_bpp / 1e9;
+                let active = m.active_parameters.unwrap_or(m.parameters_raw);
+                let active_billions = active as f64 / 1e9;
+                let max_ctx = (m.context_length.min(16384)) as u32;
+                cuda_launch_params(vram, weight_gb, active_billions, max_ctx)
+            }
+            // Unknown VRAM or an imported model without metadata: keep the old
+            // conservative fixed params.
+            _ => DEFAULT_CUDA_PARAMS,
         }
     } else {
-        LaunchParams { n_gpu_layers: None, ctx_size: 4096 }
+        LaunchParams { n_gpu_layers: None, ctx_size: 4096, parallel: 1, kv_quant: false }
     };
 
     set_starting(app, state, model_id, &host, port, false);
@@ -149,9 +312,16 @@ pub async fn start_service_core(
         port,
         gpu_layers = ?params.n_gpu_layers,
         ctx_size = params.ctx_size,
+        parallel = params.parallel,
+        kv_quant = params.kv_quant,
         "starting llama-server"
     );
-    match launch_service(&server_path, &model_path, &host, port, &params, &extra_args).await {
+    let startup_timeout = if backend.is_gpu() {
+        GPU_STARTUP_TIMEOUT_SECS
+    } else {
+        CPU_STARTUP_TIMEOUT_SECS
+    };
+    match launch_service(&server_path, &model_path, &host, port, &params, &extra_args, startup_timeout).await {
         Ok(child) => set_running(app, state, child, false, "AI服务已启动，可以开始聊天。".to_string()),
         Err(error) => {
             if backend == EngineBackend::Cpu {
@@ -159,7 +329,26 @@ pub async fn start_service_core(
                 return Err(AppError::Message(info.message));
             }
 
-            tracing::warn!(%model_id, error = %error, "CUDA launch failed; falling back to CPU safe mode");
+            // Before giving up on the GPU, retry once with conservative GPU
+            // params (small context, fp16 KV, single slot). The aggressive
+            // params above may have asked for a context the VRAM couldn't hold;
+            // a smaller one often still runs fully on the GPU — far better than
+            // crawling on the CPU when the card is actually fine.
+            let conservative = LaunchParams {
+                n_gpu_layers: Some(999),
+                ctx_size: 4096,
+                parallel: 1,
+                kv_quant: false,
+            };
+            if conservative != params {
+                tracing::warn!(%model_id, backend = ?backend, error = %error, "GPU launch failed; retrying with conservative GPU params");
+                set_starting(app, state, model_id, &host, port, false);
+                if let Ok(child) = launch_service(&server_path, &model_path, &host, port, &conservative, &extra_args, startup_timeout).await {
+                    return set_running(app, state, child, false, "AI服务已启动，可以开始聊天。".to_string());
+                }
+            }
+
+            tracing::warn!(%model_id, backend = ?backend, error = %error, "GPU launch failed; falling back to CPU safe mode");
             let Some(cpu_path) = find_cpu_engine_executable(&install_dir) else {
                 let info = set_failed(
                     app,
@@ -169,9 +358,9 @@ pub async fn start_service_core(
                 return Err(AppError::Message(info.message));
             };
 
-            let safe_params = LaunchParams { n_gpu_layers: None, ctx_size: 2048 };
+            let safe_params = LaunchParams { n_gpu_layers: None, ctx_size: 2048, parallel: 1, kv_quant: false };
             set_starting(app, state, model_id, &host, port, true);
-            match launch_service(&cpu_path, &model_path, &host, port, &safe_params, &extra_args).await {
+            match launch_service(&cpu_path, &model_path, &host, port, &safe_params, &extra_args, CPU_STARTUP_TIMEOUT_SECS).await {
                 Ok(child) => set_running(
                     app,
                     state,
@@ -385,6 +574,7 @@ async fn launch_service(
     port: u16,
     params: &LaunchParams,
     extra_args: &[String],
+    startup_timeout_secs: u64,
 ) -> AppResult<Child> {
     let mut command = Command::new(server_path);
     crate::proc::hide_console(&mut command);
@@ -396,10 +586,28 @@ async fn launch_service(
         .arg("--port")
         .arg(port.to_string())
         .arg("--ctx-size")
-        .arg(params.ctx_size.to_string());
+        .arg(params.ctx_size.to_string())
+        // Pin to a single slot: this is a single-user desktop app, and the
+        // llama.cpp default of 4 slots multiplies the KV cache 4× — the root
+        // cause of blowing past small VRAM budgets and spilling to system RAM.
+        .arg("--parallel")
+        .arg(params.parallel.to_string());
 
     if let Some(n_gpu_layers) = params.n_gpu_layers {
         command.arg("--n-gpu-layers").arg(n_gpu_layers.to_string());
+    }
+
+    // An 8-bit KV cache roughly halves the per-token KV footprint so a larger
+    // context fits in tight VRAM. This matches the verified-working manual
+    // config (`--cache-type-k/v q8_0`); this llama.cpp build auto-enables flash
+    // attention when the KV cache is quantized, so we don't pass `--flash-attn`
+    // explicitly (an untested flag on this build).
+    if params.kv_quant {
+        command
+            .arg("--cache-type-k")
+            .arg("q8_0")
+            .arg("--cache-type-v")
+            .arg("q8_0");
     }
 
     // Advanced users can append raw llama.cpp flags (risk-at-own) via settings.
@@ -413,7 +621,7 @@ async fn launch_service(
 
     // Require two consecutive healthy probes so a single transient 200 during
     // llama.cpp warmup doesn't get mistaken for a stable service.
-    if let Err(error) = wait_for_health(port, 2).await {
+    if let Err(error) = wait_for_health(port, 2, startup_timeout_secs).await {
         let _ = child.kill();
         return Err(error);
     }
@@ -464,7 +672,7 @@ fn set_running(
     Ok(info)
 }
 
-async fn wait_for_health(port: u16, required_consecutive: u32) -> AppResult<()> {
+async fn wait_for_health(port: u16, required_consecutive: u32, timeout_secs: u64) -> AppResult<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -473,7 +681,7 @@ async fn wait_for_health(port: u16, required_consecutive: u32) -> AppResult<()> 
     // 0.0.0.0) are reachable on the loopback locally, so the local health check
     // works regardless of whether LAN access is enabled.
     let url = format!("http://127.0.0.1:{}/v1/models", port);
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut consecutive = 0;
 
     while Instant::now() < deadline {
@@ -553,19 +761,26 @@ fn set_failed(app: &AppHandle, state: &AppState, message: String) -> ServiceInfo
 }
 
 fn detect_backend(server_path: &PathBuf, install_dir: &PathBuf) -> EngineBackend {
-    if server_path
+    if let Some(name) = server_path
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name.to_ascii_lowercase().contains("cuda"))
-        .unwrap_or(false)
+        .map(|name| name.to_ascii_lowercase())
     {
-        return EngineBackend::Cuda;
+        if name.contains("vulkan") {
+            return EngineBackend::Vulkan;
+        }
+        if name.contains("cuda") {
+            return EngineBackend::Cuda;
+        }
     }
 
     let marker = install_dir.join("engine").join("current_backend.txt");
     std::fs::read_to_string(marker)
         .map(|content| {
-            if content.to_ascii_lowercase().contains("cuda") {
+            let content = content.to_ascii_lowercase();
+            if content.contains("vulkan") {
+                EngineBackend::Vulkan
+            } else if content.contains("cuda") {
                 EngineBackend::Cuda
             } else {
                 EngineBackend::Cpu
@@ -579,6 +794,7 @@ fn find_engine_executable(install_dir: &PathBuf) -> Option<PathBuf> {
     let backend_dir = engine_dir.join("backends");
 
     let candidates = vec![
+        backend_dir.join("llama-server-vulkan.exe"),
         backend_dir.join("llama-server-cuda.exe"),
         backend_dir.join("llama-server-cpu.exe"),
         engine_dir.join("llama-server.exe"),
@@ -600,6 +816,26 @@ fn find_engine_executable(install_dir: &PathBuf) -> Option<PathBuf> {
 /// acceptable for a single-user desktop tool.
 fn is_port_available(host: &str, port: u16) -> bool {
     TcpListener::bind((host, port)).is_ok()
+}
+
+/// Poll `is_port_available` for a short window. Returns true as soon as the port
+/// is free. This absorbs the brief delay between killing our previous server and
+/// the OS releasing its socket, so a same-port restart (settings change, model
+/// update) doesn't misread the not-yet-released port as an external conflict.
+/// A port genuinely held by another program stays taken for the whole window and
+/// returns false.
+async fn wait_for_port_available(host: &str, port: u16) -> bool {
+    const ATTEMPTS: u32 = 12;
+    const INTERVAL: Duration = Duration::from_millis(250);
+    for attempt in 0..ATTEMPTS {
+        if is_port_available(host, port) {
+            return true;
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(INTERVAL).await;
+        }
+    }
+    false
 }
 
 /// Split a user-provided extra-args string into individual arguments on
@@ -630,45 +866,95 @@ fn find_cpu_engine_executable(install_dir: &PathBuf) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn cuda_params_scale_with_available_vram() {
-        let required = 5.0;
+    // Qwen3-8B Q4_K_M: 8.2B params × 0.4 bpp = 3.28GB weights, 8.2B active.
+    // Used across the tuning tests below.
+    const W8B: f64 = 3.28;
+    const A8B: f64 = 8.2;
 
-        // Comfortable headroom: offload everything with the full context.
-        assert_eq!(
-            cuda_launch_params(7.0, required),
-            LaunchParams { n_gpu_layers: Some(999), ctx_size: 4096 }
-        );
-        // Just fits: still full offload but a smaller context for KV headroom.
-        assert_eq!(
-            cuda_launch_params(5.2, required),
-            LaunchParams { n_gpu_layers: Some(999), ctx_size: 3072 }
-        );
-        // Tight (>= 70% of requirement): partial offload.
-        assert_eq!(
-            cuda_launch_params(4.0, required),
-            LaunchParams { n_gpu_layers: Some(20), ctx_size: 3072 }
-        );
-        // Low (>= 50%): fewer layers, minimal context.
-        assert_eq!(
-            cuda_launch_params(2.6, required),
-            LaunchParams { n_gpu_layers: Some(12), ctx_size: 2048 }
-        );
-        // Very low: minimal offload, minimal context.
-        assert_eq!(
-            cuda_launch_params(1.0, required),
-            LaunchParams { n_gpu_layers: Some(8), ctx_size: 2048 }
-        );
+    #[test]
+    fn ample_vram_uses_fp16_at_default_context() {
+        // 8GB card holds 8B weights + 16k fp16 KV with comfort. fp16 is fastest
+        // for short prompts — the core use case — so we prefer it over q8.
+        let p = cuda_launch_params(8.0, W8B, A8B, 16384);
+        assert_eq!(p.n_gpu_layers, Some(999));
+        assert_eq!(p.ctx_size, 16384);
+        assert_eq!(p.parallel, 1);
+        assert!(!p.kv_quant, "fp16 should hold the default context easily");
     }
 
     #[test]
-    fn cuda_params_are_monotonic_in_vram() {
-        // More VRAM never offloads fewer layers than less VRAM.
-        let required = 5.0;
-        let layers = |vram: f64| cuda_launch_params(vram, required).n_gpu_layers.unwrap();
-        assert!(layers(1.0) <= layers(2.6));
-        assert!(layers(2.6) <= layers(4.0));
-        assert!(layers(4.0) <= layers(5.2));
+    fn medium_vram_still_reaches_jumbo_context_on_q8() {
+        // 6GB: fp16 falls short of 32k but q8 (half footprint + flash attention)
+        // reaches it. This is the path an advanced user hits by raising
+        // --ctx-size past what fp16 can hold on a smaller card.
+        let p = cuda_launch_params(6.0, W8B, A8B, 32768);
+        assert_eq!(p.n_gpu_layers, Some(999));
+        assert_eq!(p.ctx_size, 32768);
+        assert!(p.kv_quant, "large context beyond fp16 capacity should use q8 KV");
+        assert_eq!(p.parallel, 1);
+    }
+
+    #[test]
+    fn tight_vram_takes_largest_q8_context() {
+        // 5.5GB: even q8 can't reach 32k, so take the largest q8 context,
+        // rounded down to a 2048 multiple (and never below 2048).
+        let p = cuda_launch_params(5.5, W8B, A8B, 32768);
+        assert_eq!(p.n_gpu_layers, Some(999));
+        assert!(p.kv_quant);
+        assert!(p.ctx_size < 32768 && p.ctx_size >= 2048);
+        assert_eq!(p.ctx_size % 2048, 0);
+    }
+
+    #[test]
+    fn very_low_vram_falls_back_to_partial_offload() {
+        // Weights barely fit: keep the old partial-offload tiers so the GPU
+        // still starts with a small context.
+        let tight = cuda_launch_params(4.0, W8B, A8B, 32768);
+        assert_eq!(tight.n_gpu_layers, Some(20));
+        assert_eq!(tight.parallel, 1);
+
+        let lower = cuda_launch_params(2.0, W8B, A8B, 32768);
+        assert_eq!(lower.n_gpu_layers, Some(12));
+
+        let lowest = cuda_launch_params(1.0, W8B, A8B, 32768);
+        assert_eq!(lowest.n_gpu_layers, Some(8));
+    }
+
+    #[test]
+    fn context_never_exceeds_model_trained_limit() {
+        // A tiny model with a small trained context must not be over-extended
+        // just because there's plenty of VRAM.
+        let p = cuda_launch_params(16.0, 1.5, 1.7, 8192);
+        assert!(p.ctx_size <= 8192);
+        assert!(!p.kv_quant, "small context at high VRAM should use fp16");
+    }
+
+    #[test]
+    fn context_is_monotonic_in_vram() {
+        // More VRAM never yields a smaller context (at equal or better KV
+        // precision), across the full range.
+        let ctx = |vram: f64| cuda_launch_params(vram, W8B, A8B, 32768).ctx_size;
+        assert!(ctx(4.0) <= ctx(5.5));
+        assert!(ctx(5.5) <= ctx(6.0));
+        assert!(ctx(6.0) <= ctx(8.0));
+    }
+
+    #[test]
+    fn all_gpu_launches_pin_single_slot() {
+        // The single-slot pin is the core fix for the 4× KV blowup; it must
+        // hold across every VRAM tier.
+        for vram in [1.0, 2.0, 4.0, 5.5, 6.0, 8.0, 16.0] {
+            let p = cuda_launch_params(vram, W8B, A8B, 32768);
+            assert_eq!(p.parallel, 1, "vram={vram}");
+        }
+    }
+
+    #[test]
+    fn round_ctx_floors_to_2048_multiple_with_floor() {
+        assert_eq!(round_ctx(28048.0), 26624);
+        assert_eq!(round_ctx(4095.0), 2048);
+        assert_eq!(round_ctx(100.0), 2048);
+        assert_eq!(round_ctx(4096.0), 4096);
     }
 
     #[test]
@@ -694,5 +980,30 @@ mod tests {
         assert!(!is_port_available("127.0.0.1", port));
         drop(listener);
         assert!(is_port_available("127.0.0.1", port));
+    }
+
+    #[test]
+    fn detect_backend_reads_executable_name() {
+        let install = PathBuf::from("/does/not/matter");
+        assert_eq!(
+            detect_backend(&PathBuf::from("/x/llama-server-vulkan.exe"), &install),
+            EngineBackend::Vulkan
+        );
+        assert_eq!(
+            detect_backend(&PathBuf::from("/x/llama-server-cuda.exe"), &install),
+            EngineBackend::Cuda
+        );
+        // A generic name with no missing marker file falls back to CPU.
+        assert_eq!(
+            detect_backend(&PathBuf::from("/x/llama-server.exe"), &install),
+            EngineBackend::Cpu
+        );
+    }
+
+    #[test]
+    fn gpu_backends_report_is_gpu() {
+        assert!(EngineBackend::Vulkan.is_gpu());
+        assert!(EngineBackend::Cuda.is_gpu());
+        assert!(!EngineBackend::Cpu.is_gpu());
     }
 }

@@ -2166,6 +2166,7 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "futures-util",
+ "getrandom 0.2.17",
  "hex",
  "portpicker",
  "reqwest 0.12.28",

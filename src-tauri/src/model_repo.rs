@@ -64,6 +64,19 @@ pub fn list_imported_models(db_path: &Path) -> AppResult<Vec<ImportedModelRow>> 
     Ok(models)
 }
 
+/// Untrack an imported model. Missing rows return Ok — uninstall is idempotent
+/// so a stale UI or a second click can't turn into an error the user has to
+/// puzzle over. Only rows flagged `is_imported = 1` are touched, so a stray
+/// catalog id can never wipe a bundled entry.
+pub fn delete_imported_model(db_path: &Path, id: &str) -> AppResult<()> {
+    let connection = Connection::open(db_path)?;
+    connection.execute(
+        "DELETE FROM model_metadata WHERE id = ?1 AND is_imported = 1",
+        params![id],
+    )?;
+    Ok(())
+}
+
 /// Insert a model row, or update it on id conflict. `is_imported` flags locally
 /// imported models. `overwrite_local_path` controls whether a conflicting row's
 /// `local_path` is replaced (true for imports) or kept (false for catalog seeds).
@@ -246,6 +259,35 @@ mod tests {
         let rows = list_imported_models(&db).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "我的模型-改名");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_imported_model_is_idempotent_and_scoped() {
+        let (dir, db) = temp_db();
+
+        // Seed catalog + import one file, then confirm both rows exist.
+        let catalog = builtin_models();
+        seed_catalog(&db, &catalog).unwrap();
+        let path = dir.join("mine.gguf");
+        upsert_imported_model(&db, "imported-mine", "我的模型", &path, 1200, 3.0).unwrap();
+        assert_eq!(list_imported_models(&db).unwrap().len(), 1);
+
+        // Removing the imported id drops just that row.
+        delete_imported_model(&db, "imported-mine").unwrap();
+        assert!(list_imported_models(&db).unwrap().is_empty());
+        // Catalog rows are untouched.
+        assert_eq!(catalog_count(&db), catalog.len() as i64);
+
+        // Second delete is a no-op, not an error.
+        delete_imported_model(&db, "imported-mine").unwrap();
+
+        // A catalog id must never be wiped even if passed here by mistake — the
+        // `is_imported = 1` guard is the whole point of the API.
+        let seeded_id = catalog[0].id.clone();
+        delete_imported_model(&db, &seeded_id).unwrap();
+        assert_eq!(catalog_count(&db), catalog.len() as i64);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

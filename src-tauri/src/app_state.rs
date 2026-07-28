@@ -38,7 +38,7 @@ pub struct ServiceState {
     pub safe_mode: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceStatus {
     #[default]

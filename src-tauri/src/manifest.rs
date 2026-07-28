@@ -192,6 +192,24 @@ pub async fn verify_file(file_id: &str, path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+/// The full set of files the signed manifest must attest, assembled from the
+/// live model catalog (`models.rs`) and engine packages (`engine.rs`). Both the
+/// offline signer and the tests read this, so the signed manifest is generated
+/// from the exact hashes the runtime enforces — no hand-copied duplicate list.
+pub fn manifest_entries() -> Vec<ManifestEntry> {
+    let mut entries: Vec<ManifestEntry> = crate::models::builtin_models()
+        .into_iter()
+        .map(|model| ManifestEntry {
+            file_id: format!("model:{}", model.id),
+            sha256: model.sha256,
+        })
+        .collect();
+    for (file_id, sha256) in crate::engine::engine_manifest_entries() {
+        entries.push(ManifestEntry { file_id, sha256 });
+    }
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,47 +223,6 @@ mod tests {
         0x21, 0x21,
     ];
     const KEY_ID: &str = "localai-root-2026";
-
-    fn manifest_entries() -> Vec<ManifestEntry> {
-        // Same SHA256 values embedded in models.rs / engine.rs; the manifest is
-        // the signed authority attesting them.
-        let raw = [
-            (
-                "model:qwen3_14b_chat",
-                "500a8806e85ee9c83f3ae08420295592451379b4f8cf2d0f41c15dffeb6b81f0",
-            ),
-            (
-                "model:qwen3_8b_chat",
-                "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
-            ),
-            (
-                "model:qwen3_4b_chat",
-                "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
-            ),
-            (
-                "model:qwen3_1_7b_light",
-                "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
-            ),
-            (
-                "engine:llama-b9837-bin-win-cpu-x64.zip",
-                "d53a9a0107c088d57592e4a43bf56ec3e3d274e9e45413d7d5c9bec583d173fd",
-            ),
-            (
-                "engine:llama-b9837-bin-win-cuda-12.4-x64.zip",
-                "4b21072c3352f88e9faa03175dd218fec64379346059b18d6e7d4b739d213f48",
-            ),
-            (
-                "engine:cudart-llama-bin-win-cuda-12.4-x64.zip",
-                "4d3a95c9c6c5ed34341b581c83ba84e8de4d2f4dbaff567b9446d5136055691f",
-            ),
-        ];
-        raw.into_iter()
-            .map(|(file_id, sha256)| ManifestEntry {
-                file_id: file_id.to_string(),
-                sha256: sha256.to_string(),
-            })
-            .collect()
-    }
 
     fn build_signed_doc(signing: &SigningKey, key_id: &str, payload: &[u8]) -> SignedDocument {
         let signature = signing.sign(payload);
@@ -299,7 +276,7 @@ mod tests {
             .entries
             .iter()
             .any(|e| e.file_id == "model:qwen3_14b_chat"));
-        assert_eq!(manifest.entries.len(), 7);
+        assert_eq!(manifest.entries.len(), 8);
     }
 
     #[test]

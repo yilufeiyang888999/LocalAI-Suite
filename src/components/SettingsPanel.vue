@@ -1,14 +1,24 @@
 <script setup lang="ts">
-import { open } from '@tauri-apps/plugin-dialog';
-import { watch, ref } from 'vue';
+import { open, confirm, message as dialogMessage } from '@tauri-apps/plugin-dialog';
+import { openPath } from '@tauri-apps/plugin-opener';
+import { computed, watch, ref } from 'vue';
 import type { AppSettings, MirrorSource } from '../types';
-import { importLocalModel, updateSettings } from '../api/tauri';
+import { displayNameFromModelId } from '../utils/markdown';
+import {
+  clearAllChatRecords,
+  getDataPaths,
+  importLocalModel,
+  resetToFactory,
+  uninstallAllModels,
+  updateSettings
+} from '../api/tauri';
 
-const props = defineProps<{ settings: AppSettings | null }>();
-const emit = defineEmits<{ saved: [settings: AppSettings] }>();
+const props = defineProps<{ settings: AppSettings | null; modelId?: string | null }>();
+const emit = defineEmits<{ saved: [settings: AppSettings]; 'data-changed': [] }>();
 
 const saving = ref(false);
 const importing = ref(false);
+const dataMgmtBusy = ref<string | null>(null);
 const message = ref<string | null>(null);
 const installDir = ref('');
 const llamaPath = ref('');
@@ -20,6 +30,7 @@ const proxy = ref('');
 const autostart = ref(false);
 const serviceHost = ref('127.0.0.1');
 const servicePort = ref(8080);
+const aiDisplayName = ref('');
 const extraArgs = ref('');
 const logLevel = ref('INFO');
 
@@ -27,6 +38,11 @@ function mirrorKey(source: MirrorSource | undefined): 'auto' | 'model_scope' | '
   if (source === 'model_scope' || source === 'hf_mirror') return source;
   return 'auto';
 }
+
+// Placeholder hint for the AI-name box: shows what leaving it blank means.
+const aiNamePlaceholder = computed(() =>
+  props.modelId ? `留空 = 模型自己决定（如 ${displayNameFromModelId(props.modelId)}）` : '留空 = 模型自己决定'
+);
 
 function syncFromProps() {
   installDir.value = props.settings?.install_dir ?? '';
@@ -39,6 +55,7 @@ function syncFromProps() {
   autostart.value = props.settings?.autostart ?? false;
   serviceHost.value = props.settings?.service_host ?? '127.0.0.1';
   servicePort.value = props.settings?.service_port ?? 8080;
+  aiDisplayName.value = props.settings?.ai_display_name ?? '';
   extraArgs.value = props.settings?.extra_launch_args ?? '';
   logLevel.value = props.settings?.log_level ?? 'INFO';
 }
@@ -48,17 +65,6 @@ async function chooseInstallDir() {
   if (typeof selected === 'string') {
     installDir.value = selected;
     message.value = '已选择AI文件保存位置，点击保存设置后生效。';
-  }
-}
-
-async function chooseEngine() {
-  const selected = await open({
-    multiple: false,
-    filters: [{ name: '本地AI运行引擎', extensions: ['exe'] }]
-  });
-  if (typeof selected === 'string') {
-    llamaPath.value = selected;
-    message.value = '已选择本地AI运行引擎，点击保存设置后生效。';
   }
 }
 
@@ -100,10 +106,13 @@ async function save() {
       autostart: autostart.value,
       service_host: serviceHost.value,
       service_port: port,
+      ai_display_name: aiDisplayName.value.trim() || null,
       extra_launch_args: extraArgs.value.trim() || null,
       log_level: logLevel.value,
-      llama_server_path: llamaPath.value || null,
-      local_model_path: modelPath.value || null
+      // 引擎/模型路径由后端自动管理（安装、导入、切换时自动设置），
+      // 这里只透传现有值，不从只读展示框取值。
+      llama_server_path: props.settings.llama_server_path ?? null,
+      local_model_path: props.settings.local_model_path ?? null
     });
     emit('saved', next);
     message.value = '设置已保存。';
@@ -115,6 +124,70 @@ async function save() {
 }
 
 watch(() => props.settings, syncFromProps, { immediate: true });
+
+async function openDataFolder(kind: 'data' | 'logs') {
+  if (dataMgmtBusy.value) return;
+  dataMgmtBusy.value = `open-${kind}`;
+  message.value = null;
+  try {
+    const paths = await getDataPaths();
+    const target = kind === 'logs' ? paths.logs_dir : paths.data_dir;
+    await openPath(target);
+  } catch (error) {
+    message.value = `打开文件夹失败：${String(error)}`;
+  } finally {
+    dataMgmtBusy.value = null;
+  }
+}
+
+async function doClearAllChat() {
+  if (dataMgmtBusy.value) return;
+  if (!(await confirm('确定清空全部聊天记录？\n\n所有会话和消息都会被删除，模型和设置不受影响。此操作不可撤销。', { title: '清空聊天记录', kind: 'warning' }))) return;
+  dataMgmtBusy.value = 'clear-chat';
+  message.value = null;
+  try {
+    const result = await clearAllChatRecords();
+    message.value = result.message;
+    emit('data-changed');
+  } catch (error) {
+    message.value = String(error);
+  } finally {
+    dataMgmtBusy.value = null;
+  }
+}
+
+async function doUninstallAll() {
+  if (dataMgmtBusy.value) return;
+  if (!(await confirm('确定一键卸载全部模型？\n\n内置模型的文件将从本地删除，本地导入的模型仅取消跟踪（文件保留）。运行引擎不动。此操作不可撤销。', { title: '卸载全部模型', kind: 'warning' }))) return;
+  dataMgmtBusy.value = 'uninstall-all';
+  message.value = null;
+  try {
+    const result = await uninstallAllModels();
+    message.value = result.message;
+    emit('data-changed');
+  } catch (error) {
+    message.value = String(error);
+  } finally {
+    dataMgmtBusy.value = null;
+  }
+}
+
+async function doResetToFactory() {
+  if (dataMgmtBusy.value) return;
+  if (!(await confirm('【警告】重置到出厂设置会删除：\n· 所有模型文件\n· 运行引擎\n· 所有聊天记录\n· 所有设置\n· 日志\n\n此操作不可撤销。要继续吗？', { title: '重置到出厂设置', kind: 'warning' }))) return;
+  if (!(await confirm('再次确认：所有本地数据都会在下次启动时被清空，相当于全新安装状态。真的要重置吗？', { title: '再次确认重置', kind: 'warning' }))) return;
+  dataMgmtBusy.value = 'reset';
+  message.value = null;
+  try {
+    const result = await resetToFactory();
+    message.value = result.message;
+    await dialogMessage(result.message, { title: '重置到出厂设置' });
+  } catch (error) {
+    message.value = String(error);
+  } finally {
+    dataMgmtBusy.value = null;
+  }
+}
 </script>
 
 <template>
@@ -150,6 +223,12 @@ watch(() => props.settings, syncFromProps, { immediate: true });
       <input v-model="autostart" type="checkbox" />
       开机时自动启动本软件
     </label>
+
+    <label>
+      AI 自称名字
+      <input v-model="aiDisplayName" :placeholder="aiNamePlaceholder" />
+    </label>
+    <p class="muted small-hint">只在你想让 AI 用固定名字自称时才填。留空则让模型自己决定怎么回答「你是谁」。</p>
 
     <div class="service-access">
       <label>
@@ -193,14 +272,14 @@ watch(() => props.settings, syncFromProps, { immediate: true });
         <input v-model="extraArgs" placeholder="例如 --threads 8 --no-mmap" />
       </label>
 
+      <p class="muted">模型文件和运行引擎都会自动放在上面的「AI文件保存位置」里，无需手动设置。下面仅供查看当前位置。</p>
       <label>
-        本地AI运行引擎路径
-        <input v-model="llamaPath" placeholder="例如 D:\\tools\\llama-server.exe" />
+        本地AI运行引擎位置（自动）
+        <input v-model="llamaPath" readonly class="readonly-path" placeholder="安装运行引擎后自动生成" />
       </label>
-      <button class="secondary-button full-width" @click="chooseEngine">选择运行引擎</button>
       <label>
-        本地模型文件路径
-        <input v-model="modelPath" placeholder="例如 D:\\models\\chat-model.gguf" />
+        当前模型文件位置（自动）
+        <input v-model="modelPath" readonly class="readonly-path" placeholder="安装或导入模型后自动生成" />
       </label>
       <button class="secondary-button full-width" :disabled="importing" @click="importModel">
         {{ importing ? '正在导入' : '导入本地模型文件' }}
@@ -209,6 +288,33 @@ watch(() => props.settings, syncFromProps, { immediate: true });
 
     <button class="primary-button" :disabled="saving" @click="save">保存设置</button>
     <p v-if="message" class="notice">{{ message }}</p>
+
+    <details class="data-mgmt-box">
+      <summary>数据管理 / 清理</summary>
+      <p class="muted">这里的操作会直接影响本地数据，请谨慎使用。</p>
+
+      <div class="data-mgmt-row">
+        <button class="secondary-button" :disabled="dataMgmtBusy !== null" @click="openDataFolder('data')">
+          打开数据文件夹
+        </button>
+        <button class="secondary-button" :disabled="dataMgmtBusy !== null" @click="openDataFolder('logs')">
+          打开日志文件夹
+        </button>
+      </div>
+
+      <button class="secondary-button full-width" :disabled="dataMgmtBusy !== null" @click="doClearAllChat">
+        {{ dataMgmtBusy === 'clear-chat' ? '正在清空聊天记录' : '一键清空所有聊天记录' }}
+      </button>
+
+      <button class="danger-button-full" :disabled="dataMgmtBusy !== null" @click="doUninstallAll">
+        {{ dataMgmtBusy === 'uninstall-all' ? '正在卸载全部模型' : '一键卸载全部模型' }}
+      </button>
+
+      <button class="danger-button-full nuclear" :disabled="dataMgmtBusy !== null" @click="doResetToFactory">
+        {{ dataMgmtBusy === 'reset' ? '正在标记重置' : '重置到出厂设置' }}
+      </button>
+      <p class="muted small">重置需要关闭软件后重新打开才会生效。</p>
+    </details>
 
     <details class="about-box">
       <summary>关于</summary>
@@ -235,5 +341,61 @@ watch(() => props.settings, syncFromProps, { immediate: true });
 .about-box {
   margin-top: 8px;
   font-size: 12px;
+}
+.data-mgmt-box {
+  margin-top: 12px;
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.data-mgmt-box summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.data-mgmt-row {
+  display: flex;
+  gap: 8px;
+}
+.data-mgmt-row .secondary-button {
+  flex: 1;
+}
+.danger-button-full {
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid #d64545;
+  background: transparent;
+  color: #d64545;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+.danger-button-full:hover:not(:disabled) {
+  background: #d64545;
+  color: #fff;
+}
+.danger-button-full:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.danger-button-full.nuclear {
+  border-color: #a01414;
+  color: #a01414;
+}
+.danger-button-full.nuclear:hover:not(:disabled) {
+  background: #a01414;
+}
+.small {
+  font-size: 11px;
+  margin: -4px 0 0;
+}
+.small-hint {
+  font-size: 12px;
+  margin: -6px 0 4px;
+}
+.readonly-path {
+  background: #f2f3f5;
+  color: #6b7280;
+  cursor: default;
 }
 </style>
