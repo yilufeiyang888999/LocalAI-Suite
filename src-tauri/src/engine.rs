@@ -114,21 +114,25 @@ pub async fn ensure_engine_ready(
     })
 }
 
+// gh-proxy mirror is listed first: from within CN, direct github.com release
+// downloads frequently connect but then stall to a crawl, so we prefer the
+// mirror and fall back to the direct URL (with the per-chunk idle timeout in
+// try_download_archive catching any stall on either).
 static CPU_URLS: [&str; 2] = [
-    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
     "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
+    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
 ];
 static CUDA_URLS: [&str; 2] = [
-    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
     "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
+    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
 ];
 static CUDA_RUNTIME_URLS: [&str; 2] = [
-    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
     "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
 ];
 static VULKAN_URLS: [&str; 2] = [
-    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-vulkan-x64.zip",
     "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-vulkan-x64.zip",
+    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-vulkan-x64.zip",
 ];
 static CPU: EnginePackage = EnginePackage {
     backend: "CPUx86",
@@ -267,9 +271,28 @@ async fn try_download_archive(url: &str, sha256: &str, file_name: &str, package_
     if existing > 0 {
         request = request.header(header::RANGE, format!("bytes={}-", existing));
     }
-    let response = request.send().await.map_err(|_| {
-        AppError::Message("当前网络无法连接运行引擎下载源，请稍后重试。".to_string())
-    })?;
+    // Bound the wait for response headers independently. connect_timeout only
+    // covers TCP/TLS setup, and the 30-min total timeout is far too long: if a
+    // mirror accepts the connection but then stalls before sending headers, we
+    // want to fail fast and try the next URL rather than hang.
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        request.send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            return Err(AppError::Message(
+                "当前网络无法连接运行引擎下载源，请稍后重试。".to_string(),
+            ))
+        }
+        Err(_) => {
+            return Err(AppError::Message(
+                "运行引擎下载源响应超时，正在尝试其他线路。".to_string(),
+            ))
+        }
+    };
 
     if !(response.status().is_success() || response.status() == StatusCode::PARTIAL_CONTENT) {
         return Err(AppError::Message(
@@ -285,9 +308,24 @@ async fn try_download_archive(url: &str, sha256: &str, file_name: &str, package_
         fs::File::create(&tmp_path).await?
     };
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|_| AppError::Message("运行引擎下载中断了，请稍后重试。".to_string()))?;
+    // Idle timeout: GitHub release downloads from within CN often connect but
+    // then stall (no bytes for a long time). Without this the download would
+    // hang until the 30-minute total timeout before trying the next mirror.
+    // Bounding each chunk wait lets us fail fast and fall through to gh-proxy.
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    loop {
+        let next = tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await;
+        let chunk = match next {
+            Ok(Some(chunk)) => chunk.map_err(|_| {
+                AppError::Message("运行引擎下载中断了，请稍后重试。".to_string())
+            })?,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(AppError::Message(
+                    "运行引擎下载停滞了（长时间没有数据），正在尝试其他线路。".to_string(),
+                ))
+            }
+        };
         file.write_all(&chunk).await?;
     }
     file.flush().await?;

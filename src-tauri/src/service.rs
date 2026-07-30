@@ -620,8 +620,11 @@ async fn launch_service(
     })?;
 
     // Require two consecutive healthy probes so a single transient 200 during
-    // llama.cpp warmup doesn't get mistaken for a stable service.
-    if let Err(error) = wait_for_health(port, 2, startup_timeout_secs).await {
+    // llama.cpp warmup doesn't get mistaken for a stable service. The health
+    // wait also watches the child: if the process exits early (corrupted exe,
+    // missing DLL, incompatible GPU backend), we fail fast instead of waiting
+    // out the full 180s timeout.
+    if let Err(error) = wait_for_health(&mut child, port, 2, startup_timeout_secs).await {
         let _ = child.kill();
         return Err(error);
     }
@@ -672,7 +675,12 @@ fn set_running(
     Ok(info)
 }
 
-async fn wait_for_health(port: u16, required_consecutive: u32, timeout_secs: u64) -> AppResult<()> {
+async fn wait_for_health(
+    child: &mut Child,
+    port: u16,
+    required_consecutive: u32,
+    timeout_secs: u64,
+) -> AppResult<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -685,6 +693,19 @@ async fn wait_for_health(port: u16, required_consecutive: u32, timeout_secs: u64
     let mut consecutive = 0;
 
     while Instant::now() < deadline {
+        // Fast-fail: if the server process has already exited (corrupted exe,
+        // missing DLL, incompatible GPU backend, out-of-memory abort), stop
+        // waiting immediately rather than burning the whole timeout. This is
+        // what keeps a failed GPU launch from making the user wait ~180s per
+        // attempt before falling back to CPU safe mode.
+        if let Ok(Some(exit_status)) = child.try_wait() {
+            let code = exit_status.code().unwrap_or(-1);
+            return Err(AppError::Message(format!(
+                "AI服务进程启动后异常退出（退出码 {}），可能是运行引擎与硬件不兼容或模型文件损坏。",
+                code
+            )));
+        }
+
         let healthy = client
             .get(&url)
             .send()
