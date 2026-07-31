@@ -8,8 +8,7 @@ const scenes: Array<{ value: Scene; title: string; desc: string }> = [
   { value: 'chat', title: '日常聊天问答', desc: '适合先体验本地AI，回答问题和简单交流。' },
   { value: 'writing', title: '写文案/写报告', desc: '更重视中文表达和长文本整理。' },
   { value: 'coding', title: '写代码', desc: '更适合解释代码、生成代码和排查问题。' },
-  { value: 'knowledge', title: '本地知识库', desc: '为后续接入本地资料问答预留。' },
-  { value: 'roleplay', title: '角色扮演', desc: '更重视对话自然度和风格稳定。' }
+  { value: 'general', title: '通用', desc: '不限定具体场景，按模型综合表现推荐。' }
 ];
 </script>
 

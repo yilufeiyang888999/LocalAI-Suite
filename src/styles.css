@@ -22,10 +22,8 @@ button, input { font: inherit; }
   box-shadow: 0 18px 40px rgba(47, 109, 246, 0.24);
   margin-bottom: 22px;
 }
-
-.app-header h1 { margin: 6px 0 8px; font-size: 34px; }
+.app-header h1 { margin: 0 0 8px; font-size: 34px; }
 .app-header p { margin: 0; opacity: 0.92; }
-.eyebrow { letter-spacing: 0.12em; font-size: 13px; }
 
 .layout { display: grid; grid-template-columns: 1fr 340px; gap: 20px; align-items: start; }
 .main-flow, .side-flow { display: flex; flex-direction: column; gap: 18px; }

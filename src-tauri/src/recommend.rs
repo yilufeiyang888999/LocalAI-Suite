@@ -71,8 +71,13 @@ pub fn recommend_models(
         .cloned()
         .filter(|model| model.vram_required_gb <= max_required)
         .map(|model| {
+            // Scene match is the dominant signal: a 4B model tagged for the
+            // user's selected scene should beat a 14B model tagged for
+            // something else — the user picked a use case, not a parameter
+            // count, so honour it. `General` acts as a safe fallback
+            // (everyone gets a small boost there).
             let scene_match = if model.recommended_scene.contains(&request.scene) {
-                35.0
+                50.0
             } else {
                 5.0
             };

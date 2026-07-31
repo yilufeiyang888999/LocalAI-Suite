@@ -446,10 +446,11 @@ async function handleFix(issueId: string) {
 <template>
   <main class="app-shell">
     <header class="app-header">
-      <div>
-        <p class="eyebrow">MVP 可运行骨架</p>
-        <h1>本地AI模型一键部署助手</h1>
-        <p>检测电脑配置，推荐合适模型，并引导启动本地AI聊天。</p>
+      <div class="header-content">
+        <div>
+          <h1>本地AI模型一键部署助手</h1>
+          <p>检测电脑配置，推荐合适模型，并引导启动本地AI聊天。</p>
+        </div>
       </div>
     </header>
 

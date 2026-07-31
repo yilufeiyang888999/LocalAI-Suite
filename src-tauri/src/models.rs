@@ -77,11 +77,14 @@ pub struct ModelMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Scene {
+    /// Casual chat and Q&A: fast, lightweight, low memory.
     Chat,
+    /// Long-form Chinese writing: reports, articles, structured output.
     Writing,
+    /// Code generation, explanation, debugging.
     Coding,
-    Knowledge,
-    Roleplay,
+    /// Catch-all when no specific scene fits; falls back to general-purpose scoring.
+    General,
 }
 
 impl Scene {
@@ -90,8 +93,7 @@ impl Scene {
             Scene::Chat => "日常聊天问答",
             Scene::Writing => "写文案/写报告",
             Scene::Coding => "写代码",
-            Scene::Knowledge => "本地知识库",
-            Scene::Roleplay => "角色扮演",
+            Scene::General => "通用场景",
         }
     }
 }
@@ -389,7 +391,7 @@ pub fn builtin_models() -> Vec<ModelMetadata> {
             vram_required_gb: 10.5,
             file_size_mb: 9002,
             context_length: 32768,
-            recommended_scene: vec![Scene::Chat, Scene::Writing, Scene::Knowledge, Scene::Roleplay, Scene::Coding],
+            recommended_scene: vec![Scene::Coding, Scene::Writing, Scene::General],
             chinese_score: 95,
             speed_rating: 2,
             architecture: "Qwen3".to_string(),
@@ -419,7 +421,7 @@ pub fn builtin_models() -> Vec<ModelMetadata> {
             vram_required_gb: 6.0,
             file_size_mb: 5028,
             context_length: 32768,
-            recommended_scene: vec![Scene::Chat, Scene::Writing, Scene::Knowledge, Scene::Roleplay, Scene::Coding],
+            recommended_scene: vec![Scene::Writing, Scene::General, Scene::Chat],
             chinese_score: 93,
             speed_rating: 3,
             architecture: "Qwen3".to_string(),
@@ -449,7 +451,7 @@ pub fn builtin_models() -> Vec<ModelMetadata> {
             vram_required_gb: 3.4,
             file_size_mb: 2497,
             context_length: 32768,
-            recommended_scene: vec![Scene::Chat, Scene::Writing, Scene::Roleplay, Scene::Coding],
+            recommended_scene: vec![Scene::Chat, Scene::General],
             chinese_score: 90,
             speed_rating: 4,
             architecture: "Qwen3".to_string(),
@@ -479,7 +481,7 @@ pub fn builtin_models() -> Vec<ModelMetadata> {
             vram_required_gb: 2.4,
             file_size_mb: 1834,
             context_length: 32768,
-            recommended_scene: vec![Scene::Chat, Scene::Roleplay],
+            recommended_scene: vec![Scene::Chat],
             chinese_score: 84,
             speed_rating: 5,
             architecture: "Qwen3".to_string(),
@@ -488,6 +490,39 @@ pub fn builtin_models() -> Vec<ModelMetadata> {
             download_url: "https://www.modelscope.cn/models/Qwen/Qwen3-1.7B-GGUF/resolve/master/Qwen3-1.7B-Q8_0.gguf".to_string(),
             mirror_urls: vec!["https://hf-mirror.com/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf".to_string()],
             sha256: "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a".to_string(),
+            supported_gpu: vec!["NVIDIA".to_string(), "CPU".to_string()],
+            license: "Apache-2.0".to_string(),
+            is_installed: false,
+            local_path: None,
+        },
+        ModelMetadata {
+            id: "ornith_1_0_9b".to_string(),
+            name: "Ornith-1.0 9B 增强版".to_string(),
+            author: "Ornith".to_string(),
+            base_model: "Ornith-1.0-9B".to_string(),
+            display_compression: "普通压缩版".to_string(),
+            quant_level: "Q4_K_M".to_string(),
+            quant_type: "GGUF/Q4_K_M".to_string(),
+            quant_bpp: 0.5,
+            parameter_count: "9B".to_string(),
+            parameters_raw: 9_500_000_000,
+            active_parameters: None,
+            is_moe: false,
+            vram_required_gb: 5.5,
+            file_size_mb: 5367,
+            context_length: 32768,
+            // Ornith is a Qwen3-8B fine-tune positioned as a general-purpose
+            // chat/write/coding model. Slot it between 8B (light) and 14B
+            // (top) on the 8GB tier — fills the mid-range gap.
+            recommended_scene: vec![Scene::General, Scene::Writing, Scene::Coding],
+            chinese_score: 91,
+            speed_rating: 3,
+            architecture: "Qwen3".to_string(),
+            model_format: "gguf".to_string(),
+            release_date: "2025-07-01".to_string(),
+            download_url: "https://www.modelscope.cn/models/deepreinforce-ai/Ornith-1.0-9B-GGUF/file/view/master/ornith-1.0-9b-Q4_K_M.gguf?status=2".to_string(),
+            mirror_urls: vec!["https://hf-mirror.com/deepreinforce-ai/Ornith-1.0-9B-GGUF/resolve/main/ornith-1.0-9b-Q4_K_M.gguf".to_string()],
+            sha256: "5720d1f671b4996481274fffe01868c3c36e87c135cc8538471cc7bd6087b106".to_string(),
             supported_gpu: vec!["NVIDIA".to_string(), "CPU".to_string()],
             license: "Apache-2.0".to_string(),
             is_installed: false,

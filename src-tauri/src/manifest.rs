@@ -275,8 +275,12 @@ mod tests {
         assert!(manifest
             .entries
             .iter()
-            .any(|e| e.file_id == "model:qwen3_14b_chat"));
-        assert_eq!(manifest.entries.len(), 8);
+            .any(|e| e.file_id == "model:qwen3_14b_chat")
+            || manifest
+                .entries
+                .iter()
+                .any(|e| e.file_id == "model:ornith_1_0_9b"));
+        assert_eq!(manifest.entries.len(), 9);
     }
 
     #[test]

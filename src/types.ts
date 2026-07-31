@@ -40,7 +40,7 @@ export interface DiskInfo {
   available_gb: number;
 }
 
-export type Scene = 'chat' | 'writing' | 'coding' | 'knowledge' | 'roleplay';
+export type Scene = 'chat' | 'writing' | 'coding' | 'general';
 
 export interface ModelMetadata {
   id: string;
