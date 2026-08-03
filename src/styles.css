@@ -15,15 +15,34 @@ button, input { font: inherit; }
 .app-shell { padding: 28px; }
 
 .app-header {
-  padding: 28px;
+  padding: 24px 28px;
   border-radius: 24px;
   color: white;
   background: linear-gradient(135deg, #2f6df6, #6b8cff);
   box-shadow: 0 18px 40px rgba(47, 109, 246, 0.24);
   margin-bottom: 22px;
 }
-.app-header h1 { margin: 0 0 8px; font-size: 34px; }
-.app-header p { margin: 0; opacity: 0.92; }
+.app-header .header-content {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+.app-header .app-logo {
+  /* Round the square source PNG so the mark feels like an app icon, and
+     shrink to a single line of headline height so it doesn't dwarf the
+     two-line title block. */
+  width: 56px;
+  height: 56px;
+  flex: 0 0 56px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+  padding: 4px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  object-fit: cover;
+}
+.app-header .header-text { min-width: 0; }
+.app-header h1 { margin: 0 0 6px; font-size: 26px; line-height: 1.2; }
+.app-header p { margin: 0; opacity: 0.92; font-size: 13px; line-height: 1.5; }
 
 .layout { display: grid; grid-template-columns: 1fr 340px; gap: 20px; align-items: start; }
 .main-flow, .side-flow { display: flex; flex-direction: column; gap: 18px; }

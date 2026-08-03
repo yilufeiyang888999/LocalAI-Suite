@@ -262,6 +262,11 @@ async function switchModel(model: InstalledModelInfo) {
     settings.value = await getSettings();
     await loadInstalledModels();
     await prepareEngineAndStart(model.model_id);
+    // Belt-and-suspenders: the start flow emits service_status_changed which
+    // already updated `service`, but a defensive getServiceStatus() guarantees
+    // the ThirdPartyConnect card sees the new model_id even if an event got
+    // dropped (Tauri 2 events are not guaranteed-delivery on the JS side).
+    service.value = await getServiceStatus();
     await loadInstalledModels();
   } catch (error) {
     serviceMessage.value = String(error);
@@ -447,7 +452,8 @@ async function handleFix(issueId: string) {
   <main class="app-shell">
     <header class="app-header">
       <div class="header-content">
-        <div>
+        <img class="app-logo" src="/app-logo.png" alt="本地AI模型一键部署助手" />
+        <div class="header-text">
           <h1>本地AI模型一键部署助手</h1>
           <p>检测电脑配置，推荐合适模型，并引导启动本地AI聊天。</p>
         </div>

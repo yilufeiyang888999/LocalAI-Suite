@@ -219,6 +219,17 @@ pub async fn start_service_core(
         // Keep host/port — they are needed for the restarting_same_address
         // check below and will be overwritten by set_starting later.
     }
+    // Emit *now* so the frontend's ThirdPartyConnect/ChatView cards see the
+    // new model_id immediately, rather than waiting for set_starting /
+    // set_running to fire after the await points below. Without this, if any
+    // later step (port-availability check, GPU param computation) takes a
+    // moment, the UI briefly (or in some Tauri 2 cases persistently) shows the
+    // previous model_id even though the service is about to start with the
+    // new one.
+    let _ = app.emit(
+        "service_status_changed",
+        &service_status(state),
+    );
     let (host, extra_args) = {
         let inner = state.inner.lock().expect("state lock poisoned");
         let host = inner.settings.service_host.clone();
@@ -349,13 +360,38 @@ pub async fn start_service_core(
             }
 
             tracing::warn!(%model_id, backend = ?backend, error = %error, "GPU launch failed; falling back to CPU safe mode");
-            let Some(cpu_path) = find_cpu_engine_executable(&install_dir) else {
-                let info = set_failed(
-                    app,
-                    state,
-                    "显卡加速暂时没启动成功，也没有找到 CPU 备用运行引擎。".to_string(),
-                );
-                return Err(AppError::Message(info.message));
+            // The CPU fallback may not be on disk yet because `ensure_engine_ready`
+            // for a GPU backend now downloads it in the background (so a slow
+            // network doesn't block the user who asked for GPU). Try once to
+            // fetch it synchronously here — if a download is already in flight,
+            // the call is fast; if not, it's a 16 MB package and worth a short
+            // wait before we tell the user "no CPU fallback either."
+            let cpu_path = match find_cpu_engine_executable(&install_dir) {
+                Some(path) => path,
+                None => {
+                    let engine_dir = install_dir.join("engine");
+                    let backend_dir = engine_dir.join("backends");
+                    if let Err(fallback_error) = crate::engine::prepare_cpu_package(&engine_dir, &backend_dir).await {
+                        tracing::warn!(error = %fallback_error, "CPU fallback engine fetch failed during GPU fallback");
+                        let info = set_failed(
+                            app,
+                            state,
+                            "显卡加速暂时没启动成功，也没有找到 CPU 备用运行引擎。".to_string(),
+                        );
+                        return Err(AppError::Message(info.message));
+                    }
+                    match find_cpu_engine_executable(&install_dir) {
+                        Some(path) => path,
+                        None => {
+                            let info = set_failed(
+                                app,
+                                state,
+                                "显卡加速暂时没启动成功，也没有找到 CPU 备用运行引擎。".to_string(),
+                            );
+                            return Err(AppError::Message(info.message));
+                        }
+                    }
+                }
             };
 
             let safe_params = LaunchParams { n_gpu_layers: None, ctx_size: 2048, parallel: 1, kv_quant: false };

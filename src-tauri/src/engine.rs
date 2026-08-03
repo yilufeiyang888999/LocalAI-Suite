@@ -74,12 +74,23 @@ pub async fn ensure_engine_ready(
     // A GPU backend can still fail to launch on a given machine (missing Vulkan
     // ICD, driver too old for the CUDA build, etc.), in which case the service
     // falls back to CPU safe mode — which needs `llama-server-cpu.exe` present.
-    // Prepare the small CPU package alongside so that fallback actually works.
-    // Best-effort: a CPU download failure must not block a working GPU backend.
+    //
+    // Run the CPU download in the *background* rather than awaiting it on the
+    // startup path. A slow network can stretch a 16 MB package over several
+    // minutes, and the user just asked for the GPU backend — making them wait
+    // for the CPU fallback they may never need is a bad tradeoff. If the GPU
+    // path does fail later, the service flow re-runs `ensure_engine_ready`
+    // for the CPU backend and will wait for the in-flight download to finish
+    // before giving up.
     if package.backend != CPU.backend {
-        if let Err(error) = prepare_package(&CPU, &engine_dir, &backend_dir).await {
-            tracing::warn!(error = %error, "failed to prepare CPU fallback engine alongside GPU backend");
-        }
+        let engine_dir_bg = engine_dir.to_path_buf();
+        let backend_dir_bg = backend_dir.to_path_buf();
+        tokio::spawn(async move {
+            match prepare_package(&CPU, &engine_dir_bg, &backend_dir_bg).await {
+                Ok(()) => tracing::info!("CPU fallback engine ready in background"),
+                Err(error) => tracing::warn!(error = %error, "background CPU fallback engine download failed"),
+            }
+        });
     }
 
     fs::write(
@@ -114,23 +125,28 @@ pub async fn ensure_engine_ready(
     })
 }
 
-// gh-proxy mirror is listed first: from within CN, direct github.com release
-// downloads frequently connect but then stall to a crawl, so we prefer the
-// mirror and fall back to the direct URL (with the per-chunk idle timeout in
-// try_download_archive catching any stall on either).
-static CPU_URLS: [&str; 2] = [
+// ModelScope mirror (CN) is listed first: from within CN, direct github.com
+// release downloads frequently connect but then stall to a crawl, so we
+// prefer the ModelScope CDN, then a generic GitHub proxy, then the direct
+// URL. The per-chunk idle timeout in try_download_archive catches any stall
+// on any of them.
+static CPU_URLS: [&str; 3] = [
+    "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/llama-b9837-bin-win-cpu-x64.zip",
     "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
     "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
 ];
-static CUDA_URLS: [&str; 2] = [
+static CUDA_URLS: [&str; 3] = [
+    "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/llama-b9837-bin-win-cuda-12.4-x64.zip",
     "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
     "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
 ];
-static CUDA_RUNTIME_URLS: [&str; 2] = [
+static CUDA_RUNTIME_URLS: [&str; 3] = [
+    "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/cudart-llama-bin-win-cuda-12.4-x64.zip",
     "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
     "https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
 ];
-static VULKAN_URLS: [&str; 2] = [
+static VULKAN_URLS: [&str; 3] = [
+    "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/llama-b9837-bin-win-vulkan-x64.zip",
     "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-vulkan-x64.zip",
     "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-vulkan-x64.zip",
 ];
@@ -219,6 +235,16 @@ async fn prepare_package(
         extract_dependency_archive(&archive_path, backend_dir).await?;
     }
     Ok(())
+}
+
+/// Public wrapper around `prepare_package` for the CPU engine, so the GPU→CPU
+/// fallback path in `service::start_service_core` can pull the CPU package
+/// without going through the full `ensure_engine_ready` Tauri command (which
+/// would also write `current_backend.txt` and overwrite settings — not what
+/// we want when GPU is the user's chosen backend and we're just shoring up
+/// the fallback exe).
+pub async fn prepare_cpu_package(engine_dir: &Path, backend_dir: &Path) -> AppResult<()> {
+    prepare_package(&CPU, engine_dir, backend_dir).await
 }
 
 async fn download_archive(urls: &[&str], sha256: &str, file_name: &str, package_path: &Path) -> AppResult<()> {
