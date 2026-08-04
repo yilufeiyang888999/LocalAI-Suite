@@ -320,6 +320,7 @@ async function doResetToFactory() {
       <summary>关于</summary>
       <p class="muted">本地AI模型一键部署助手 · 版本 0.1.0（MVP）</p>
       <p class="muted">所有对话、设置与日志均保存在本机，不会上传云端。</p>
+      <p class="muted">首次启动 AI 服务时，Windows 可能弹窗询问是否允许运行，请选择「仍要运行」。</p>
       <p class="muted">遇到问题可导出诊断日志（已脱敏）反馈给开发者。</p>
     </details>
   </section>

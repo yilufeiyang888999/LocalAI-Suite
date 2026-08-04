@@ -50,12 +50,26 @@ const DEFAULT_CUDA_PARAMS: LaunchParams = LaunchParams {
     kv_quant: false,
 };
 
-/// Health-check budget for a GPU launch. The first GPU cold start can be slow:
-/// Windows Defender scans the large CUDA DLLs (`ggml-cuda.dll` is ~565MB), and
-/// CUDA may JIT-compile kernels for a newer GPU arch not precompiled in the
-/// build (both results get cached, so later starts are fast). 90s was too tight
-/// and misfired as a failure — falling back to CPU on a perfectly usable GPU.
-const GPU_STARTUP_TIMEOUT_SECS: u64 = 180;
+/// Health-check budget for a GPU launch.
+///
+/// The first GPU cold start can be slow: Windows Defender scans the large CUDA
+/// DLLs (`ggml-cuda.dll` is ~565MB), and CUDA may JIT-compile kernels for a
+/// newer GPU arch not precompiled in the build (both results get cached, so
+/// later starts are fast). 90s was empirically too tight and misfired as a
+/// failure on a perfectly usable GPU, falling back to CPU.
+///
+/// 180s was too generous: with the two-attempt strategy (aggressive params
+/// then conservative params) it made the user wait ~6 minutes before falling
+/// back to CPU safe mode on a launch that was never going to succeed — most
+/// commonly because Windows SmartScreen blocked the unsigned
+/// `llama-server-vulkan.exe` at the OS layer (no process is ever spawned,
+/// so the in-process fast-fail on `child.try_wait()` cannot see it).
+///
+/// 120s is the middle ground: still leaves headroom for cold-start DLL scan
+/// + JIT, but trims the two-attempt total from ~6 min to ~4 min when the GPU
+/// path is going to fail anyway. Real (working) GPU starts are observed at
+/// 26–60s in practice.
+const GPU_STARTUP_TIMEOUT_SECS: u64 = 120;
 
 /// Health-check budget for a CPU launch (and CPU safe-mode fallback). CPU has no
 /// JIT step, so the original tighter budget is fine.
