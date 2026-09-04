@@ -111,23 +111,44 @@ pub fn update_settings(
 ) -> AppResult<AppSettings> {
     let mut inner = state.inner.lock().expect("state lock poisoned");
     let autostart_changed = inner.settings.autostart != settings.autostart;
-    save_settings(&inner.data_dir, &settings)?;
+    // The frontend's `SettingsPanel.save()` spreads its cached `settings`
+    // object and forwards every field, but `local_model_path` and
+    // `llama_server_path` are owned by dedicated commands
+    // (`switch_installed_model` / `import_local_model` /
+    // `ensure_engine_ready` / `start_download` / `update_installed_model`).
+    // Letting the frontend's stale copy overwrite them here would silently
+    // revert those pointers — e.g. a settings change right after switching
+    // models would re-point the config at the previous model. Sanitize first.
+    let sanitized = sanitize_settings_update(&inner.settings, settings);
+    save_settings(&inner.data_dir, &sanitized)?;
     if autostart_changed {
         // Best-effort: a failed registry write must not block saving settings.
-        let _ = apply_autostart(settings.autostart);
+        let _ = apply_autostart(sanitized.autostart);
     }
     tracing::info!(
-        autostart = settings.autostart,
+        autostart = sanitized.autostart,
         autostart_changed,
-        mirror = ?settings.mirror_source,
-        log_level = %settings.log_level,
-        speed_limit = ?settings.download_speed_limit,
-        service_host = %settings.service_host,
-        service_port = settings.service_port,
+        mirror = ?sanitized.mirror_source,
+        log_level = %sanitized.log_level,
+        speed_limit = ?sanitized.download_speed_limit,
+        service_host = %sanitized.service_host,
+        service_port = sanitized.service_port,
         "settings updated"
     );
-    inner.settings = settings.clone();
-    Ok(settings)
+    inner.settings = sanitized.clone();
+    Ok(sanitized)
+}
+
+/// Keep the two engine/model pointers from being overwritten by a stale
+/// frontend snapshot passed into `update_settings`. All other fields are
+/// accepted as-is — they are the ones the user can actually edit from
+/// SettingsPanel.
+pub fn sanitize_settings_update(current: &AppSettings, incoming: AppSettings) -> AppSettings {
+    AppSettings {
+        local_model_path: current.local_model_path.clone(),
+        llama_server_path: current.llama_server_path.clone(),
+        ..incoming
+    }
 }
 
 /// Register or remove this app from Windows per-user startup (HKCU Run key) via
@@ -161,4 +182,72 @@ fn apply_autostart(enable: bool) -> AppResult<()> {
 #[cfg(not(windows))]
 fn apply_autostart(_enable: bool) -> AppResult<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_preserves_current_engine_and_model_paths() {
+        // Simulate a stale frontend snapshot that still references the previous
+        // model/engine, sent right after the user switched models. Without
+        // sanitization, this would silently revert the config to the old paths.
+        let mut current = AppSettings::default();
+        current.local_model_path = Some(PathBuf::from("/install/models/qwen3_8b_chat/Qwen3-8B-Q4_K_M.gguf"));
+        current.llama_server_path = Some(PathBuf::from("/install/engine/backends/llama-server-cuda.exe"));
+
+        let mut incoming = current.clone();
+        incoming.local_model_path = Some(PathBuf::from("/install/models/ornith-1.0-9b-Q4/ornith-1.0-9b-Q4_K_M.gguf"));
+        incoming.llama_server_path = Some(PathBuf::from("/install/engine/backends/llama-server-vulkan.exe"));
+        // User also changed the listen port — that change MUST survive.
+        incoming.service_port = 9000;
+
+        let sanitized = sanitize_settings_update(&current, incoming);
+
+        assert_eq!(
+            sanitized.local_model_path,
+            Some(PathBuf::from("/install/models/qwen3_8b_chat/Qwen3-8B-Q4_K_M.gguf")),
+            "stale local_model_path from the frontend must not overwrite the current pointer"
+        );
+        assert_eq!(
+            sanitized.llama_server_path,
+            Some(PathBuf::from("/install/engine/backends/llama-server-cuda.exe")),
+            "stale llama_server_path from the frontend must not overwrite the current pointer"
+        );
+        assert_eq!(
+            sanitized.service_port, 9000,
+            "user-edited fields must still go through"
+        );
+    }
+
+    #[test]
+    fn sanitize_passes_through_all_other_fields() {
+        // Everything the user can actually edit in SettingsPanel must reach
+        // config.json unchanged — sanitize is a filter, not a rewriter.
+        let current = AppSettings::default();
+        let mut incoming = current.clone();
+        incoming.mirror_source = MirrorSource::HfMirror;
+        incoming.log_level = "DEBUG".to_string();
+        incoming.ai_display_name = Some("小助手".to_string());
+        incoming.download_speed_limit = Some(5_000_000);
+        incoming.proxy = Some("http://127.0.0.1:7890".to_string());
+        incoming.autostart = true;
+        incoming.extra_launch_args = Some("--ctx-size 8192".to_string());
+        incoming.service_host = "0.0.0.0".to_string();
+
+        let sanitized = sanitize_settings_update(&current, incoming);
+
+        assert!(matches!(sanitized.mirror_source, MirrorSource::HfMirror));
+        assert_eq!(sanitized.log_level, "DEBUG");
+        assert_eq!(sanitized.ai_display_name.as_deref(), Some("小助手"));
+        assert_eq!(sanitized.download_speed_limit, Some(5_000_000));
+        assert_eq!(sanitized.proxy.as_deref(), Some("http://127.0.0.1:7890"));
+        assert!(sanitized.autostart);
+        assert_eq!(sanitized.extra_launch_args.as_deref(), Some("--ctx-size 8192"));
+        assert_eq!(sanitized.service_host, "0.0.0.0");
+        // And the two protected pointers still come from `current`.
+        assert_eq!(sanitized.local_model_path, current.local_model_path);
+        assert_eq!(sanitized.llama_server_path, current.llama_server_path);
+    }
 }
