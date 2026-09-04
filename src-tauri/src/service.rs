@@ -2,6 +2,10 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Child, Command},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -438,6 +442,9 @@ pub fn stop_model_service(
 /// Stop the running local service (killing our spawned child or a reattached
 /// pid) and clear its persisted snapshot. Shared by the command and update flow.
 pub fn stop_service_core(app: &AppHandle, state: &AppState) -> ServiceInfo {
+    // Stop the auto-restart watchdog *first* so it doesn't try to revive the
+    // process we are about to kill.
+    stop_service_watchdog(state);
     let info = {
         let mut inner = state.inner.lock().expect("state lock poisoned");
         if let Some(mut child) = inner.service.process.take() {
@@ -511,6 +518,9 @@ pub async fn recover_service(
             }
         };
         let _ = app.emit("service_status_changed", &info);
+        // Reattach path: the old process is alive and answering, so we want
+        // the same auto-restart safety net as a freshly spawned service.
+        spawn_service_watchdog(app.clone(), (*state).clone());
         return Ok(info);
     }
 
@@ -721,6 +731,7 @@ fn set_running(
     };
 
     let _ = app.emit("service_status_changed", &info);
+    spawn_service_watchdog(app.clone(), state.clone());
     tracing::info!(model_id = ?info.model_id, port = ?info.port, safe_mode, "llama-server running");
     Ok(info)
 }
@@ -829,6 +840,187 @@ fn set_failed(app: &AppHandle, state: &AppState, message: String) -> ServiceInfo
     };
     let _ = app.emit("service_status_changed", &info);
     info
+}
+
+/// Spawn a background task that watches the running llama-server process and
+/// automatically restarts it if it dies unexpectedly (e.g. OOM abort, GPU
+/// driver crash, user killed it from Task Manager). User-initiated stops go
+/// through `stop_service_core` which sets the stop flag first, so the loop
+/// exits cleanly without trying to revive a service the user just killed.
+///
+/// This is intentionally minimal: process-alive polling + bounded restart
+/// with exponential backoff. It does NOT do periodic health-probe of the
+/// HTTP endpoint — the in-process `try_wait` is cheaper and catches all
+/// crash classes the user would care about (process gone = unhealthy). A
+/// hung process that still answers `/v1/models` but never produces tokens
+/// is a separate, much harder problem and is out of scope here.
+pub fn spawn_service_watchdog(app: AppHandle, state: AppState) {
+    // Stop any previous watchdog (e.g. when switching models restarts the
+    // service, or recover_service re-spawns after a crash). The old loop
+    // sees the flag and exits on its next iteration; new loop takes over.
+    stop_service_watchdog(&state);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let mut inner = state.inner.lock().expect("state lock poisoned");
+        inner.watchdog_stop = Some(stop.clone());
+    }
+
+    let app_for_task = app.clone();
+    let state_for_task = state.clone();
+    let stop_for_task = stop.clone();
+
+    tokio::spawn(async move {
+        service_watchdog_loop(app_for_task, state_for_task, stop_for_task).await;
+    });
+
+    tracing::info!("service watchdog spawned");
+}
+
+/// Signal the watchdog loop to exit on its next iteration. Safe to call when
+/// no watchdog is running.
+pub fn stop_service_watchdog(state: &AppState) {
+    let prev = {
+        let mut inner = state.inner.lock().expect("state lock poisoned");
+        inner.watchdog_stop.take()
+    };
+    if let Some(stop_flag) = prev {
+        stop_flag.store(true, Ordering::Relaxed);
+    }
+}
+
+async fn service_watchdog_loop(app: AppHandle, state: AppState, stop: Arc<AtomicBool>) {
+    /// How often the watchdog polls `child.try_wait()`.
+    const POLL: Duration = Duration::from_secs(5);
+    /// Backoff between successive restart attempts. The first attempt is
+    /// immediate; subsequent ones wait progressively longer to give the
+    /// system (GPU driver, free VRAM, etc.) time to settle, and to avoid
+    /// tight crash-restart loops when the underlying cause persists.
+    const BACKOFF: [Duration; 6] = [
+        Duration::from_secs(0),  // 1st: immediate
+        Duration::from_secs(5),  // 2nd
+        Duration::from_secs(15), // 3rd
+        Duration::from_secs(30), // 4th
+        Duration::from_secs(60), // 5th
+        Duration::from_secs(60), // 6th+: cap at 60s
+    ];
+    /// After this many consecutive restart failures the watchdog gives up and
+    /// the service is left in `Failed` state for the user to handle (likely
+    /// the same root cause that killed the original process will keep
+    /// killing every restart: bad driver, OOM, missing file, etc.).
+    const MAX_FAILURES: u32 = 5;
+
+    let mut consecutive_failures: u32 = 0;
+    tracing::info!("service watchdog loop entered");
+
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(POLL).await;
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Step 1: bail out if the service is no longer expected to be running.
+        // (User pressed Stop, or a previous restart already failed and
+        // set_failed flipped the status — either way, no point watching.)
+        let (should_monitor, model_id) = {
+            let inner = state.inner.lock().expect("state lock poisoned");
+            (
+                matches!(inner.service.status, ServiceStatus::Running),
+                inner.service.model_id.clone(),
+            )
+        };
+        if !should_monitor {
+            break;
+        }
+
+        // Step 2: is the process still alive? `try_wait` is non-blocking and
+        // returns Some(exit) iff the OS has reaped the child.
+        let exit_status = {
+            let mut inner = state.inner.lock().expect("state lock poisoned");
+            match inner.service.process.as_mut() {
+                Some(child) => child.try_wait().ok().flatten(),
+                // Reattached process: we have no Child handle, so we can't
+                // poll the kernel for it. Skip — the next start_service_core
+                // path will respawn us with a fresh handle.
+                None => None,
+            }
+        };
+        let Some(exit) = exit_status else {
+            continue;
+        };
+
+        let Some(model_id) = model_id else {
+            tracing::warn!("watchdog: process died but no model_id recorded; exiting");
+            break;
+        };
+
+        tracing::warn!(
+            model_id = %model_id,
+            exit_code = ?exit.code(),
+            "watchdog: llama-server crashed, scheduling restart"
+        );
+
+        // Clear the dead child handle and reset status so start_service_core
+        // can run its "kill any existing + set Starting" guard cleanly. The
+        // previous `process` is already dead so dropping it is a no-op.
+        {
+            let mut inner = state.inner.lock().expect("state lock poisoned");
+            inner.service.process = None;
+            inner.service.pid = None;
+            inner.service.status = ServiceStatus::Stopped;
+        }
+
+        // Step 3: apply the backoff schedule. Skip the sleep entirely on the
+        // first attempt so a one-off hiccup (model load race, transient VRAM
+        // pressure) recovers without the user noticing.
+        let backoff_idx = (consecutive_failures as usize).min(BACKOFF.len() - 1);
+        let backoff = BACKOFF[backoff_idx];
+        if !backoff.is_zero() {
+            tracing::info!(
+                model_id = %model_id,
+                backoff_secs = backoff.as_secs(),
+                "watchdog: backoff before restart"
+            );
+            tokio::time::sleep(backoff).await;
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
+        // Step 4: try to bring the service back up. On success, the normal
+        // start_service_core → set_running path will respawn *this* watchdog
+        // (with a fresh flag) and the old loop here is already past its
+        // useful life; that's fine, the new loop will take over.
+        match start_service_core(&model_id, &app, &state).await {
+            Ok(info) => {
+                tracing::info!(
+                    model_id = ?info.model_id,
+                    "watchdog: restart succeeded"
+                );
+                consecutive_failures = 0;
+            }
+            Err(error) => {
+                consecutive_failures += 1;
+                tracing::error!(
+                    model_id = %model_id,
+                    attempt = consecutive_failures,
+                    max = MAX_FAILURES,
+                    error = %error,
+                    "watchdog: restart failed"
+                );
+                if consecutive_failures >= MAX_FAILURES {
+                    tracing::error!(
+                        model_id = %model_id,
+                        "watchdog: giving up after {} consecutive failures; user intervention required",
+                        MAX_FAILURES
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    tracing::info!("service watchdog loop exiting");
 }
 
 fn detect_backend(server_path: &PathBuf, install_dir: &PathBuf) -> EngineBackend {

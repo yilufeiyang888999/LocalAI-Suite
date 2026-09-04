@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     process::Child,
-    sync::{atomic::AtomicU8, Arc, Mutex},
+    sync::{atomic::{AtomicBool, AtomicU8}, Arc, Mutex},
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,11 @@ pub struct AppStateInner {
     pub service: ServiceState,
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
+    /// Stop flag for the background "crashed llama-server? auto-restart"
+    /// watchdog. The flag is set to `true` on user-initiated stop / model
+    /// switch so the loop exits on its next iteration. The field is `None`
+    /// when no watchdog is currently running.
+    pub watchdog_stop: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +63,7 @@ impl AppState {
                 service: ServiceState::default(),
                 data_dir,
                 db_path,
+                watchdog_stop: None,
             })),
         }
     }
