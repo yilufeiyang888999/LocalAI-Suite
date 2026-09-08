@@ -636,6 +636,18 @@ async fn launch_service(
     extra_args: &[String],
     startup_timeout_secs: u64,
 ) -> AppResult<Child> {
+    // True iff `extra_args` already contains a flag the user explicitly
+    // passed in `extra_launch_args`. We skip our auto-derived copy in that
+    // case so llama.cpp doesn't see the same flag twice (it now logs a
+    // DEPRECATED warning for repeated `--ctx-size` etc. and only honors
+    // the last value, which can silently overrule the computed one).
+    let extra_has = |flag: &str| -> bool {
+        let prefix_eq = format!("{}=", flag);
+        extra_args
+            .iter()
+            .any(|token| token == flag || token.starts_with(&prefix_eq))
+    };
+
     let mut command = Command::new(server_path);
     crate::proc::hide_console(&mut command);
     command
@@ -644,17 +656,21 @@ async fn launch_service(
         .arg("--host")
         .arg(host)
         .arg("--port")
-        .arg(port.to_string())
-        .arg("--ctx-size")
-        .arg(params.ctx_size.to_string())
-        // Pin to a single slot: this is a single-user desktop app, and the
-        // llama.cpp default of 4 slots multiplies the KV cache 4× — the root
-        // cause of blowing past small VRAM budgets and spilling to system RAM.
-        .arg("--parallel")
-        .arg(params.parallel.to_string());
+        .arg(port.to_string());
+    if !extra_has("--ctx-size") {
+        command.arg("--ctx-size").arg(params.ctx_size.to_string());
+    }
+    // Pin to a single slot: this is a single-user desktop app, and the
+    // llama.cpp default of 4 slots multiplies the KV cache 4× — the root
+    // cause of blowing past small VRAM budgets and spilling to system RAM.
+    if !extra_has("--parallel") {
+        command.arg("--parallel").arg(params.parallel.to_string());
+    }
 
     if let Some(n_gpu_layers) = params.n_gpu_layers {
-        command.arg("--n-gpu-layers").arg(n_gpu_layers.to_string());
+        if !extra_has("--n-gpu-layers") {
+            command.arg("--n-gpu-layers").arg(n_gpu_layers.to_string());
+        }
     }
 
     // An 8-bit KV cache roughly halves the per-token KV footprint so a larger
@@ -662,7 +678,10 @@ async fn launch_service(
     // config (`--cache-type-k/v q8_0`); this llama.cpp build auto-enables flash
     // attention when the KV cache is quantized, so we don't pass `--flash-attn`
     // explicitly (an untested flag on this build).
-    if params.kv_quant {
+    if params.kv_quant
+        && !extra_has("--cache-type-k")
+        && !extra_has("--cache-type-v")
+    {
         command
             .arg("--cache-type-k")
             .arg("q8_0")
