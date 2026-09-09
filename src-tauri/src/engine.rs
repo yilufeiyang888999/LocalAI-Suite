@@ -1,7 +1,9 @@
 use std::{
+    collections::HashMap,
     fs::File,
     io::copy,
     path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex as StdMutex},
 };
 
 use futures_util::StreamExt;
@@ -212,6 +214,39 @@ pub fn engine_manifest_entries() -> Vec<(String, String)> {
     entries
 }
 
+/// Per-executable locks that serialize `prepare_package`. Without this, two
+/// overlapping callers (the startup `ensure_engine_ready`, a model switch, and
+/// the GPU→CPU fallback all call it) would each start their own download into
+/// the *same* `<archive>.zip.tmp`, interleaving bytes until the SHA256 check
+/// fails and both retry — observed in the field as the same package
+/// "downloading" four times in half an hour without ever completing.
+static PREPARE_LOCKS: LazyLock<StdMutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// Get (or create) the lock guarding one engine executable. Keyed by
+/// `executable_name`, so different backends still prepare concurrently — only
+/// duplicate work on the *same* engine is serialized.
+fn prepare_lock(executable_name: &'static str) -> Arc<tokio::sync::Mutex<()>> {
+    PREPARE_LOCKS
+        .lock()
+        .expect("engine prepare lock registry poisoned")
+        .entry(executable_name)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// True when a `<exe>.version.json` marker body says the engine on disk was
+/// built from `expected_version`. Any missing field, malformed JSON, or
+/// version mismatch means "not current" so the caller re-downloads.
+fn marker_is_current(raw: &str, expected_version: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .as_ref()
+        .and_then(|json| json.get("version"))
+        .and_then(|version| version.as_str())
+        == Some(expected_version)
+}
+
 // Download + extract one engine package (and any dependency archives such as
 // the CUDA runtime). No-op if the target executable is already present
 // **and** its version marker is current — stale engines from an older
@@ -223,13 +258,19 @@ async fn prepare_package(
 ) -> AppResult<()> {
     let executable_path = backend_dir.join(package.executable_name);
     let version_marker = backend_dir.join(format!("{}.version.json", package.executable_name));
+
+    // Hold this for the whole download+extract. A second caller for the same
+    // engine blocks here, then re-checks below and returns immediately once
+    // the first one has finished — instead of racing it on the temp file.
+    let lock = prepare_lock(package.executable_name);
+    let _guard = lock.lock().await;
+
     if executable_path.exists() {
+        // Re-checked *after* acquiring the lock: another task may have just
+        // finished installing this very engine while we were waiting.
         if let Ok(raw) = fs::read_to_string(&version_marker).await {
-            use serde_json::Value;
-            if let Ok(json) = serde_json::from_str::<Value>(&raw) {
-                if json.get("version").and_then(|v| v.as_str()) == Some(package.version) {
-                    return Ok(());
-                }
+            if marker_is_current(&raw, package.version) {
+                return Ok(());
             }
         }
         // Marker missing, unreadable, or version mismatch (b9837 → b10853):
@@ -540,4 +581,57 @@ fn extract_zip_blocking(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_current_correct_version() {
+        assert!(marker_is_current(
+            r#"{"backend":"CUDA","version":"b10853","file_name":"llama-b10853-bin-win-cuda-12.4-x64.zip"}"#,
+            "b10853"
+        ));
+    }
+
+    #[test]
+    fn marker_stale_when_version_differs() {
+        // The b9837 → b10853 upgrade path: an engine installed by an older
+        // app release must be detected as stale so it gets replaced.
+        assert!(!marker_is_current(
+            r#"{"backend":"CUDA","version":"b9837","file_name":"llama-b9837-bin-win-cuda-12.4-x64.zip"}"#,
+            "b10853"
+        ));
+    }
+
+    #[test]
+    fn marker_stale_when_version_field_missing() {
+        assert!(!marker_is_current(
+            r#"{"backend":"CUDA","file_name":"llama-b10853-bin-win-cuda-12.4-x64.zip"}"#,
+            "b10853"
+        ));
+    }
+
+    #[test]
+    fn marker_stale_on_unparsable_or_empty_marker() {
+        // Covers a truncated/corrupted marker and the pre-marker installs
+        // (which have no file at all — the caller treats a read error the
+        // same way this treats unparsable content).
+        assert!(!marker_is_current("not even json", "b10853"));
+        assert!(!marker_is_current("", "b10853"));
+        assert!(!marker_is_current(r#"{"version":null}"#, "b10853"));
+    }
+
+    #[test]
+    fn prepare_lock_is_per_executable_and_shared_per_key() {
+        // Same engine → same lock (so duplicate downloads serialize).
+        let a = prepare_lock("llama-server-cuda.exe");
+        let b = prepare_lock("llama-server-cuda.exe");
+        assert!(Arc::ptr_eq(&a, &b));
+        // Different engines → different locks (GPU prep and the background
+        // CPU fallback must still run concurrently).
+        let cpu = prepare_lock("llama-server-cpu.exe");
+        assert!(!Arc::ptr_eq(&a, &cpu));
+    }
 }
