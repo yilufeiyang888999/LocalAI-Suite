@@ -232,12 +232,25 @@ async fn prepare_package(
                 }
             }
         }
-        // Marker missing, unreadable, or version mismatch (b9837 → b10853).
-        tracing::info!(old = %executable_path.display(), version = %package.version, "stale engine detected; re-downloading");
-        let _ = fs::remove_file(&executable_path).await;
+        // Marker missing, unreadable, or version mismatch (b9837 → b10853):
+        // fall through and re-download.
+        //
+        // Deliberately do NOT delete the existing executable here. Extraction
+        // writes with `File::create`, which truncates in place, so the old
+        // engine is replaced only once the new package has actually been
+        // downloaded, SHA256-verified and opened. Deleting up front would
+        // leave the user with *no* engine for the whole download (615 MB for
+        // the CUDA pair — many minutes, or hours on a throttled mirror), and
+        // a failed or interrupted download would strip a perfectly working
+        // engine for good.
+        tracing::info!(
+            engine = %package.executable_name,
+            version = %package.version,
+            "stale engine detected; downloading replacement (keeping current one until it lands)"
+        );
     }
 
-    tracing::info!(file = %package.file_name, "engine not present; downloading package");
+    tracing::info!(file = %package.file_name, "preparing engine package");
     fs::create_dir_all(backend_dir).await?;
     let package_path = engine_dir.join(package.file_name);
     download_archive(package.urls, package.sha256, package.file_name, &package_path).await?;
