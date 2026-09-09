@@ -213,15 +213,28 @@ pub fn engine_manifest_entries() -> Vec<(String, String)> {
 }
 
 // Download + extract one engine package (and any dependency archives such as
-// the CUDA runtime). No-op if the target executable is already present.
+// the CUDA runtime). No-op if the target executable is already present
+// **and** its version marker is current — stale engines from an older
+// release get replaced when the app updates.
 async fn prepare_package(
     package: &EnginePackage,
     engine_dir: &Path,
     backend_dir: &Path,
 ) -> AppResult<()> {
     let executable_path = backend_dir.join(package.executable_name);
+    let version_marker = backend_dir.join(format!("{}.version.json", package.executable_name));
     if executable_path.exists() {
-        return Ok(());
+        if let Ok(raw) = fs::read_to_string(&version_marker).await {
+            use serde_json::Value;
+            if let Ok(json) = serde_json::from_str::<Value>(&raw) {
+                if json.get("version").and_then(|v| v.as_str()) == Some(package.version) {
+                    return Ok(());
+                }
+            }
+        }
+        // Marker missing, unreadable, or version mismatch (b9837 → b10853).
+        tracing::info!(old = %executable_path.display(), version = %package.version, "stale engine detected; re-downloading");
+        let _ = fs::remove_file(&executable_path).await;
     }
 
     tracing::info!(file = %package.file_name, "engine not present; downloading package");
@@ -234,6 +247,20 @@ async fn prepare_package(
         download_archive(archive.urls, archive.sha256, archive.file_name, &archive_path).await?;
         extract_dependency_archive(&archive_path, backend_dir).await?;
     }
+    // Record which build this executable came from so a later app update can
+    // tell it is stale and pull the new one (the shared `versions.json` only
+    // tracks the last-prepared backend, which is not enough here: the GPU
+    // engine and the CPU fallback are prepared independently).
+    let _ = fs::write(
+        &version_marker,
+        serde_json::json!({
+            "backend": package.backend,
+            "version": package.version,
+            "file_name": package.file_name,
+        })
+        .to_string(),
+    )
+    .await;
     Ok(())
 }
 
