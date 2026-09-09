@@ -131,33 +131,33 @@ pub async fn ensure_engine_ready(
 // URL. The per-chunk idle timeout in try_download_archive catches any stall
 // on any of them.
 static CPU_URLS: [&str; 3] = [
-    "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/llama-b9837-bin-win-cpu-x64.zip",
-    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
-    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cpu-x64.zip",
+    "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/llama-b10853-bin-win-cpu-x64.zip",
+    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b10853/llama-b10853-bin-win-cpu-x64.zip",
+    "https://github.com/ggml-org/llama.cpp/releases/download/b10853/llama-b10853-bin-win-cpu-x64.zip",
 ];
 static CUDA_URLS: [&str; 3] = [
-    "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/llama-b9837-bin-win-cuda-12.4-x64.zip",
-    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
-    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-cuda-12.4-x64.zip",
+    "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/llama-b10853-bin-win-cuda-12.4-x64.zip",
+    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b10853/llama-b10853-bin-win-cuda-12.4-x64.zip",
+    "https://github.com/ggml-org/llama.cpp/releases/download/b10853/llama-b10853-bin-win-cuda-12.4-x64.zip",
 ];
 static CUDA_RUNTIME_URLS: [&str; 3] = [
     "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/cudart-llama-bin-win-cuda-12.4-x64.zip",
-    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
-    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b10853/cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "https://github.com/ggml-org/llama.cpp/releases/download/b10853/cudart-llama-bin-win-cuda-12.4-x64.zip",
 ];
 static VULKAN_URLS: [&str; 3] = [
-    "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/llama-b9837-bin-win-vulkan-x64.zip",
-    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-vulkan-x64.zip",
-    "https://github.com/ggml-org/llama.cpp/releases/download/b9837/llama-b9837-bin-win-vulkan-x64.zip",
+    "https://www.modelscope.cn/models/yilufeiyang888999/llama-cpp-engine-zh-2026/resolve/master/llama-b10853-bin-win-vulkan-x64.zip",
+    "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/releases/download/b10853/llama-b10853-bin-win-vulkan-x64.zip",
+    "https://github.com/ggml-org/llama.cpp/releases/download/b10853/llama-b10853-bin-win-vulkan-x64.zip",
 ];
 static CPU: EnginePackage = EnginePackage {
     backend: "CPUx86",
-    version: "b9837",
-    file_name: "llama-b9837-bin-win-cpu-x64.zip",
+    version: "b10853",
+    file_name: "llama-b10853-bin-win-cpu-x64.zip",
     urls: &CPU_URLS,
     extra_archives: &[],
     executable_name: "llama-server-cpu.exe",
-    sha256: "d53a9a0107c088d57592e4a43bf56ec3e3d274e9e45413d7d5c9bec583d173fd",
+    sha256: "10b520be35483161a0746de3d05d66a36ce3e2bb6b243d806564ff798e28f01c",
 };
 static CUDA_EXTRA: [EngineArchive; 1] = [EngineArchive {
     file_name: "cudart-llama-bin-win-cuda-12.4-x64.zip",
@@ -166,24 +166,24 @@ static CUDA_EXTRA: [EngineArchive; 1] = [EngineArchive {
 }];
 static CUDA: EnginePackage = EnginePackage {
     backend: "CUDA",
-    version: "b9837",
-    file_name: "llama-b9837-bin-win-cuda-12.4-x64.zip",
+    version: "b10853",
+    file_name: "llama-b10853-bin-win-cuda-12.4-x64.zip",
     urls: &CUDA_URLS,
     extra_archives: &CUDA_EXTRA,
     executable_name: "llama-server-cuda.exe",
-    sha256: "4b21072c3352f88e9faa03175dd218fec64379346059b18d6e7d4b739d213f48",
+    sha256: "26898c5f8519e59b61f78b4fc285c9e330b2a0afa670329d303ccc871f68ef5b",
 };
 // Vulkan is the default GPU backend: it relies only on the driver's Vulkan
 // ICD (bundled with modern NVIDIA/AMD/Intel drivers), so it dodges the CUDA
 // 12.4 runtime's driver floor and covers all three vendors from one package.
 static VULKAN: EnginePackage = EnginePackage {
     backend: "Vulkan",
-    version: "b9837",
-    file_name: "llama-b9837-bin-win-vulkan-x64.zip",
+    version: "b10853",
+    file_name: "llama-b10853-bin-win-vulkan-x64.zip",
     urls: &VULKAN_URLS,
     extra_archives: &[],
     executable_name: "llama-server-vulkan.exe",
-    sha256: "2bec9f5c97f9b9f83974375c551853afc30477e6391fb970e834c12558f44719",
+    sha256: "e4c1a9d47a79e9352ec0d9085840bed1ac5ebea0ef134f263be2cc90434a60ed",
 };
 
 fn engine_package(backend: &str) -> &'static EnginePackage {
