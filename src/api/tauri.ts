@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   AppSettings,
+  BackendCheckAvailability,
+  BackendCheckResult,
   CatalogRefreshResult,
   ChatMessage,
   ChatSession,
@@ -82,6 +84,20 @@ export function recoverService() {
 
 export function runDiagnose() {
   return invoke<DiagnoseResult[]>('run_diagnose');
+}
+
+/** 后端一致性自检是否可用（需要机器上同时装了 CUDA 与 Vulkan 两个引擎）。 */
+export function getBackendCheckAvailability() {
+  return invoke<BackendCheckAvailability>('get_backend_check_availability');
+}
+
+/**
+ * 跑一次后端一致性自检。
+ *
+ * 注意：服务会重启两次，期间聊天不可用（约 1–2 分钟），结束后自动恢复原后端。
+ */
+export function runBackendConsistencyCheck() {
+  return invoke<BackendCheckResult>('run_backend_consistency_check');
 }
 
 export function applyLowVramFix() {

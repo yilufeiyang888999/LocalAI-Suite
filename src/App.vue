@@ -8,6 +8,7 @@ import InstallProgress from './components/InstallProgress.vue';
 import InstalledModels from './components/InstalledModels.vue';
 import SettingsPanel from './components/SettingsPanel.vue';
 import DiagnosticsPanel from './components/DiagnosticsPanel.vue';
+import BackendCheckPanel from './components/BackendCheckPanel.vue';
 import ChatView from './components/ChatView.vue';
 import ThirdPartyConnect from './components/ThirdPartyConnect.vue';
 import {
@@ -21,6 +22,8 @@ import {
   listInstalledModels,
   recoverService,
   runDiagnose,
+  getBackendCheckAvailability,
+  runBackendConsistencyCheck,
   applyLowVramFix,
   refreshModelCatalog,
   startDownload,
@@ -37,6 +40,8 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import type {
   AppSettings,
+  BackendCheckAvailability,
+  BackendCheckResult,
   DiagnoseResult,
   DownloadProgress,
   HardwareInfo,
@@ -70,10 +75,16 @@ const restoringGpu = ref(false);
 const diagnoseResults = ref<DiagnoseResult[]>([]);
 const diagnoseLoading = ref(false);
 const fixingIssueId = ref<string | null>(null);
+const backendCheckAvailability = ref<BackendCheckAvailability | null>(null);
+const backendCheckResult = ref<BackendCheckResult | null>(null);
+const backendCheckRunning = ref(false);
+const backendCheckError = ref<string | null>(null);
 
 onMounted(async () => {
   await Promise.all([loadHardware(), loadSettings(), loadService(), loadInstalledModels()]);
   await tryAutoStartService();
+  // 服务起过后才知道实际后端，此时再判定一致性校验是否可用。
+  await loadBackendCheckAvailability();
   // Best-effort online catalog refresh; when it brings new models, refresh the
   // recommendation list. Runs off the critical path so a slow/absent endpoint
   // never delays startup.
@@ -90,6 +101,11 @@ onMounted(async () => {
   await listen<ServiceInfo>('service_status_changed', (event) => {
     service.value = event.payload;
     serviceMessage.value = event.payload.message;
+    // 服务状态变化意味着后端可能已经不同（例如校验后恢复、或 CPU 安全模式
+    // 回退），可用性结论要跟着更新，否则按钮会停在过期状态上。
+    if (!backendCheckRunning.value) {
+      void loadBackendCheckAvailability();
+    }
   });
   await listen<UpdateProgress>('model_update_progress', (event) => {
     if (updatingModelId.value === event.payload.model_id) {
@@ -408,6 +424,44 @@ async function runChecks() {
   }
 }
 
+/** 刷新「后端一致性校验」是否可用（依赖当前后端与已安装的引擎）。 */
+async function loadBackendCheckAvailability() {
+  try {
+    backendCheckAvailability.value = await getBackendCheckAvailability();
+  } catch {
+    // 拿不到可用性时按「不可用」处理，不打断页面其它部分。
+    backendCheckAvailability.value = null;
+  }
+}
+
+/**
+ * 跑一次后端一致性自检。
+ *
+ * 这个操作会重启服务两次，期间聊天不可用，所以用一个独立的 running 标志
+ * 挡住重复点击；无论成功失败都要重读服务状态，因为服务已被重启过。
+ */
+async function runBackendCheck() {
+  if (backendCheckRunning.value) return;
+  if (!backendCheckAvailability.value?.available) return;
+
+  backendCheckRunning.value = true;
+  backendCheckError.value = null;
+  backendCheckResult.value = null;
+  serviceMessage.value = '正在校验两个显卡后端的输出是否一致，期间聊天会暂时不可用。';
+  try {
+    backendCheckResult.value = await runBackendConsistencyCheck();
+    serviceMessage.value = backendCheckResult.value.comparison.summary;
+  } catch (error) {
+    backendCheckError.value = String(error);
+    serviceMessage.value = '后端一致性校验没有完成。';
+  } finally {
+    backendCheckRunning.value = false;
+    // 服务已被重启，必须重新同步状态，否则 UI 会停在旧的后端/端口上。
+    await loadService();
+    await loadBackendCheckAvailability();
+  }
+}
+
 async function handleFix(issueId: string) {
   if (fixingIssueId.value) return;
   fixingIssueId.value = issueId;
@@ -523,6 +577,13 @@ async function handleFix(issueId: string) {
           :fixing-id="fixingIssueId"
           @run="runChecks"
           @fix="handleFix"
+        />
+        <BackendCheckPanel
+          :availability="backendCheckAvailability"
+          :result="backendCheckResult"
+          :running="backendCheckRunning"
+          :error="backendCheckError"
+          @run="runBackendCheck"
         />
       </aside>
     </div>

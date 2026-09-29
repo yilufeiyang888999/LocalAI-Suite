@@ -1,4 +1,5 @@
 mod app_state;
+mod backend_check;
 mod catalog;
 mod chat;
 mod data_mgmt;
@@ -8,6 +9,7 @@ mod download;
 mod engine;
 mod error;
 mod fix;
+mod gguf;
 mod hardware;
 mod hash;
 mod logging;
@@ -86,6 +88,8 @@ pub fn run() {
             service::stop_model_service,
             service::get_service_status,
             service::recover_service,
+            backend_check::get_backend_check_availability,
+            backend_check::run_backend_consistency_check,
             diagnose::run_diagnose,
             fix::apply_low_vram_fix,
             catalog::refresh_model_catalog,
