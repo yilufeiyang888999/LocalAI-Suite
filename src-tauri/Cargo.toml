@@ -1,6 +1,6 @@
 [package]
 name = "local-ai-installer"
-version = "0.1.0"
+version = "0.1.1"
 description = "本地AI模型一键部署助手"
 authors = ["Local AI Installer"]
 edition = "2021"
