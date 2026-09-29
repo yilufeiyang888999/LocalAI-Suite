@@ -335,10 +335,31 @@ pub fn import_local_model(
     let model_path = PathBuf::from(trimmed);
     validate_model_file(&model_path)?;
 
-    let metadata = std::fs::metadata(&model_path)?;
-    let file_size_mb = (metadata.len() + 999_999) / 1_000_000;
-    let estimated_vram_gb = ((file_size_mb as f64 / 1000.0) * 1.1 + 0.5) * 10.0;
-    let estimated_vram_gb = estimated_vram_gb.round() / 10.0;
+    let file_bytes = std::fs::metadata(&model_path)?.len();
+    let file_size_mb = (file_bytes + 999_999) / 1_000_000;
+
+    // 解析 GGUF 头部获取真实架构参数（层数 / KV 头数 / 原生上下文 / 参数量 / 量化档）。
+    // 失败不阻断导入 —— 异常文件仍按保守估算处理，只是会丢掉这些信息。
+    let gguf_metadata = match crate::gguf::parse_file(&model_path) {
+        Ok(meta) => {
+            tracing::info!(
+                architecture = %meta.architecture,
+                parameters = meta.parameter_count,
+                context_length = ?meta.context_length,
+                "parsed gguf metadata"
+            );
+            Some(meta)
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to parse gguf metadata; falling back to conservative estimate"
+            );
+            None
+        }
+    };
+
+    let estimated_vram_gb = estimate_vram_gb(file_bytes, gguf_metadata.as_ref());
     let name = model_path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -357,6 +378,7 @@ pub fn import_local_model(
         &model_path,
         file_size_mb,
         estimated_vram_gb,
+        gguf_metadata.as_ref(),
     );
     tracing::info!(model_id = %model_id, file_size_mb, "imported local model file");
 
@@ -366,13 +388,52 @@ pub fn import_local_model(
         local_path: model_path.to_string_lossy().to_string(),
         file_size_mb,
         estimated_vram_gb,
-        message: format!(
-            "已导入本地模型文件，预计需要约 {:.1} GB 资源。",
-            estimated_vram_gb
-        ),
+        message: match &gguf_metadata {
+            Some(meta) => format!(
+                "已导入本地模型（{}，原生上下文 {} tokens），预计需要约 {:.1} GB 显存。",
+                meta.parameter_label().unwrap_or_else(|| "参数未知".to_string()),
+                meta.context_length.unwrap_or(4096),
+                estimated_vram_gb
+            ),
+            None => format!(
+                "已导入本地模型文件，预计需要约 {:.1} GB 资源。",
+                estimated_vram_gb
+            ),
+        },
     })
 }
 
+/// 估算模型跑起来需要多少显存（GB）：权重 + 运行时开销 + 默认上下文下的 KV。
+///
+/// 此前只有文件大小时用的是 `文件大小 × 1.1 + 0.5`：这会低估未量化模型的权重，
+/// 又会把混合注意力模型的 KV 高估数倍。有 GGUF 结构后按真实层结构计算。
+fn estimate_vram_gb(file_bytes: u64, gguf: Option<&crate::gguf::GgufMetadata>) -> f64 {
+    // 显存一律按 GiB（1024³）计，与 `nvidia-smi` 的口径一致；用 10⁹ 会与
+    // 可用显存相减时引入约 7% 的系统偏差。
+    let weight_gb = file_bytes as f64 / crate::gguf::每GiB字节;
+    // 计算缓冲 + 驱动与运行库占用；llama.cpp 在 8G 卡上实测约 1.3 GiB。
+    let overhead_gb = 1.3;
+    // 以 8K 上下文作为「能不能跑」的门槛；启动时再按可用显存求最大上下文。
+    let kv_gb = gguf.map(|meta| meta.kv_gb(8192, 2.0)).unwrap_or(0.5);
+    let total = weight_gb + overhead_gb + kv_gb;
+    (total * 10.0).round() / 10.0
+}
+
+/// 内置模型清单（下载来源）。
+///
+/// `parameters_raw` / `file_size_mb` / `vram_required_gb` / `quant_bpp` 都是
+/// **下载前的估算**，用于推荐过滤与「能不能跑」的门槛；模型下载完成后会被
+/// 真实文件大小与 GGUF 元数据覆盖（见 `model_repo::upsert_imported_model`）。
+///
+/// 数值来源（2026-09-24 校准，实测表见 CLAUDE.md）：
+/// - **Qwen3-8B / Qwen3-1.7B** —— 本机真实文件实测，字段按实测校准。
+/// - **Qwen3-14B / Qwen3-4B** —— 本机没有文件。`quant_bpp` 取同架构同量化档
+///   （Q4_K_M）的实测值 0.614；`context_length` 取 Qwen3 系列实测的 40960。
+/// - **Ornith-1.0-9B** —— 本机只有 1.5 版，版本与架构都不同，**不可外推**，
+///   因此保持原值，等拿到 1.0 的文件再校准。
+///
+/// 注意：每条的 `sha256` 必须与 `manifests/signed_manifest.json` 里的记录
+/// 一致，改错会让下载校验失败 —— 动这些字段前先确认两者同源。
 pub fn builtin_models() -> Vec<ModelMetadata> {
     vec![
         ModelMetadata {
@@ -383,14 +444,14 @@ pub fn builtin_models() -> Vec<ModelMetadata> {
             display_compression: "普通压缩版".to_string(),
             quant_level: "Q4_K_M".to_string(),
             quant_type: "GGUF/Q4_K_M".to_string(),
-            quant_bpp: 0.4,
+            quant_bpp: 0.614,
             parameter_count: "14B".to_string(),
             parameters_raw: 14_800_000_000,
             active_parameters: None,
             is_moe: false,
             vram_required_gb: 10.5,
             file_size_mb: 9002,
-            context_length: 32768,
+            context_length: 40960,
             recommended_scene: vec![Scene::Coding, Scene::Writing, Scene::General],
             chinese_score: 95,
             speed_rating: 2,
@@ -413,14 +474,17 @@ pub fn builtin_models() -> Vec<ModelMetadata> {
             display_compression: "普通压缩版".to_string(),
             quant_level: "Q4_K_M".to_string(),
             quant_type: "GGUF/Q4_K_M".to_string(),
-            quant_bpp: 0.4,
+            // 实测：文件 5,027,783,488 字节 / 8.2B 参数 → bpp 0.614（原记 0.4，
+            // 是 Q4_K_M 的理论值，按它算权重会低估 1.53×）。
+            quant_bpp: 0.614,
             parameter_count: "8B".to_string(),
             parameters_raw: 8_200_000_000,
             active_parameters: None,
             is_moe: false,
-            vram_required_gb: 6.0,
+            // 4.68(权重) + 1.3(保留) + 1.13(KV@8K) ≈ 7.1 GiB
+            vram_required_gb: 7.1,
             file_size_mb: 5028,
-            context_length: 32768,
+            context_length: 40960,
             recommended_scene: vec![Scene::Writing, Scene::General, Scene::Chat],
             chinese_score: 93,
             speed_rating: 3,
@@ -443,14 +507,14 @@ pub fn builtin_models() -> Vec<ModelMetadata> {
             display_compression: "普通压缩版".to_string(),
             quant_level: "Q4_K_M".to_string(),
             quant_type: "GGUF/Q4_K_M".to_string(),
-            quant_bpp: 0.4,
+            quant_bpp: 0.614,
             parameter_count: "4B".to_string(),
             parameters_raw: 4_000_000_000,
             active_parameters: None,
             is_moe: false,
             vram_required_gb: 3.4,
             file_size_mb: 2497,
-            context_length: 32768,
+            context_length: 40960,
             recommended_scene: vec![Scene::Chat, Scene::General],
             chinese_score: 90,
             speed_rating: 4,
@@ -473,14 +537,16 @@ pub fn builtin_models() -> Vec<ModelMetadata> {
             display_compression: "高质量压缩版".to_string(),
             quant_level: "Q8_0".to_string(),
             quant_type: "GGUF/Q8_0".to_string(),
-            quant_bpp: 0.9,
+            // 实测：文件 1834 MB / 1.721B 参数 → bpp 1.066（Q8_0）。
+            quant_bpp: 1.066,
             parameter_count: "1.7B".to_string(),
             parameters_raw: 1_720_000_000,
             active_parameters: None,
             is_moe: false,
-            vram_required_gb: 2.4,
+            // 1.71(权重) + 1.3(保留) + 0.88(KV@8K) ≈ 3.9 GiB
+            vram_required_gb: 3.9,
             file_size_mb: 1834,
-            context_length: 32768,
+            context_length: 40960,
             recommended_scene: vec![Scene::Chat],
             chinese_score: 84,
             speed_rating: 5,

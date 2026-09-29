@@ -2,7 +2,11 @@ use std::path::Path;
 
 use rusqlite::{params, Connection};
 
-use crate::{error::AppResult, models::ModelMetadata};
+use crate::{
+    error::AppResult,
+    gguf::GgufMetadata,
+    models::ModelMetadata,
+};
 
 /// A locally imported model surfaced back to the installed-models list. Only the
 /// fields the UI needs are read; the full row is stored for completeness.
@@ -34,8 +38,9 @@ pub fn upsert_imported_model(
     local_path: &Path,
     file_size_mb: u64,
     vram_required_gb: f64,
+    gguf: Option<&GgufMetadata>,
 ) -> AppResult<()> {
-    let model = imported_metadata(id, name, local_path, file_size_mb, vram_required_gb);
+    let model = imported_metadata(id, name, local_path, file_size_mb, vram_required_gb, gguf);
     let connection = Connection::open(db_path)?;
     upsert(&connection, &model, true, true)
 }
@@ -159,35 +164,62 @@ fn is_moe_flag(is_moe: bool) -> i64 {
     is_moe as i64
 }
 
-/// Build a catalog row for an imported `.gguf`. Most fields are unknown, so they
-/// get neutral defaults; the meaningful bits are name, size and local path.
+/// Build a catalog row for an imported `.gguf`.
+///
+/// When GGUF metadata is available the real architecture values are used;
+/// otherwise every field falls back to a neutral default. The fallbacks matter:
+/// before GGUF parsing existed an imported Spark-X2.5-4B reported a 4K context
+/// even though the model natively supports 1M, and every import carried the
+/// hardcoded 0.4 bytes-per-param that Q4_K_M alone would already beat.
 fn imported_metadata(
     id: &str,
     name: &str,
     local_path: &Path,
     file_size_mb: u64,
     vram_required_gb: f64,
+    gguf: Option<&GgufMetadata>,
 ) -> ModelMetadata {
+    let 参数量 = gguf.map(|数据| 数据.parameter_count).unwrap_or(0);
+    // 实测每参数字节数，替代此前写死的 0.4 —— 真实的 Q4_K_M 约 0.61。
+    let 实测bpp = gguf
+        .and_then(|数据| 数据.bytes_per_param(file_size_mb.saturating_mul(1_000_000)))
+        .unwrap_or(0.0);
+    let 上下文长度 = gguf
+        .and_then(|数据| 数据.context_length)
+        .map(u64::from)
+        .unwrap_or(4096);
+    let 架构 = gguf
+        .map(|数据| 数据.architecture.clone())
+        .filter(|值| !值.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let 量化档 = gguf
+        .and_then(|数据| 数据.file_type_label())
+        .unwrap_or("unknown");
+
     ModelMetadata {
         id: id.to_string(),
         name: name.to_string(),
         author: "本地导入".to_string(),
-        base_model: name.to_string(),
-        display_compression: "本地模型文件".to_string(),
-        quant_level: "unknown".to_string(),
-        quant_type: "gguf".to_string(),
-        quant_bpp: 0.0,
-        parameter_count: String::new(),
-        parameters_raw: 0,
-        active_parameters: None,
-        is_moe: false,
+        base_model: gguf
+            .and_then(|数据| 数据.name.clone())
+            .unwrap_or_else(|| name.to_string()),
+        display_compression: 压缩档说明(量化档),
+        quant_level: 量化档.to_string(),
+        quant_type: format!("GGUF/{量化档}"),
+        quant_bpp: 实测bpp,
+        parameter_count: gguf
+            .and_then(|数据| 数据.parameter_label())
+            .unwrap_or_default(),
+        parameters_raw: 参数量,
+        active_parameters: gguf.and_then(|数据| 数据.active_parameters()),
+        is_moe: gguf.map(|数据| 数据.is_moe()).unwrap_or(false),
         vram_required_gb,
         file_size_mb,
-        context_length: 4096,
+        context_length: 上下文长度,
         recommended_scene: Vec::new(),
         chinese_score: 0,
         speed_rating: 0,
-        architecture: "unknown".to_string(),
+        architecture: 架构,
         model_format: "gguf".to_string(),
         release_date: String::new(),
         download_url: String::new(),
@@ -197,6 +229,18 @@ fn imported_metadata(
         license: String::new(),
         is_installed: true,
         local_path: Some(local_path.to_string_lossy().to_string()),
+    }
+}
+
+/// 量化档位到界面中文说明的映射。
+fn 压缩档说明(量化档: &str) -> String {
+    match 量化档 {
+        "F32" | "F16" | "BF16" => "未压缩（原始精度）".to_string(),
+        "Q8_0" => "高质量压缩版".to_string(),
+        "Q6_K" | "Q5_K_M" | "Q5_K_S" => "较高质量压缩版".to_string(),
+        "Q4_K_M" | "Q4_K_S" | "Q4_0" | "Q4_1" => "普通压缩版".to_string(),
+        "unknown" => "本地模型文件".to_string(),
+        _ => "压缩版".to_string(),
     }
 }
 
@@ -247,7 +291,7 @@ mod tests {
         let (dir, db) = temp_db();
         let path = dir.join("my-model.gguf");
 
-        upsert_imported_model(&db, "imported-my-model", "我的模型", &path, 4200, 5.0).unwrap();
+        upsert_imported_model(&db, "imported-my-model", "我的模型", &path, 4200, 5.0, None).unwrap();
         let rows = list_imported_models(&db).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "imported-my-model");
@@ -255,10 +299,70 @@ mod tests {
         assert_eq!(rows[0].file_size_mb, 4200);
 
         // Re-importing the same id updates in place instead of duplicating.
-        upsert_imported_model(&db, "imported-my-model", "我的模型-改名", &path, 4300, 5.0).unwrap();
+        upsert_imported_model(
+            &db,
+            "imported-my-model",
+            "我的模型-改名",
+            &path,
+            4300,
+            5.0,
+            None,
+        )
+        .unwrap();
         let rows = list_imported_models(&db).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "我的模型-改名");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn imported_model_uses_real_gguf_parameters_when_available() {
+        // 回归测试：导入时若解析出 GGUF 元数据，架构 / 参数量 / 原生上下文 /
+        // 实测 bpp 都应来自真实值，而不是此前写死的 unknown / 0 / 4096 / 0.4。
+        let (dir, db) = temp_db();
+        let path = dir.join("ornith.gguf");
+
+        let 元数据 = GgufMetadata {
+            architecture: "qwen35".to_string(),
+            name: Some("Ornith-1.5-9B".to_string()),
+            parameter_count: 9_197_000_000,
+            file_type: Some(15),
+            block_count: Some(33),
+            context_length: Some(262_144),
+            head_count_kv: Some(4),
+            key_length: Some(256),
+            value_length: Some(256),
+            full_attention_interval: Some(4),
+            ..Default::default()
+        };
+
+        upsert_imported_model(
+            &db,
+            "imported-ornith",
+            "Ornith",
+            &path,
+            5383,
+            7.0,
+            Some(&元数据),
+        )
+        .unwrap();
+
+        let connection = Connection::open(&db).unwrap();
+        let (架构, 参数量, 上下文, 每参数字节): (String, i64, i64, f64) = connection
+            .query_row(
+                "SELECT architecture, parameters_raw, context_length, quant_bpp \
+                 FROM model_metadata WHERE id = ?1",
+                params!["imported-ornith"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(架构, "qwen35");
+        assert_eq!(参数量, 9_197_000_000);
+        assert_eq!(上下文, 262_144, "原生的 256K 上下文不应被写成 4096");
+        // 5383 MB ÷ 9.197B 参数 ≈ 0.585 字节/参数
+        assert!((每参数字节 - 0.585).abs() < 0.01, "实际为 {每参数字节}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -271,7 +375,7 @@ mod tests {
         let catalog = builtin_models();
         seed_catalog(&db, &catalog).unwrap();
         let path = dir.join("mine.gguf");
-        upsert_imported_model(&db, "imported-mine", "我的模型", &path, 1200, 3.0).unwrap();
+        upsert_imported_model(&db, "imported-mine", "我的模型", &path, 1200, 3.0, None).unwrap();
         assert_eq!(list_imported_models(&db).unwrap().len(), 1);
 
         // Removing the imported id drops just that row.
