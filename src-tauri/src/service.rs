@@ -954,6 +954,11 @@ async fn launch_service(
         command.args(extra_args);
     }
 
+    // 捕获 stderr 以便启动失败时能读到 llama.cpp 自己打印的原因。
+    // 这是实测教训：只报退出码等于没有诊断信息，用户只能看到
+    // 「可能是运行引擎与硬件不兼容或模型文件损坏」这种无法行动的话。
+    command.stderr(std::process::Stdio::piped());
+
     let mut child = command.spawn().map_err(|_| {
         AppError::Message("AI服务暂时没能启动，请检查模型文件是否完整。".to_string())
     })?;
@@ -1038,12 +1043,19 @@ async fn wait_for_health(
         // waiting immediately rather than burning the whole timeout. This is
         // what keeps a failed GPU launch from making the user wait ~180s per
         // attempt before falling back to CPU safe mode.
-        if let Ok(Some(exit_status)) = child.try_wait() {
-            let code = exit_status.code().unwrap_or(-1);
-            return Err(AppError::Message(format!(
-                "AI服务进程启动后异常退出（退出码 {}），可能是运行引擎与硬件不兼容或模型文件损坏。",
-                code
-            )));
+        //
+        // 注意借用顺序：先把退出码取成普通值，`try_wait` 的 &mut 借用随之结束，
+        // 之后才能把 `child` 再借给读取 stderr 的函数（需要 &mut 去 take 管道）。
+        let 已退出 = match child.try_wait() {
+            Ok(Some(exit_status)) => Some(exit_status.code().unwrap_or(-1)),
+            _ => None,
+        };
+        if let Some(code) = 已退出 {
+            // 把 llama-server 的 stderr 读回来附在错误里。这是排障的关键：
+            // 只给一个退出码，用户和我们都只能猜；llama.cpp 在真正失败前
+            // 通常已经打印了原因（CUDA 初始化失败、架构不支持、显存不足...）。
+            let 诊断 = 读取子进程诊断输出(child).await;
+            return Err(AppError::Message(格式化启动失败(code, &诊断)));
         }
 
         let healthy = client
@@ -1066,6 +1078,82 @@ async fn wait_for_health(
     Err(AppError::Message(
         "AI服务启动超时，请稍后重试或换一个更小的模型。".to_string(),
     ))
+}
+
+/// 读回已退出子进程的 stderr，取最后若干行作为诊断信息。
+///
+/// llama.cpp 在真正失败前通常已经打印了原因（CUDA 初始化失败、架构不支持、
+/// 显存不足、模型文件损坏...）。进程已退出，管道写入端关闭，读到 EOF 即结束。
+/// 设一个短超时兜底：万一子进程留下了孙进程仍占着管道，不能让这里挂住。
+async fn 读取子进程诊断输出(child: &mut Child) -> String {
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let Ok(读取结果) = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut 缓冲 = String::new();
+            let _ = stderr.read_to_string(&mut 缓冲);
+            缓冲
+        }),
+    )
+    .await
+    else {
+        return String::new();
+    };
+    let Ok(文本) = 读取结果 else {
+        return String::new();
+    };
+
+    // 取最后 12 行非空内容：崩溃原因基本都在尾部，前面多是加载进度。
+    let 尾部: Vec<&str> = 文本
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    尾部.join("\n")
+}
+
+/// 把退出码翻译成人能行动的中文提示，并附上 llama.cpp 的原始输出。
+fn 格式化启动失败(code: i32, 诊断: &str) -> String {
+    // Windows NTSTATUS 快速失败码。这些码的含义很具体，翻译出来能直接指向
+    // 排查方向；直接甩一个负数给用户等于没给信息。
+    let 解释 = match code as u32 {
+        0xC0000409 => Some(
+            "运行引擎触发了保护性中止（STATUS_STACK_BUFFER_OVERRUN）。\
+             在虚拟机上通常是因为 CPU 型号过于精简（如 PVE 默认的 qemu64/kvm64）\
+             或显卡驱动与虚拟机环境不匹配。建议把虚拟机 CPU 类型改为 host，\
+             或先用 CPU 模式运行。",
+        ),
+        0xC000001D => Some(
+            "运行引擎使用了当前 CPU 不支持的指令集（STATUS_ILLEGAL_INSTRUCTION）。\
+             建议在虚拟机设置里把 CPU 类型改为 host。",
+        ),
+        0xC0000005 => Some(
+            "运行引擎访问了非法内存地址（STATUS_ACCESS_VIOLATION）。\
+             常见于显卡驱动异常或引擎文件不完整。",
+        ),
+        0xC00000FD => Some("运行引擎栈溢出（STATUS_STACK_OVERFLOW）。"),
+        _ => None,
+    };
+
+    let mut 文案 = match 解释 {
+        Some(说明) => format!("AI服务进程启动后异常退出（退出码 {}）。\n{}", code, 说明),
+        None => format!(
+            "AI服务进程启动后异常退出（退出码 {}），可能是运行引擎与硬件不兼容或模型文件损坏。",
+            code
+        ),
+    };
+    if !诊断.is_empty() {
+        文案.push_str("\n\n运行引擎的输出：\n");
+        文案.push_str(诊断);
+    }
+    文案
 }
 
 /// Single health probe used by startup recovery to decide whether a persisted
@@ -1407,6 +1495,51 @@ fn find_cpu_engine_executable(install_dir: &PathBuf) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 退出码必须翻译成人能行动的中文，而不是只甩一个负数。
+    ///
+    /// **这条护栏是 2026-09-29 虚拟机实测换来的**：PVE 虚拟机（CPU 类型 qemu64）
+    /// 上 llama-server 以 0xC0000409 退出，而当时的错误信息只有
+    /// 「可能是运行引擎与硬件不兼容或模型文件损坏」—— 用户完全无从下手。
+    #[test]
+    fn exit_code_is_translated_into_actionable_chinese() {
+        // 0xC0000409 -> -1073740791，本次虚拟机遇到的真实退出码
+        let 文案 = 格式化启动失败(-1073740791, "");
+        assert!(文案.contains("-1073740791"), "应保留原始退出码：{文案}");
+        assert!(
+            文案.contains("qemu64") || 文案.contains("host"),
+            "0xC0000409 应给出虚拟机 CPU 类型的具体建议：{文案}"
+        );
+        assert!(
+            !文案.contains("可能是运行引擎与硬件不兼容"),
+            "已知退出码不应退化成含糊文案：{文案}"
+        );
+
+        // 0xC000001D -> -1073741795，非法指令集
+        let 文案 = 格式化启动失败(-1073741795, "");
+        assert!(文案.contains("指令集"), "应指出指令集问题：{文案}");
+
+        // 未知退出码走通用文案，但也要带上码
+        let 文案 = 格式化启动失败(-1, "");
+        assert!(文案.contains("-1"), "未知码也要保留：{文案}");
+    }
+
+    /// llama.cpp 的原始输出必须被附在错误里 —— 这是排障的唯一线索。
+    #[test]
+    fn engine_output_is_appended_to_the_error() {
+        let 诊断 = "ggml_cuda_init: failed to initialize CUDA\n\
+                    error: device 0 not found";
+        let 文案 = 格式化启动失败(-1073740791, 诊断);
+        assert!(文案.contains("ggml_cuda_init"), "应附上引擎原始输出：{文案}");
+        assert!(文案.contains("device 0 not found"), "应附上引擎原始输出：{文案}");
+    }
+
+    /// 没有引擎输出时不应留下空标题，否则界面会出现「运行引擎的输出：」后面没内容。
+    #[test]
+    fn empty_diagnostics_do_not_leave_a_dangling_header() {
+        let 文案 = 格式化启动失败(-1, "");
+        assert!(!文案.contains("运行引擎的输出"), "空诊断不应有标题：{文案}");
+    }
 
     // 权重与 KV 一律用本机真实模型文件的实测值（详见 CLAUDE.md「GGUF 元数据
     // 解析与 KV 缓存估算（实机校准）」）。用真值而不是拍脑袋的数字：公式一旦
