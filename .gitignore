@@ -13,6 +13,9 @@ Thumbs.db
 # 日志
 *.log
 
+# P100 引擎升级用的大体积中转包（llama.cpp 官方预编译包 / 源码包，约 70 MB，不提交）
+engine-pkg/
+
 # 签名私钥（绝不提交）
 localai-signing-key.json
 *.signing-key.json
@@ -21,3 +24,14 @@ private/
 
 # Claude Code 本地目录
 .claude/
+
+# 调试残渣（cargo/探针输出转储，用完即删，防误提交）
+z_*.txt
+cross_check.txt
+probe_net.txt
+sha256.txt
+规划器输出.txt
+规划器-*.txt
+
+# 仓库根目录的临时截图（正式留档请放 30天学习计划/资产-本地模型部署/）
+/*.png
