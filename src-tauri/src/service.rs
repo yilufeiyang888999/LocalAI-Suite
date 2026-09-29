@@ -1120,40 +1120,95 @@ async fn 读取子进程诊断输出(child: &mut Child) -> String {
 }
 
 /// 把退出码翻译成人能行动的中文提示，并附上 llama.cpp 的原始输出。
+///
+/// **判据优先看引擎输出**（2026-09-29 虚拟机实测教训）：同一个退出码
+/// （如 0xC0000409）可能由多种原因触发，只看码会指错方向。当时的真实案例是
+/// 退出码指向「CPU 型号过精简」，但引擎输出里明摆着
+/// `CUDA error: invalid device function` —— 真正的根因是 **CUDA kernel 的
+/// 目标架构与显卡不匹配**，跟 CPU 毫无关系。所以这里先用引擎输出做归因，
+/// 归因不出来才退回按退出码给通用指引。
 fn 格式化启动失败(code: i32, 诊断: &str) -> String {
-    // Windows NTSTATUS 快速失败码。这些码的含义很具体，翻译出来能直接指向
-    // 排查方向；直接甩一个负数给用户等于没给信息。
-    let 解释 = match code as u32 {
-        0xC0000409 => Some(
-            "运行引擎触发了保护性中止（STATUS_STACK_BUFFER_OVERRUN）。\
-             在虚拟机上通常是因为 CPU 型号过于精简（如 PVE 默认的 qemu64/kvm64）\
-             或显卡驱动与虚拟机环境不匹配。建议把虚拟机 CPU 类型改为 host，\
-             或先用 CPU 模式运行。",
-        ),
-        0xC000001D => Some(
-            "运行引擎使用了当前 CPU 不支持的指令集（STATUS_ILLEGAL_INSTRUCTION）。\
-             建议在虚拟机设置里把 CPU 类型改为 host。",
-        ),
-        0xC0000005 => Some(
-            "运行引擎访问了非法内存地址（STATUS_ACCESS_VIOLATION）。\
-             常见于显卡驱动异常或引擎文件不完整。",
-        ),
-        0xC00000FD => Some("运行引擎栈溢出（STATUS_STACK_OVERFLOW）。"),
-        _ => None,
-    };
+    let mut 文案 = format!("AI服务进程启动后异常退出（退出码 {}）。", code);
 
-    let mut 文案 = match 解释 {
-        Some(说明) => format!("AI服务进程启动后异常退出（退出码 {}）。\n{}", code, 说明),
-        None => format!(
-            "AI服务进程启动后异常退出（退出码 {}），可能是运行引擎与硬件不兼容或模型文件损坏。",
-            code
-        ),
-    };
+    if let Some(说明) = 从引擎输出推断原因(诊断) {
+        文案.push('\n');
+        文案.push_str(说明);
+    } else {
+        // 引擎输出没能给出线索，退回按 Windows NTSTATUS 退出码给通用指引。
+        文案.push('\n');
+        文案.push_str(按退出码给指引(code));
+    }
+
     if !诊断.is_empty() {
         文案.push_str("\n\n运行引擎的输出：\n");
         文案.push_str(诊断);
     }
     文案
+}
+
+/// 从 llama.cpp 的 stderr 里认出已知的失败特征，给出针对性的处置建议。
+///
+/// 返回 `None` 表示没认出已知特征 —— 调用方会退回按退出码给通用指引。
+fn 从引擎输出推断原因(诊断: &str) -> Option<&'static str> {
+    // CUDA kernel 架构不匹配：引擎编入的设备码里没有这张卡的目标架构。
+    // 官方 Windows CUDA 12.4 预编译包最高只到 86-real / 89-real，
+    // Blackwell（sm_120）需要 CUDA >= 12.8，因此 50 系卡必定踩这个错。
+    if 诊断.contains("invalid device function")
+        || 诊断.contains("no kernel image is available")
+    {
+        return Some(
+            "运行引擎里的 CUDA 内核不是为当前显卡编译的（CUDA error: invalid device function）。\n\
+             原因：官方 Windows CUDA 12.4 预编译引擎，编入的真实架构只到 \
+             RTX 30 系（sm_86）和 RTX 40 系（sm_89）；\
+             RTX 50 系（Blackwell, sm_120）需要 CUDA 12.8 以上才能编出设备码，此引擎不具备。\n\
+             处置：请改用 Vulkan 后端运行（同一引擎目录里已有 llama-server-vulkan.exe），\
+             或先用 CPU 安全模式。若必须用 CUDA，需要换用 CUDA 13 版本的引擎包。",
+        );
+    }
+
+    // CUDA 运行时/驱动缺失。
+    if 诊断.contains("CUDA error") && 诊断.contains("not found")
+        || 诊断.contains("cudart64")
+        || 诊断.contains("cublas")
+    {
+        return Some(
+            "运行引擎缺少 CUDA 运行时库，或显卡驱动不可用。\
+             请在虚拟机里确认已安装 NVIDIA 驱动（命令 nvidia-smi 能正常输出），\
+             或改用 CPU 安全模式运行。",
+        );
+    }
+
+    // 显存不足。
+    if 诊断.contains("out of memory") || 诊断.contains("CUDA_ERROR_OUT_OF_MEMORY") {
+        return Some(
+            "显卡显存不足，模型加载失败。请在设置里调小上下文长度，\
+             或把「GPU 层数」降低后再试。",
+        );
+    }
+
+    None
+}
+
+/// 引擎输出没给出线索时，按 Windows NTSTATUS 快速失败码给通用指引。
+fn 按退出码给指引(code: i32) -> &'static str {
+    match code as u32 {
+        0xC0000409 => {
+            "运行引擎触发了保护性中止（STATUS_STACK_BUFFER_OVERRUN）。\
+             常见原因有三类：①显卡驱动与引擎不匹配；②CPU 指令集不足\
+             （虚拟机上如 PVE 默认的 qemu64/kvm64）；③运行库文件损坏。\
+             建议先改用 CPU 安全模式确认程序与模型本身正常，再排查显卡。"
+        }
+        0xC000001D => {
+            "运行引擎使用了当前 CPU 不支持的指令集（STATUS_ILLEGAL_INSTRUCTION）。\
+             建议在虚拟机设置里把 CPU 类型改为 host。"
+        }
+        0xC0000005 => {
+            "运行引擎访问了非法内存地址（STATUS_ACCESS_VIOLATION）。\
+             常见于显卡驱动异常或引擎文件不完整。"
+        }
+        0xC00000FD => "运行引擎栈溢出（STATUS_STACK_OVERFLOW）。",
+        _ => "可能是运行引擎与硬件不兼容或模型文件损坏。",
+    }
 }
 
 /// Single health probe used by startup recovery to decide whether a persisted
@@ -1498,21 +1553,22 @@ mod tests {
 
     /// 退出码必须翻译成人能行动的中文，而不是只甩一个负数。
     ///
-    /// **这条护栏是 2026-09-29 虚拟机实测换来的**：PVE 虚拟机（CPU 类型 qemu64）
-    /// 上 llama-server 以 0xC0000409 退出，而当时的错误信息只有
-    /// 「可能是运行引擎与硬件不兼容或模型文件损坏」—— 用户完全无从下手。
+    /// **这条护栏是 2026-09-29 虚拟机实测换来的**：当时 llama-server 以
+    /// 0xC0000409 退出，而错误信息只有「可能是运行引擎与硬件不兼容或模型
+    /// 文件损坏」—— 用户完全无从下手。
     #[test]
     fn exit_code_is_translated_into_actionable_chinese() {
-        // 0xC0000409 -> -1073740791，本次虚拟机遇到的真实退出码
+        // 0xC0000409 -> -1073740791，本次虚拟机遇到的真实退出码。
+        // 没有引擎输出时，退回按退出码给通用指引。
         let 文案 = 格式化启动失败(-1073740791, "");
         assert!(文案.contains("-1073740791"), "应保留原始退出码：{文案}");
         assert!(
-            文案.contains("qemu64") || 文案.contains("host"),
-            "0xC0000409 应给出虚拟机 CPU 类型的具体建议：{文案}"
-        );
-        assert!(
             !文案.contains("可能是运行引擎与硬件不兼容"),
             "已知退出码不应退化成含糊文案：{文案}"
+        );
+        assert!(
+            文案.contains("保护性中止"),
+            "应说明 0xC0000409 的含义：{文案}"
         );
 
         // 0xC000001D -> -1073741795，非法指令集
@@ -1522,6 +1578,45 @@ mod tests {
         // 未知退出码走通用文案，但也要带上码
         let 文案 = 格式化启动失败(-1, "");
         assert!(文案.contains("-1"), "未知码也要保留：{文案}");
+    }
+
+    /// **核心归因逻辑**：引擎输出里明摆着是 CUDA 架构不匹配时，
+    /// 就不能再按退出码去怪 CPU —— 这是虚拟机实测踩过的坑。
+    ///
+    /// 当时 0xC0000409 的通用文案指向「CPU 型号过精简（qemu64/kvm64）」，
+    /// 但日志里明明写着 `CUDA error: invalid device function`，
+    /// CPU 侧早已正常初始化到 `n_threads = 8`。**按码归因会把方向带偏。**
+    #[test]
+    fn engine_output_beats_exit_code_when_attributing_cause() {
+        let 诊断 = "ggml-cuda.cu:108: CUDA error\n\
+                    E CUDA error: invalid device function\n\
+                    E cudaFuncGetAttributes(&attr, kernel)";
+        let 文案 = 格式化启动失败(-1073740791, 诊断);
+
+        assert!(
+            文案.contains("CUDA 内核不是为当前显卡编译"),
+            "应认出 CUDA 架构不匹配：{文案}"
+        );
+        assert!(
+            文案.contains("Vulkan"),
+            "应给出改用 Vulkan 后端的可行动建议：{文案}"
+        );
+        assert!(
+            !文案.contains("qemu64"),
+            "已经定位到 CUDA 架构问题时，不应再去误导用户改 CPU 类型：{文案}"
+        );
+    }
+
+    /// 引擎输出识别不出来时，必须退回按退出码给指引 —— 不能什么都不给。
+    #[test]
+    fn unrecognised_output_falls_back_to_exit_code_guidance() {
+        let 诊断 = "some totally unknown failure line";
+        let 文案 = 格式化启动失败(-1073740791, 诊断);
+        assert!(
+            文案.contains("保护性中止"),
+            "识别不出特征时应退回按退出码归因：{文案}"
+        );
+        assert!(文案.contains("qemu64") || 文案.contains("CPU 指令集"), "通用指引应保留：{文案}");
     }
 
     /// llama.cpp 的原始输出必须被附在错误里 —— 这是排障的唯一线索。
@@ -1539,6 +1634,16 @@ mod tests {
     fn empty_diagnostics_do_not_leave_a_dangling_header() {
         let 文案 = 格式化启动失败(-1, "");
         assert!(!文案.contains("运行引擎的输出"), "空诊断不应有标题：{文案}");
+    }
+
+    /// 显存不足与运行时缺失也要能认出来，给对应的建议。
+    #[test]
+    fn other_cuda_failures_are_also_recognised() {
+        let 文案 = 格式化启动失败(-1073740791, "CUDA error: out of memory");
+        assert!(文案.contains("显存不足"), "应认出显存不足：{文案}");
+
+        let 文案 = 格式化启动失败(-1073740791, "error while loading cudart64_12.dll");
+        assert!(文案.contains("CUDA 运行时库"), "应认出运行时缺失：{文案}");
     }
 
     // 权重与 KV 一律用本机真实模型文件的实测值（详见 CLAUDE.md「GGUF 元数据
