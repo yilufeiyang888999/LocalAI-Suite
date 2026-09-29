@@ -258,22 +258,43 @@ fn eval_vram(has_gpu: bool, vram_gb: f64, smallest_need_gb: f64, safe_mode: bool
 
 // --- Impure helpers ---------------------------------------------------------
 
+/// 统计引擎目录里可用的 DLL 数量，**同时算上被后端隔离挪进 `.pool/` 的那些**。
+///
+/// 为什么要把池子算进来：`service::isolate_backend_dlls` 会让
+/// `backends/` 根目录下只剩当前后端的 DLL，另一个 GPU 后端的 DLL
+/// （CUDA 那个有 547MB）会被挪到 `backends/.pool/<后端>/`。
+/// 若这里只数根目录，隔离生效后计数会凭空少一大截，
+/// 诊断就会误报「运行库缺失」并提示用户重新下载引擎 —— 白白让用户
+/// 重下几百 MB，而实际上文件好端端地在池子里。
 fn count_backend_dlls(install_dir: &Path) -> usize {
     let backend_dir = install_dir.join("engine").join("backends");
-    let Ok(entries) = std::fs::read_dir(&backend_dir) else {
+    统计目录内dll数(&backend_dir) + 统计目录内dll数(&backend_dir.join(".pool"))
+}
+
+/// 递归统计一个目录下的 `.dll` 文件数。目录不存在时返回 0。
+fn 统计目录内dll数(目录: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(目录) else {
         return 0;
     };
-    entries
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("dll"))
-                .unwrap_or(false)
-        })
-        .count()
+    let mut 数 = 0;
+    for entry in entries.flatten() {
+        let 路径 = entry.path();
+        if 路径.is_dir() {
+            // 池子结构是 .pool/<后端名>/*.dll，递归一层足矣；
+            // 用递归实现是为了不依赖「恰好两层」这个假设。
+            数 += 统计目录内dll数(&路径);
+            continue;
+        }
+        if 路径
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("dll"))
+            .unwrap_or(false)
+        {
+            数 += 1;
+        }
+    }
+    数
 }
 
 fn available_disk_gb(install_dir: &Path) -> f64 {

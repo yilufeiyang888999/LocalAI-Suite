@@ -374,6 +374,25 @@ pub async fn start_service_core(
         inner.settings.service_port
     };
     let backend = detect_backend(&server_path, &install_dir);
+
+    // 隔离后端 DLL：让 backends/ 根目录下只剩当前后端需要的 GPU 后端 DLL。
+    //
+    // 必须做这一步，否则「切后端」形同虚设 —— llama.cpp 的
+    // ggml_backend_load_all() 不看可执行文件名，只要目录里有
+    // ggml-cuda.dll 就会加载并初始化 CUDA。2026-09-29 虚拟机实测：
+    // 选 Vulkan 却仍报 CUDA error: invalid device function，正是此因。
+    //
+    // CPU 是兜底路径，它的变体不参与隔离；共用底座（ggml.dll / llama.dll
+    // 等）也不动。失败不阻断启动（best-effort）—— 见 isolate_backend_dlls 注释。
+    let 移动数 = isolate_backend_dlls(&install_dir, backend);
+    if 移动数 > 0 {
+        tracing::info!(
+            backend = backend_label(backend),
+            移动文件数 = 移动数,
+            "已隔离后端 DLL，确保只加载当前后端的 GPU 模块"
+        );
+    }
+
     // A fixed port lets external clients keep a stable base_url. 0 means "auto".
     let port = if configured_port == 0 {
         pick_unused_port().unwrap_or(8000)
@@ -557,6 +576,14 @@ pub async fn start_service_core(
             };
 
             let safe_params = LaunchParams { n_gpu_layers: None, ctx_size: 2048, parallel: 1, kv_quant: false };
+            // CPU 兜底必须把**两个** GPU 后端都隔离掉。
+            // 否则 ggml_backend_load_all 仍会去加载 ggml-cuda.dll 并调用它的
+            // 初始化函数 —— 在 CUDA 不适配的机器上，那一步本身就会崩，
+            // 连 CPU 这条路都走不通（这正是本次虚拟机踩的坑）。
+            let 隔离数 = isolate_backend_dlls(&install_dir, EngineBackend::Cpu);
+            if 隔离数 > 0 {
+                tracing::info!(移动文件数 = 隔离数, "CPU 安全模式：已隔离全部 GPU 后端 DLL");
+            }
             set_starting(app, state, model_id, &host, port, true);
             match launch_service(&cpu_path, &model_path, &host, port, &safe_params, &extra_args, CPU_STARTUP_TIMEOUT_SECS).await {
                 Ok(child) => set_running(
@@ -685,6 +712,185 @@ pub fn get_service_status(state: tauri::State<'_, AppState>) -> ServiceInfo {
 /// when that backend's binary is present. Used by the backend-consistency check
 /// to launch a second backend without going through the engine installer.
 ///
+/// 每台机器最多同时存在的 GPU 后端种类；后端隔离目录用固定名字。
+///
+/// 之所以要「隔离」，是因为 llama.cpp 的后端加载**根本不看可执行文件名**：
+/// `ggml_backend_load_all()` 内部是按硬编码名字列表
+/// （blas / cuda / vulkan / ... / cpu）逐个 `ggml_backend_load_best(name)`，
+/// 每个 `load_best` 会在**可执行文件所在目录**里找 `ggml-<name>-*.dll` 或
+/// `ggml-<name>.dll`，找到就 `dlopen` 并调用它的 `ggml_backend_init`。
+///
+/// 实测（2026-09-29 虚拟机）后果：`backends/` 里同时躺着 `ggml-cuda.dll` 和
+/// `ggml-vulkan.dll` 时，**即使启动的是 `llama-server-vulkan.exe`，CUDA 后端
+/// 也会被加载并初始化** —— 于是一张 CUDA 不支持的卡（如 RTX 50 系 +
+/// 官方 CUDA 12.4 包）会让 Vulkan 路径也一起崩掉，报
+/// `CUDA error: invalid device function`，且报错内容与后端选择无关，极具误导性。
+///
+/// 上游**没有**提供「只加载某几个后端」的开关（只有 `GGML_DISABLE_VULKAN`
+/// 一个特例，没有 CUDA 版本）。所以唯一可靠的隔离手段就是让不被选中的后端
+/// DLL **不在搜索目录里**。本模块把非当前后端的 DLL 挪进
+/// `backends/.pool/<后端名>/`，启动前再按需换位。
+const 后端池目录名: &str = ".pool";
+
+/// `ggml-*.dll` 里哪些属于哪个后端。用于决定「当前后端需要哪些文件留在
+/// `backends/` 根下、哪些要挪进池子」。
+///
+/// 判定用**文件名前缀匹配**，因为同一后端可能有多个变体
+/// （CPU 就有一整套 `ggml-cpu-{alderlake,haswell,...,x64,sse42}.dll`）。
+/// 顺序有意义：先匹配到的先返回，所以更具体的前缀要排在前面。
+fn 文件名属于哪个后端(文件名: &str) -> Option<BackendFileKind> {
+    let 小写 = 文件名.to_ascii_lowercase();
+    if !小写.ends_with(".dll") {
+        return None;
+    }
+    if 小写.starts_with("ggml-cuda") {
+        Some(BackendFileKind::Cuda)
+    } else if 小写.starts_with("ggml-vulkan") {
+        Some(BackendFileKind::Vulkan)
+    } else if 小写.starts_with("ggml-cpu") {
+        Some(BackendFileKind::Cpu)
+    } else {
+        // ggml.dll / ggml-base.dll / llama.dll / llama-server-impl.dll 等
+        // 是所有后端共用的底座，必须始终留在根目录。
+        None
+    }
+}
+
+/// 一个后端专属的 DLL 归属。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendFileKind {
+    Cuda,
+    Vulkan,
+    /// CPU 是兜底路径，任何 GPU 后端启动失败都会退到它，所以 CPU 变体
+    /// **永远留在根目录**，不参与隔离（它体积极小，且不会有「架构不适配
+    /// 导致崩溃」之外的风险）。
+    Cpu,
+}
+
+impl BackendFileKind {
+    fn 对应后端(self) -> EngineBackend {
+        match self {
+            BackendFileKind::Cuda => EngineBackend::Cuda,
+            BackendFileKind::Vulkan => EngineBackend::Vulkan,
+            BackendFileKind::Cpu => EngineBackend::Cpu,
+        }
+    }
+}
+
+/// 让 `backends/` 根目录下**只剩** `目标后端` 需要的 GPU 后端 DLL。
+///
+/// 幂等：可以反复调用（每次启动前都调）。返回值是本次被移动的文件数，仅供日志。
+///
+/// 只动 GPU 后端的 DLL：
+/// - `目标后端` 自己的 DLL → 确保在根目录（若还在池子里就搬回来）
+/// - 另一个 GPU 后端的 DLL → 搬进池子
+/// - 共用底座（`ggml.dll` / `llama.dll` / `llama-server-impl.dll` 等）→ 不动
+/// - `目标后端 == Cpu` 时，**两个 GPU 后端都搬进池子**：CPU 安全模式的意义就是
+///   绕开 GPU 路径，而 CUDA/Vulkan 的 `ggml_backend_init` 在不适配的机器上
+///   本身就会崩，留着它们等于 CPU 兜底也走不通。
+///
+/// 失败不阻断启动（best-effort）：万一某个文件被占用搬不动，只是回到
+/// 「两个后端都在」的老行为，不该因此让用户连服务都起不来。
+pub fn isolate_backend_dlls(install_dir: &Path, 目标后端: EngineBackend) -> usize {
+    let backend_dir = install_dir.join("engine").join("backends");
+    if !backend_dir.is_dir() {
+        return 0;
+    }
+    let 池根 = backend_dir.join(后端池目录名);
+    let mut 移动数 = 0;
+
+    // 第一步：把不该留在根目录的 GPU 后端 DLL 收进池子。
+    if let Ok(条目) = std::fs::read_dir(&backend_dir) {
+        for 项 in 条目.flatten() {
+            let 路径 = 项.path();
+            let Some(名) = 路径.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+            let Some(归属) = 文件名属于哪个后端(&名) else {
+                continue;
+            };
+            // CPU 变体常驻根目录（体积极小，且是最终兜底）。
+            if 归属 == BackendFileKind::Cpu {
+                continue;
+            }
+            // 当前后端的 DLL 留在根目录 —— 但 CPU 模式例外：它要清掉所有 GPU 后端。
+            if 目标后端 != EngineBackend::Cpu && 归属.对应后端() == 目标后端 {
+                continue;
+            }
+            let 目标目录 = 池根.join(backend_label(归属.对应后端()));
+            if std::fs::create_dir_all(&目标目录).is_err() {
+                continue;
+            }
+            if std::fs::rename(&路径, 目标目录.join(&名)).is_ok() {
+                移动数 += 1;
+            }
+        }
+    }
+
+    // 第二步：把当前后端自己的 DLL 从池子里搬回根目录。
+    //
+    // 这一步不能省。想象用户先用 Vulkan（此时 CUDA DLL 在池子里），
+    // 之后切回 CUDA —— 若只做第一步，CUDA 的 DLL 会永远留在池子里出不来。
+    // CPU 模式不需要搬回任何东西（没有任何 GPU 后端属于它）。
+    if 目标后端 == EngineBackend::Cpu {
+        return 移动数;
+    }
+    let 池目录 = 池根.join(backend_label(目标后端));
+    if let Ok(条目) = std::fs::read_dir(&池目录) {
+        for 项 in 条目.flatten() {
+            let 路径 = 项.path();
+            let Some(名) = 路径.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+                continue;
+            };
+            // 双保险：只搬确实属于当前后端的文件，避免池子被污染后误搬。
+            if 文件名属于哪个后端(&名).map(|k| k.对应后端()) != Some(目标后端) {
+                continue;
+            }
+            if std::fs::rename(&路径, backend_dir.join(&名)).is_ok() {
+                移动数 += 1;
+            }
+        }
+    }
+
+    移动数
+}
+
+/// 把曾被隔离走的 DLL 全部还原到 `backends/` 根目录。
+///
+/// 用途：① 安装新引擎包前还原（避免新旧 DLL 混在一个目录，见 `engine.rs`）；
+/// ② 卸载 / 校验引擎完整性 / 用户手工排查时需要一个「原样」目录。
+/// 正常启动流程**不需要**调用它 —— 隔离状态本身就是期望状态。
+pub fn restore_backend_dlls(backend_dir: &Path) -> usize {
+    let 池根 = backend_dir.join(后端池目录名);
+    if !池根.is_dir() {
+        return 0;
+    }
+    let mut 还原数 = 0;
+    if let Ok(子目录) = std::fs::read_dir(&池根) {
+        for 子项 in 子目录.flatten() {
+            let 子路径 = 子项.path();
+            if !子路径.is_dir() {
+                continue;
+            }
+            if let Ok(文件) = std::fs::read_dir(&子路径) {
+                for 文件项 in 文件.flatten() {
+                    let 路径 = 文件项.path();
+                    let Some(名) = 路径.file_name().and_then(|n| n.to_str()).map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if std::fs::rename(&路径, backend_dir.join(&名)).is_ok() {
+                        还原数 += 1;
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(&子路径);
+        }
+    }
+    let _ = std::fs::remove_dir(&池根);
+    还原数
+}
+
 /// The CPU binary is deliberately not offered: comparing GPU backends is the
 /// point, and a CPU run would take minutes per generation.
 pub fn backend_executable(install_dir: &Path, backend: EngineBackend) -> Option<PathBuf> {
@@ -1886,6 +2092,209 @@ mod tests {
         assert!(!is_port_available("127.0.0.1", port));
         drop(listener);
         assert!(is_port_available("127.0.0.1", port));
+    }
+
+    /// **后端隔离的核心契约**：选定某个后端后，`backends/` 根目录下
+    /// 必须**没有**另一个 GPU 后端的 DLL。
+    ///
+    /// 这条测试源自 2026-09-29 虚拟机实测：选了 Vulkan，但 `backends/`
+    /// 里同时躺着 `ggml-cuda.dll`，而 llama.cpp 的 `ggml_backend_load_all()`
+    /// **不看可执行文件名**，照样加载并初始化 CUDA → 在 CUDA 不适配的卡上
+    /// 直接崩，报 `CUDA error: invalid device function`。
+    #[test]
+    fn isolating_vulkan_evicts_cuda_dlls() {
+        let 沙盘 = 建临时引擎目录();
+        let backends = 沙盘.join("engine").join("backends");
+
+        let 移动数 = isolate_backend_dlls(&沙盘, EngineBackend::Vulkan);
+
+        assert!(移动数 > 0, "应当有 CUDA 的 DLL 被移走");
+        assert!(
+            backends.join("ggml-vulkan.dll").exists(),
+            "Vulkan 自己的 DLL 必须留在根目录"
+        );
+        assert!(
+            !backends.join("ggml-cuda.dll").exists(),
+            "CUDA 的 DLL 必须被移出根目录，否则仍会被加载"
+        );
+        assert!(
+            backends.join("ggml.dll").exists() && backends.join("llama.dll").exists(),
+            "共用底座 DLL 不能被误移"
+        );
+        assert!(
+            backends.join("ggml-cpu-x64.dll").exists(),
+            "CPU 变体必须常驻（它是最终兜底）"
+        );
+
+        清理临时目录(&沙盘);
+    }
+
+    /// 反向：选定 CUDA 时，Vulkan 的 DLL 要被移走，CUDA 的留在根下。
+    #[test]
+    fn isolating_cuda_evicts_vulkan_dlls() {
+        let 沙盘 = 建临时引擎目录();
+        let backends = 沙盘.join("engine").join("backends");
+
+        isolate_backend_dlls(&沙盘, EngineBackend::Cuda);
+
+        assert!(backends.join("ggml-cuda.dll").exists(), "CUDA 的 DLL 应留在根目录");
+        assert!(
+            !backends.join("ggml-vulkan.dll").exists(),
+            "Vulkan 的 DLL 应被移出根目录"
+        );
+
+        清理临时目录(&沙盘);
+    }
+
+    /// **CPU 安全模式必须清光两个 GPU 后端** —— 这是最容易被忽略的一档。
+    ///
+    /// 理由：CUDA/Vulkan 的 `ggml_backend_init` 在不适配的机器上**本身就会崩**。
+    /// 若 CPU 兜底时还留着它们，等于兜底路径也走不通（虚拟机实测正是如此）。
+    #[test]
+    fn isolating_cpu_evicts_both_gpu_backends() {
+        let 沙盘 = 建临时引擎目录();
+        let backends = 沙盘.join("engine").join("backends");
+
+        isolate_backend_dlls(&沙盘, EngineBackend::Cpu);
+
+        assert!(
+            !backends.join("ggml-cuda.dll").exists(),
+            "CPU 模式不能留下 CUDA 的 DLL"
+        );
+        assert!(
+            !backends.join("ggml-vulkan.dll").exists(),
+            "CPU 模式不能留下 Vulkan 的 DLL"
+        );
+        assert!(
+            backends.join("ggml-cpu-x64.dll").exists(),
+            "CPU 自己的 DLL 当然要保留"
+        );
+
+        清理临时目录(&沙盘);
+    }
+
+    /// **来回切换后端必须能切回来** —— 池子不能只进不出。
+    ///
+    /// 先用 Vulkan（CUDA 进池子），再切 CUDA：若第二步「从池子里搬回」
+    /// 缺失，CUDA 的 DLL 会永远出不来，切后端等于单向操作。
+    #[test]
+    fn switching_backends_round_trips() {
+        let 沙盘 = 建临时引擎目录();
+        let backends = 沙盘.join("engine").join("backends");
+
+        isolate_backend_dlls(&沙盘, EngineBackend::Vulkan);
+        assert!(!backends.join("ggml-cuda.dll").exists());
+
+        isolate_backend_dlls(&沙盘, EngineBackend::Cuda);
+        assert!(
+            backends.join("ggml-cuda.dll").exists(),
+            "切回 CUDA 后，CUDA 的 DLL 必须从池子里被搬回来"
+        );
+        assert!(
+            !backends.join("ggml-vulkan.dll").exists(),
+            "切回 CUDA 后，Vulkan 的 DLL 应进池子"
+        );
+
+        清理临时目录(&沙盘);
+    }
+
+    /// 幂等：连续两次隔离同一后端，结果一致且不报错。
+    #[test]
+    fn isolation_is_idempotent() {
+        let 沙盘 = 建临时引擎目录();
+        let backends = 沙盘.join("engine").join("backends");
+
+        isolate_backend_dlls(&沙盘, EngineBackend::Vulkan);
+        let 第二次 = isolate_backend_dlls(&沙盘, EngineBackend::Vulkan);
+
+        assert_eq!(第二次, 0, "第二次调用应当无事可做");
+        assert!(backends.join("ggml-vulkan.dll").exists());
+        assert!(!backends.join("ggml-cuda.dll").exists());
+
+        清理临时目录(&沙盘);
+    }
+
+    /// `restore_backend_dlls` 要把所有被隔离的 DLL 还原，供卸载/校验使用。
+    #[test]
+    fn restore_puts_everything_back() {
+        let 沙盘 = 建临时引擎目录();
+        let backends = 沙盘.join("engine").join("backends");
+
+        isolate_backend_dlls(&沙盘, EngineBackend::Vulkan);
+        let 还原数 = restore_backend_dlls(&backends);
+
+        assert!(还原数 > 0, "应当有文件被还原");
+        assert!(backends.join("ggml-cuda.dll").exists(), "CUDA 的 DLL 应被还原");
+        assert!(backends.join("ggml-vulkan.dll").exists());
+        assert!(
+            !backends.join(后端池目录名).exists(),
+            "池子目录应当被清理干净"
+        );
+
+        清理临时目录(&沙盘);
+    }
+
+    /// 文件名归属判定：前缀匹配要能覆盖多变体，且不能误判共用底座。
+    #[test]
+    fn backend_file_kind_matches_by_prefix() {
+        assert_eq!(
+            文件名属于哪个后端("ggml-cuda.dll"),
+            Some(BackendFileKind::Cuda)
+        );
+        assert_eq!(
+            文件名属于哪个后端("ggml-vulkan.dll"),
+            Some(BackendFileKind::Vulkan)
+        );
+        // CPU 有一整套微架构变体，都必须归到 CPU
+        for 名 in [
+            "ggml-cpu-alderlake.dll",
+            "ggml-cpu-haswell.dll",
+            "ggml-cpu-x64.dll",
+            "ggml-cpu-sse42.dll",
+        ] {
+            assert_eq!(文件名属于哪个后端(名), Some(BackendFileKind::Cpu), "{名}");
+        }
+        // 共用底座不属于任何后端，绝不能被隔离走
+        for 名 in [
+            "ggml.dll",
+            "ggml-base.dll",
+            "llama.dll",
+            "llama-server-impl.dll",
+            "libomp.dll",
+            "cudart64_12.dll",
+        ] {
+            assert_eq!(文件名属于哪个后端(名), None, "{名} 不该被归到某个后端");
+        }
+    }
+
+    /// 搭建一个假的引擎目录，含齐三个后端的代表性 DLL 与共用底座。
+    fn 建临时引擎目录() -> PathBuf {
+        let 根 = std::env::temp_dir().join(format!(
+            "localai-隔离测试-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let backends = 根.join("engine").join("backends");
+        std::fs::create_dir_all(&backends).unwrap();
+        for 名 in [
+            "ggml-cuda.dll",
+            "ggml-vulkan.dll",
+            "ggml-cpu-x64.dll",
+            "ggml-cpu-haswell.dll",
+            "ggml.dll",
+            "ggml-base.dll",
+            "llama.dll",
+            "llama-server-impl.dll",
+            "llama-server-cuda.exe",
+            "llama-server-vulkan.exe",
+        ] {
+            std::fs::write(backends.join(名), b"stub").unwrap();
+        }
+        根
+    }
+
+    fn 清理临时目录(根: &Path) {
+        let _ = std::fs::remove_dir_all(根);
     }
 
     #[test]

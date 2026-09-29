@@ -293,6 +293,21 @@ async fn prepare_package(
 
     tracing::info!(file = %package.file_name, "preparing engine package");
     fs::create_dir_all(backend_dir).await?;
+
+    // 解包前先把「后端隔离」还原：被 `service::isolate_backend_dlls` 挪进
+    // `.pool/<后端>/` 的 DLL 放回根目录。
+    //
+    // 为什么必须还原：解包是**按包内文件名直接写进 backends/ 根目录**的。
+    // 若此刻池子里还压着另一个后端的旧 DLL，而新包又解出同名文件，就会出现
+    // 「同一后端两套版本的 DLL 混在一个目录」—— 更糟的是新旧混用会让
+    // `ggml_backend_load_best` 的 score 择优挑到意外的那一个。
+    // 还原成完整目录再解包，语义最清晰：解完就是「一个包含全部后端」的干净目录，
+    // 随后 `start_service_core` 的隔离逻辑会在下次启动时重新收敛。
+    let 还原数 = crate::service::restore_backend_dlls(backend_dir);
+    if 还原数 > 0 {
+        tracing::info!(还原文件数 = 还原数, "解包前已还原被隔离的后端 DLL");
+    }
+
     let package_path = engine_dir.join(package.file_name);
     download_archive(package.urls, package.sha256, package.file_name, &package_path).await?;
     extract_engine_package(package, &package_path, backend_dir).await?;
