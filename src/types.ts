@@ -66,10 +66,53 @@ export interface RecommendedModel {
   score: number;
   reason: string;
   speed_label: string;
+  /** 预估解码速度（字/秒），按显存带宽与权重体积推算。显卡不在带宽表里时为 null。 */
+  estimated_tps: number | null;
   quality_label: string;
 }
 
 export type DownloadStatus = 'pending' | 'downloading' | 'paused' | 'verifying' | 'failed' | 'completed' | 'cancelled';
+
+/** 后端一致性自检：能不能跑。 */
+export interface BackendCheckAvailability {
+  available: boolean;
+  /** 当前正在使用的后端：CUDA / Vulkan / CPU。 */
+  current_backend: string;
+  /** 可以拿来对比的后端名列表。 */
+  comparable_backends: string[];
+  /** 不可用时的原因。 */
+  reason: string | null;
+}
+
+/** 一个后端的一次生成结果。 */
+export interface BackendRun {
+  backend: string;
+  text: string;
+  token_count: number;
+  /** limit = 打满 n_predict；stop = 命中 EOS。 */
+  stop_type: string;
+  elapsed_sec: number;
+  tokens_per_sec: number;
+}
+
+/** 比对结论。 */
+export type ConsistencyVerdict = 'identical' | 'length_only' | 'diverged';
+
+export interface BackendComparison {
+  verdict: ConsistencyVerdict;
+  common_prefix_len: number;
+  first_divergence: number | null;
+  match_ratio: number;
+  summary: string;
+}
+
+export interface BackendCheckResult {
+  first: BackendRun;
+  second: BackendRun;
+  comparison: BackendComparison;
+  /** 自检结束后恢复到的后端。 */
+  restored_to: string;
+}
 
 export interface DownloadProgress {
   task_id: string;

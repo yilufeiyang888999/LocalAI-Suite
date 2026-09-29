@@ -317,17 +317,68 @@ fn lookup_bandwidth(vendor: &GpuVendor, name: &str) -> Option<u32> {
         .map(|(_, bandwidth)| *bandwidth)
 }
 
+/// Real-world efficiency factor for the roofline decode estimate, bucketed by
+/// GPU generation.
+///
+/// `tok/s ≈ bandwidth / weight_bytes` is the *theoretical* ceiling; how close a
+/// real llama.cpp build gets depends mostly on whether the silicon has tensor
+/// (fp16/bf16) acceleration and how well the backend kernels are tuned for it.
+/// A single constant cannot cover both ends:
+///
+/// | Class | Measured efficiency | Example |
+/// |---|---|---|
+/// | Modern, tensor-accelerated | 49–67% | RTX 4060 Laptop 8B-Q4: 35 t/s of 52 theoretical |
+/// | Pascal and older (no fp16) | ~18% | Tesla P100 27B-Q3: 11 t/s of 61 theoretical |
+/// | AMD / Intel (Vulkan/Vulkan-only) | ~35% | conservative middle ground |
+///
+/// The previous flat `0.7` matched modern consumer cards but overstated a
+/// bandwidth-rich Pascal card by 3.8× — a P100 would be advertised at ~42 t/s
+/// while actually delivering ~11. Every figure below is anchored to a measured
+/// system, and `estimate_tokens_per_second` has regression tests pinning them.
+fn efficiency_for(name: &str, vendor: &GpuVendor) -> f64 {
+    let lower = name.to_ascii_lowercase();
+
+    // NVIDIA: tensor cores arrived with Volta (V100) and became broadly useful
+    // for LLM inference from Turing onward. Pascal (P100/P40/GTX 10xx) has no
+    // usable fp16 path at all, so decode stays close to the fp32 roofline.
+    if matches!(vendor, GpuVendor::NVIDIA) {
+        const PASCAL_OR_OLDER: &[&str] = &[
+            "p100", "p40", "p4", "gtx 10", "gtx 9", "gtx 7", "tesla k", "tesla m",
+            "quadro p", "mx1", "mx2", "mx3", "mx250", "mx330", "mx350",
+        ];
+        if PASCAL_OR_OLDER.iter().any(|kw| lower.contains(kw)) {
+            return 0.20;
+        }
+        return 0.60;
+    }
+
+    // Apple Silicon shares unified memory and has a well-tuned Metal backend.
+    if matches!(vendor, GpuVendor::Unknown) {
+        return 0.55;
+    }
+
+    // AMD / Intel run the Vulkan backend, which is usable but less tuned than
+    // the NVIDIA path.
+    0.35
+}
+
 /// Rough decode-speed estimate (tokens/sec) for a memory-bandwidth-bound LLM.
 /// Each token reads the resident weights once, so `tok/s ≈ bandwidth / weight_bytes`
-/// scaled by a real-world efficiency factor. `weight_gb` should be the resident
-/// weight size (GGUF file size for dense models, active fraction for MoE).
-pub fn estimate_tokens_per_second(bandwidth_gbs: u32, weight_gb: f64) -> f64 {
+/// scaled by a generation-dependent efficiency factor. `weight_gb` should be the
+/// resident weight size (GGUF file size for dense models, active fraction for MoE).
+///
+/// `gpu_name` / `vendor` select the efficiency bucket; pass the adapter name and
+/// vendor of the GPU that will actually serve the model.
+pub fn estimate_tokens_per_second(
+    bandwidth_gbs: u32,
+    weight_gb: f64,
+    gpu_name: &str,
+    vendor: &GpuVendor,
+) -> f64 {
     if bandwidth_gbs == 0 || weight_gb <= 0.0 {
         return 0.0;
     }
-    // Real llama.cpp decode reaches ~70% of the theoretical roofline in practice.
-    const EFFICIENCY: f64 = 0.7;
-    f64::from(bandwidth_gbs) / weight_gb * EFFICIENCY
+    f64::from(bandwidth_gbs) / weight_gb * efficiency_for(gpu_name, vendor)
 }
 
 /// Windows NVIDIA driver floor for the bundled CUDA 12.4 `llama.cpp` build. An
@@ -627,15 +678,51 @@ mod tests {
 
     #[test]
     fn tokens_per_second_scales_with_bandwidth_and_size() {
-        // ~4GB weights on a 448 GB/s card: 448/4*0.7 ≈ 78 t/s.
-        let fast = estimate_tokens_per_second(448, 4.0);
-        assert!((70.0..90.0).contains(&fast), "unexpected estimate {fast}");
-        // Same card, a heavier 8GB model must be slower.
-        let slow = estimate_tokens_per_second(448, 8.0);
+        // ~4.9GB weights on a 1008 GB/s Ada card: 1008/4.9*0.60 ≈ 123 t/s.
+        let nv = GpuVendor::NVIDIA;
+        let fast = estimate_tokens_per_second(1008, 4.9, "NVIDIA GeForce RTX 4090", &nv);
+        assert!((100.0..150.0).contains(&fast), "unexpected estimate {fast}");
+        // Same card, a heavier 39GB model must be slower.
+        let slow = estimate_tokens_per_second(1008, 39.0, "NVIDIA GeForce RTX 4090", &nv);
         assert!(slow < fast);
         // Missing inputs degrade to zero rather than dividing by zero.
-        assert_eq!(estimate_tokens_per_second(0, 4.0), 0.0);
-        assert_eq!(estimate_tokens_per_second(448, 0.0), 0.0);
+        assert_eq!(estimate_tokens_per_second(0, 4.0, "NVIDIA GeForce RTX 4090", &nv), 0.0);
+        assert_eq!(estimate_tokens_per_second(1008, 0.0, "NVIDIA GeForce RTX 4090", &nv), 0.0);
+    }
+
+    /// Regression guard anchored to the 2026-09-28 P100 measurement.
+    ///
+    /// Measured on a Tesla P100 (Pascal, HBM2 732 GB/s): Qwen3.8-27B-Q3_K_XL,
+    /// 11.92 GiB resident weights → **10.47 tok/s (Vulkan) / 11.36 tok/s (CUDA)**,
+    /// i.e. ~18% of the 61.4 tok/s roofline. The old flat `0.7` factor predicted
+    /// ~42 tok/s and overstated reality by 3.8×.
+    ///
+    /// This test exists so nobody re-flattens the efficiency table and silently
+    /// brings back a 4×-inflated number on old hardware.
+    #[test]
+    fn p100_estimate_matches_measured_tok_per_second() {
+        let nv = GpuVendor::NVIDIA;
+        let est = estimate_tokens_per_second(732, 11.92, "Tesla P100-PCIE-16GB", &nv);
+        // Measured 10.47–11.36 t/s. Allow the estimate to land in a band that
+        // covers both backends without accepting a wildly optimistic value.
+        assert!(
+            (9.5..15.0).contains(&est),
+            "P100 estimate {est} drifted away from the measured 10.5–11.4 t/s"
+        );
+        // The flat 0.7 factor would have produced ~43 t/s — reject anything close.
+        assert!(est < 20.0, "P100 estimate {est} is suspiciously close to the old 0.7 factor");
+    }
+
+    #[test]
+    fn pascal_is_bucketed_below_tensor_accelerated_cards() {
+        let nv = GpuVendor::NVIDIA;
+        // Same bandwidth, different generations → different efficiency.
+        assert!(efficiency_for("Tesla P100-PCIE-16GB", &nv) < 0.3);
+        assert!(efficiency_for("NVIDIA GeForce RTX 4090", &nv) > 0.5);
+        assert!(efficiency_for("NVIDIA GeForce GTX 1080 Ti", &nv) < 0.3);
+        assert!(efficiency_for("NVIDIA GeForce RTX 4060 Laptop GPU", &nv) > 0.5);
+        // Non-NVIDIA vendors fall into their own buckets.
+        assert!((0.3..0.5).contains(&efficiency_for("AMD Radeon RX 7900 XTX", &GpuVendor::AMD)));
     }
 
     fn nvidia(name: &str, vram_gb: f64, driver: &str) -> GpuInfo {

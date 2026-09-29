@@ -15,6 +15,16 @@ pub struct RecommendedModel {
     pub score: f64,
     pub reason: String,
     pub speed_label: String,
+    /// Estimated decode speed (tokens/sec) from the bandwidth roofline, rounded
+    /// to one decimal. `None` when the GPU isn't in the bandwidth table — the UI
+    /// then shows only `speed_label`.
+    ///
+    /// Exposing the number matters because the qualitative 快/中/慢 label hides
+    /// what actually drives speed: memory bandwidth and weight size. On a Tesla
+    /// P100 a CUDA-vs-Vulkan backend swap moves decode by ~9%, while the model
+    /// choice moves it several-fold — users should see the figure that responds
+    /// to their decision.
+    pub estimated_tps: Option<f64>,
     pub quality_label: String,
 }
 
@@ -64,7 +74,7 @@ pub fn recommend_models(
 
     let cpu_only = !request.hardware.has_gpu && request.manual_vram_gb.is_none();
     let max_required = if cpu_only { 2.8 } else { usable_vram };
-    let gpu_bandwidth = primary_gpu_bandwidth(&request.hardware);
+    let gpu = primary_gpu(&request.hardware);
 
     let mut scored: Vec<_> = catalog
         .iter()
@@ -83,7 +93,7 @@ pub fn recommend_models(
             };
             let fit = fit_score(usable_vram, model.vram_required_gb);
             let quality = quality_score(&model);
-            let speed = speed_value(&model, gpu_bandwidth);
+            let speed = speed_value(&model, gpu.as_ref());
             let score = scene_match + fit * 0.25 + quality * 0.25 + speed * 0.15;
             (model, score)
         })
@@ -110,7 +120,8 @@ pub fn recommend_models(
                 RecommendationRank::Alternative
             };
             let reason = reason_for(&model, &request.scene, usable_vram);
-            let speed_label = speed_label_for(&model, gpu_bandwidth);
+            let speed_label = speed_label_for(&model, gpu.as_ref());
+            let estimated = estimated_tps(&model, gpu.as_ref()).map(|tps| (tps * 10.0).round() / 10.0);
             let quality_label = quality_label(model.chinese_score);
             let mut model = model;
             if is_model_installed(install_dir, &model) {
@@ -124,6 +135,7 @@ pub fn recommend_models(
             RecommendedModel {
                 reason,
                 speed_label,
+                estimated_tps: estimated,
                 quality_label,
                 model,
                 rank,
@@ -181,22 +193,45 @@ fn reason_for(model: &ModelMetadata, scene: &Scene, usable_vram: f64) -> String 
     }
 }
 
-/// Bandwidth (GB/s) of the GPU the service would actually use. MVP auto-uses the
-/// fastest NVIDIA card, so pick the max bandwidth among NVIDIA GPUs; `None` when
-/// there's no NVIDIA card or the model isn't in the bandwidth table.
-fn primary_gpu_bandwidth(hardware: &HardwareInfo) -> Option<u32> {
+/// The GPU the bundled service would actually run on, carrying everything the
+/// speed model needs. MVP auto-uses the fastest NVIDIA card, so pick the max
+/// bandwidth among NVIDIA GPUs; `None` when there's no NVIDIA card or the model
+/// isn't in the bandwidth table.
+///
+/// The adapter *name* matters as much as the bandwidth: it selects the
+/// generation-dependent efficiency bucket (see `hardware::efficiency_for`).
+/// A P100 and an RTX 4090 with equal bandwidth would decode at very different
+/// fractions of the roofline, so keeping only the number would lose that.
+struct 主显卡 {
+    带宽: u32,
+    名称: String,
+    厂商: GpuVendor,
+}
+
+fn primary_gpu(hardware: &HardwareInfo) -> Option<主显卡> {
     hardware
         .gpu_list
         .iter()
         .filter(|gpu| matches!(gpu.vendor, GpuVendor::NVIDIA))
-        .filter_map(|gpu| gpu.bandwidth_gbs)
-        .max()
+        .filter_map(|gpu| {
+            gpu.bandwidth_gbs.map(|带宽| 主显卡 {
+                带宽,
+                名称: gpu.name.clone(),
+                厂商: gpu.vendor.clone(),
+            })
+        })
+        .max_by_key(|g| g.带宽)
 }
 
-/// Resident weight size (GB) read per decoded token. The GGUF file size is the
+/// Resident weight size (GiB) read per decoded token. The GGUF file size is the
 /// best proxy for dense models; MoE models only read the active expert fraction.
+///
+/// `file_size_mb` is decimal (10⁶ bytes), so converting to GiB means dividing by
+/// 1024³ — dividing by 1024 alone reads a decimal MB as if it were binary and
+/// overstates the result by ~4.9%. Every VRAM figure in this project is GiB, to
+/// match `nvidia-smi` (which reports MiB).
 fn model_weight_gb(model: &ModelMetadata) -> f64 {
-    let file_gb = model.file_size_mb as f64 / 1024.0;
+    let file_gb = (model.file_size_mb as f64) * 1_000_000.0 / crate::gguf::每GiB字节;
     match model.active_parameters {
         Some(active) if model.is_moe && model.parameters_raw > 0 => {
             file_gb * (active as f64 / model.parameters_raw as f64)
@@ -206,24 +241,29 @@ fn model_weight_gb(model: &ModelMetadata) -> f64 {
 }
 
 /// Estimated decode speed (tokens/sec) when GPU bandwidth is known, else `None`.
-fn estimated_tps(model: &ModelMetadata, bandwidth: Option<u32>) -> Option<f64> {
-    let bandwidth = bandwidth?;
-    let tps = estimate_tokens_per_second(bandwidth, model_weight_gb(model));
+fn estimated_tps(model: &ModelMetadata, gpu: Option<&主显卡>) -> Option<f64> {
+    let gpu = gpu?;
+    let tps = estimate_tokens_per_second(
+        gpu.带宽,
+        model_weight_gb(model),
+        &gpu.名称,
+        &gpu.厂商,
+    );
     (tps > 0.0).then_some(tps)
 }
 
 /// Speed dimension in the same 0..50 range as the legacy `speed_rating * 10`, so
 /// weighting stays balanced. Uses the bandwidth-based tok/s estimate when
 /// available (40 t/s ≈ full marks), otherwise falls back to the static rating.
-fn speed_value(model: &ModelMetadata, bandwidth: Option<u32>) -> f64 {
-    match estimated_tps(model, bandwidth) {
+fn speed_value(model: &ModelMetadata, gpu: Option<&主显卡>) -> f64 {
+    match estimated_tps(model, gpu) {
         Some(tps) => (tps / 40.0 * 50.0).clamp(0.0, 50.0),
         None => f64::from(model.speed_rating) * 10.0,
     }
 }
 
-fn speed_label_for(model: &ModelMetadata, bandwidth: Option<u32>) -> String {
-    match estimated_tps(model, bandwidth) {
+fn speed_label_for(model: &ModelMetadata, gpu: Option<&主显卡>) -> String {
+    match estimated_tps(model, gpu) {
         Some(tps) if tps >= 30.0 => "快".to_string(),
         Some(tps) if tps >= 15.0 => "中".to_string(),
         Some(_) => "慢".to_string(),
@@ -260,6 +300,24 @@ mod tests {
             .expect("at least one builtin model")
     }
 
+    /// A modern tensor-accelerated card, for the "fast path" side of tests.
+    fn ada(带宽: u32) -> 主显卡 {
+        主显卡 {
+            带宽,
+            名称: "NVIDIA GeForce RTX 4090".to_string(),
+            厂商: GpuVendor::NVIDIA,
+        }
+    }
+
+    /// A Pascal-era card with no usable fp16 path — the slow-efficiency bucket.
+    fn pascal(带宽: u32) -> 主显卡 {
+        主显卡 {
+            带宽,
+            名称: "Tesla P100-PCIE-16GB".to_string(),
+            厂商: GpuVendor::NVIDIA,
+        }
+    }
+
     #[test]
     fn speed_value_falls_back_to_rating_without_bandwidth() {
         let model = light_model();
@@ -268,20 +326,58 @@ mod tests {
             f64::from(model.speed_rating) * 10.0
         );
         assert_eq!(speed_label_for(&model, None), speed_label(model.speed_rating));
+        assert_eq!(estimated_tps(&model, None), None);
     }
 
     #[test]
     fn speed_value_uses_bandwidth_estimate_when_available() {
         let model = light_model();
-        // A ~1.1GB model on a 448 GB/s card decodes far above 40 t/s, so the
+        // A ~1.1GB model on a fast Ada card decodes far above 40 t/s, so the
         // bandwidth path should saturate the 0..50 speed dimension.
-        let fast = speed_value(&model, Some(448));
+        let fast_gpu = ada(1008);
+        let fast = speed_value(&model, Some(&fast_gpu));
         assert_eq!(fast, 50.0);
-        assert_eq!(speed_label_for(&model, Some(448)), "快");
+        assert_eq!(speed_label_for(&model, Some(&fast_gpu)), "快");
 
         // A very slow card drags the same model below full marks.
-        let slow = speed_value(&model, Some(50));
+        let slow = speed_value(&model, Some(&pascal(50)));
         assert!(slow < 50.0, "expected throttled speed, got {slow}");
+    }
+
+    /// The generation bucket must change the *number*, not just the label.
+    ///
+    /// Same model, same bandwidth, different generation: a Pascal card has no
+    /// usable fp16 path, so its estimate must land clearly below an Ada card's.
+    /// Before the efficiency table was bucketed, both produced the same inflated
+    /// figure and the user saw a "fast" label on hardware that would crawl.
+    #[test]
+    fn generation_changes_the_estimated_number() {
+        let model = light_model();
+        let pascal_tps = estimated_tps(&model, Some(&pascal(732))).expect("bandwidth known");
+        let ada_tps = estimated_tps(&model, Some(&ada(732))).expect("bandwidth known");
+        assert!(
+            ada_tps > pascal_tps * 2.0,
+            "expected Ada to clearly out-estimate Pascal at equal bandwidth: \
+             ada={ada_tps} pascal={pascal_tps}"
+        );
+    }
+
+    /// The value handed to the UI must be rounded to one decimal. `estimated_tps`
+    /// returns the raw figure and the round happens at the serialisation site in
+    /// `recommend_models`, so this pins the exact expression used there.
+    #[test]
+    fn estimated_tps_is_rounded_for_display() {
+        let model = light_model();
+        let raw = estimated_tps(&model, Some(&ada(1008))).expect("bandwidth known");
+        let for_display = (raw * 10.0).round() / 10.0;
+        assert_ne!(raw, for_display, "test is vacuous: pick a value with more precision");
+        // One decimal place, no more.
+        assert_eq!(
+            (for_display * 10.0).round() / 10.0,
+            for_display,
+            "{for_display} has more than one decimal place"
+        );
+        assert!((for_display - raw).abs() < 0.05, "rounding moved the value too far");
     }
 
     #[test]
@@ -292,7 +388,7 @@ mod tests {
         model.active_parameters = Some(2_000_000_000);
         // Only ~20% of the weights are read per token, so the effective size is
         // a fifth of the file size.
-        let full = model.file_size_mb as f64 / 1024.0;
+        let full = (model.file_size_mb as f64) * 1_000_000.0 / crate::gguf::每GiB字节;
         assert!((model_weight_gb(&model) - full * 0.2).abs() < 1e-9);
     }
 }
