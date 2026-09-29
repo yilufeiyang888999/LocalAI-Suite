@@ -927,6 +927,12 @@ engine/
 
 **Windows 后端选择策略**：不使用 `llama-server.exe` 软链接。Windows 创建可执行文件软链接通常需要管理员权限或开发者模式，和普通用户权限运行目标冲突。启动服务时直接读取 `current_backend.txt` 中记录的后端文件名，拼接 `engine/backends/` 下的真实路径后启动；切换后端只更新该配置文件。
 
+> **实测补充（2026-09-29，客户虚拟机）**：上述"文件名区分后端"只是**启动哪个文件**的记法——**实际走哪条计算路径由同目录的 `ggml-*.dll` 决定**。四个 `llama-server-{cuda,vulkan,cpu}.exe` 的 SHA256 **完全相同**（实为同一个二进制换了名字），llama.cpp 运行时按目录里存在哪个后端 DLL（`ggml-cuda.dll` / `ggml-vulkan.dll` / `ggml-cpu.dll`）来选择。因此若 `ggml-cuda.dll` 不在根目录（例如被"后端隔离"挪进 `.pool/CUDA/`），即使启动 `llama-server-cuda.exe` 也只会退到 CPU。
+>
+> 附带的两条排查判据：① 启动日志 `device_info:` 列表里只有 `CPU` 一行 = 没上卡（有 `CUDA0` / `Vulkan0` 才算真上卡）；② `nvidia-smi` 的 `memory.used` 若只有个位数 MiB 而推理已在跑 = 权重没进显存。速度也能反推：`有效带宽 ≈ tok/s × 权重 GiB`，若结果落在内存带宽量级（P100 显存带宽 732 GB/s，实测反推约 14.7 GB/s）即纯 CPU。
+>
+> ⚠️ **选 Vulkan 前先看 `nvidia-smi` 的 `TCC/WDDM` 列**：`TCC`（Tesla Compute Cluster）模式的计算卡**无显示输出能力**，而 Vulkan 是图形 API、设备枚举需要显示/呈现能力 → TCC 卡上 Vulkan 枚举不到设备、**静默退 CPU**。**TCC 卡只能走 CUDA 或 CPU。**
+
 ---
 
 ## 四、数据模型设计
