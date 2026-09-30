@@ -112,6 +112,11 @@ export function exportLogs(destPath: string) {
   return invoke<string>('export_logs', { destPath });
 }
 
+/// 读取二进制内部版本号（与日志首行 `version=` 同源）。
+export function getAppVersion() {
+  return invoke<string>('app_version');
+}
+
 export function getSettings() {
   return invoke<AppSettings>('get_settings');
 }

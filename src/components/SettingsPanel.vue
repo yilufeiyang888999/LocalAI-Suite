@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { open, confirm, message as dialogMessage } from '@tauri-apps/plugin-dialog';
 import { openPath } from '@tauri-apps/plugin-opener';
-import { computed, watch, ref } from 'vue';
+import { computed, watch, ref, onMounted } from 'vue';
 import type { AppSettings, MirrorSource } from '../types';
 import { displayNameFromModelId } from '../utils/markdown';
 import {
   clearAllChatRecords,
+  getAppVersion,
   getDataPaths,
   importLocalModel,
   resetToFactory,
@@ -33,6 +34,18 @@ const servicePort = ref(8080);
 const aiDisplayName = ref('');
 const extraArgs = ref('');
 const logLevel = ref('INFO');
+// 实际版本号从后端读（与日志首行 version= 同源），不再写死在模板里 ——
+// 之前硬编码 "0.1.0（MVP）"，升级到 0.1.2 后界面仍显示 0.1.0，用户无法
+// 从界面确认装的是哪个包。
+const appVersion = ref('');
+
+onMounted(async () => {
+  try {
+    appVersion.value = await getAppVersion();
+  } catch {
+    appVersion.value = '未知';
+  }
+});
 
 function mirrorKey(source: MirrorSource | undefined): 'auto' | 'model_scope' | 'hf_mirror' {
   if (source === 'model_scope' || source === 'hf_mirror') return source;
@@ -318,10 +331,11 @@ async function doResetToFactory() {
 
     <details class="about-box">
       <summary>关于</summary>
-      <p class="muted">本地AI模型一键部署助手 · 版本 0.1.0（MVP）</p>
+      <p class="muted">本地AI模型一键部署助手 · 版本 {{ appVersion || '读取中…' }}</p>
       <p class="muted">所有对话、设置与日志均保存在本机，不会上传云端。</p>
       <p class="muted">首次启动 AI 服务时，Windows 可能弹窗询问是否允许运行，请选择「仍要运行」。</p>
-      <p class="muted">遇到问题可导出诊断日志（已脱敏）反馈给开发者。</p>
+      <p class="muted">遇到问题可在「故障自查」面板点「导出诊断日志（已脱敏）」反馈给开发者。</p>
+      <p class="muted small">日志在数据目录的 logs 文件夹里，文件名带日期后缀，例如 localai.log.2026-09-30（不是 localai.log）。</p>
     </details>
   </section>
 </template>

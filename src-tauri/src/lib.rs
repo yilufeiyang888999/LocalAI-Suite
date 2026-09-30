@@ -29,6 +29,17 @@ use app_state::AppState;
 use database::{init_database, load_download_tasks};
 use settings::load_settings;
 
+/// 返回二进制的内部版本号（取自 `Cargo.toml` 的 `CARGO_PKG_VERSION`）。
+///
+/// 刻意 **不**用 `tauri.conf.json` 的 version、也不用前端 `package.json` 的 version：
+/// 那两个文件与 `Cargo.toml` 可能被分别改动而不同步（本项目踩过：包名 0.1.1、
+/// 二进制内部却是 0.1.0）。此命令与日志首行的 `version=` 字段**同源**，
+/// 因此「关于」里显示的版本可以和日志逐字对上 —— 一眼看出是否装错了包。
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 pub fn run() {
     let data_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -94,6 +105,7 @@ pub fn run() {
             fix::apply_low_vram_fix,
             catalog::refresh_model_catalog,
             logging::export_logs,
+            app_version,
             data_mgmt::get_data_paths,
             data_mgmt::clear_all_chat_records,
             data_mgmt::uninstall_all_models,
