@@ -269,6 +269,75 @@ fn parse_free_vram_gb(stdout: &str) -> Option<f64> {
     Some(free_mib / 1024.0)
 }
 
+/// 跑一条 `nvidia-smi --query-gpu=<查询>`，返回去掉表头与首尾空白后的**首行**。
+///
+/// 拿不到（没有 nvidia-smi / 无 N 卡 / 字段不被该驱动版本支持）返回 `None`。
+/// 注意 `driver_model.current`、`compute_cap` 这两个字段在旧驱动上未必存在，
+/// 所以调用方必须容忍 `None`，不能把它当成「一定拿得到」。
+fn query_nvidia_smi(查询: &str) -> Option<String> {
+    let 参数 = format!("--query-gpu={}", 查询);
+    let mut command = Command::new("nvidia-smi");
+    command.args([参数.as_str(), "--format=csv,noheader,nounits"]);
+    crate::proc::hide_console(&mut command);
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 主 N 卡的驱动模型，取值 `WDDM` 或 `TCC`。
+///
+/// **为什么需要它**（2026-09-30 P100 实测教训）：`TCC`（Tesla Compute Cluster）
+/// 模式把显卡从显示子系统里摘出去了 —— 它是**纯计算模式、没有显示输出能力**。
+/// 而 **Vulkan 是图形 API，设备枚举要求适配器具备显示/呈现能力**，于是 TCC 卡上
+/// Vulkan **枚举不到任何设备**：`-ngl` 无处可卸，全部层静默落 CPU。
+///
+/// 这个失败**不报任何错、只表现为慢一个数量级**（实测 8.62 t/s），比报错更难发现。
+/// 所以选后端、以及做「后端 DLL 隔离」之前都要先看这一列：
+/// **TCC 的卡只能走 CUDA 或 CPU，不要再考虑 Vulkan。**
+pub fn nvidia_driver_model() -> Option<String> {
+    query_nvidia_smi("driver_model.current")
+}
+
+/// 该值是否表示「计算专用模式」（TCC → Vulkan 不可用）。
+///
+/// 抽成纯函数便于单测；比较不区分大小写，容忍 nvidia-smi 的大小写差异。
+pub fn is_tcc_mode(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case("TCC")
+}
+
+/// 主 N 卡的算力（compute capability），如 `6.0`（P100）/ `12.0`（RTX 50 系）。
+///
+/// 用于把「引擎未包含你这张卡的架构」这类报错**按实际显卡代际**说明清楚，
+/// 而不是笼统地猜一个型号。旧驱动上该字段可能不存在 → `None`，调用方需容忍。
+pub fn nvidia_compute_cap() -> Option<String> {
+    query_nvidia_smi("compute_cap")
+}
+
+/// 主 N 卡的型号名（如 `Tesla P100-PCIE-16GB`）。
+///
+/// 只用于把报错说清楚 —— 「你的显卡是 X（算力 Y）」比笼统的「当前显卡」
+/// 可行动得多，尤其当引擎编入的架构档位和用户的卡对不上时。
+pub fn primary_nvidia_name() -> Option<String> {
+    query_nvidia_smi("name")
+}
+
+/// 主 N 卡**当前已用**显存（GiB）。
+///
+/// 用途：服务启动后校验「显卡加速是否真的生效」。权重已进显存时该值会跳到
+/// 权重体积量级；静默退回 CPU 时它仍停在空载的个位数 MiB（实测 8 MiB）。
+/// 这是唯一能抓住「不报错但也没上卡」的判据。
+pub fn nvidia_used_vram_gb() -> Option<f64> {
+    let 值 = query_nvidia_smi("memory.used")?;
+    let mib = 值.trim().trim_end_matches("MiB").trim().parse::<f64>().ok()?;
+    Some(mib / 1024.0)
+}
+
 // Memory bandwidth (GB/s) by GPU model, per tech doc §3.1.4. Keys are matched
 // case-insensitively as substrings of the adapter name; the longest matching key
 // wins so "RTX 4080 Super" isn't shadowed by "RTX 4080".
@@ -589,6 +658,22 @@ fn bytes_to_gb(bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcc_mode_is_detected_case_insensitively() {
+        // TCC = 计算专用模式：Vulkan 在该模式下枚举不到设备，
+        // 所以这个判定直接决定「要不要放弃后端 DLL 隔离」。
+        assert!(is_tcc_mode("TCC"));
+        assert!(is_tcc_mode("tcc"));
+        assert!(is_tcc_mode("  Tcc  "));
+        // WDDM 是正常显示模式 —— 绝不能误判成 TCC，否则隔离会被无谓放弃，
+        // 「切后端无效」的老问题就回来了。
+        assert!(!is_tcc_mode("WDDM"));
+        assert!(!is_tcc_mode("wddm"));
+        // 空串 / 异常输出同样不能判成 TCC（探测失败要保守）。
+        assert!(!is_tcc_mode(""));
+        assert!(!is_tcc_mode("N/A"));
+    }
 
     fn gpu(name: &str, vram_gb: f64) -> GpuInfo {
         let vendor = classify_vendor(name);

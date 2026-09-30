@@ -384,7 +384,25 @@ pub async fn start_service_core(
     //
     // CPU 是兜底路径，它的变体不参与隔离；共用底座（ggml.dll / llama.dll
     // 等）也不动。失败不阻断启动（best-effort）—— 见 isolate_backend_dlls 注释。
-    let 移动数 = isolate_backend_dlls(&install_dir, backend);
+    //
+    // ⚠️ **TCC 保底**（2026-09-30 实测教训）：TCC 模式的计算卡上 Vulkan
+    // 枚举不到设备。此时若仍按「选了 Vulkan 就把 CUDA DLL 收走」执行隔离，
+    // 等于把唯一**可能**可用的 GPU 路径也一并砍掉 —— 引擎静默退回 CPU
+    // （实测 8.62 t/s、零提示），比隔离之前的「明确报 CUDA 错」更难诊断
+    // （报错至少指向问题，静默变慢只会让人以为一切正常）。
+    // 因此 TCC 卡上**放弃隔离**：两个后端 DLL 都留在目录里，由引擎自己试。
+    let 计算专用模式 = tokio::task::spawn_blocking(nvidia_is_tcc)
+        .await
+        .unwrap_or(false);
+    let 移动数 = if backend == EngineBackend::Vulkan && 计算专用模式 {
+        tracing::warn!(
+            "显卡处于 TCC 模式，该模式下 Vulkan 枚举不到设备；\
+             跳过后端 DLL 隔离以保留 CUDA 路径，避免静默退回 CPU"
+        );
+        0
+    } else {
+        isolate_backend_dlls(&install_dir, backend)
+    };
     if 移动数 > 0 {
         tracing::info!(
             backend = backend_label(backend),
@@ -514,7 +532,37 @@ pub async fn start_service_core(
         CPU_STARTUP_TIMEOUT_SECS
     };
     match launch_service(&server_path, &model_path, &host, port, &params, &extra_args, startup_timeout).await {
-        Ok(child) => set_running(app, state, child, false, "AI服务已启动，可以开始聊天。".to_string()),
+        Ok(child) => {
+            // 【2026-09-30 新增】启动后校验「显卡加速是否真的生效」。
+            //
+            // 背景：健康检查只问 HTTP `/v1/models` 是否 200，而引擎在
+            // 「后端 DLL 被隔离走、被迫用 CPU」时**照样**能正常起服务。
+            // 于是隔离误伤会以「启动成功」的名义蒙混过关，用户只感到慢
+            // （P100 上的真实事故：8.62 t/s，无任何提示）。
+            //
+            // 判据用 nvidia-smi 的已用显存：真上卡会到权重体积量级，
+            // 静默退 CPU 则停在空载的个位数 MiB。读不到显存时不判定
+            // （见 `gpu_offload_verified`），以免在 AMD/Intel 上误报。
+            //
+            // 判定「没上卡」时不报失败，而是按 safe_mode 处理：前端已有的
+            // 「恢复显卡加速」按钮会自动出现，用户可一键重试。
+            if backend.is_gpu() && !gpu_offload_verified().await {
+                tracing::warn!(
+                    backend = backend_label(backend),
+                    "健康检查通过，但显卡显存占用仍在空载水平 —— 判定为未真正使用显卡加速"
+                );
+                return set_running(
+                    app,
+                    state,
+                    child,
+                    true,
+                    "显卡加速没能生效，当前用的是普通（CPU）速度，生成会明显偏慢。\
+                     可以点「恢复显卡加速」重试，或在设置里换一种加速方式。"
+                        .to_string(),
+                );
+            }
+            set_running(app, state, child, false, "AI服务已启动，可以开始聊天。".to_string())
+        }
         Err(error) => {
             if backend == EngineBackend::Cpu {
                 let info = set_failed(app, state, error.to_string());
@@ -731,6 +779,33 @@ pub fn get_service_status(state: tauri::State<'_, AppState>) -> ServiceInfo {
 /// DLL **不在搜索目录里**。本模块把非当前后端的 DLL 挪进
 /// `backends/.pool/<后端名>/`，启动前再按需换位。
 const 后端池目录名: &str = ".pool";
+
+/// N 卡是否处于 **TCC（计算专用）模式** —— 该模式下 Vulkan 用不了。
+///
+/// 判据来自 `nvidia-smi --query-gpu=driver_model.current`（实测本机返回 `WDDM`，
+/// P100 那台返回 `TCC`）。
+///
+/// **探测失败一律返回 `false`** —— 宁可照旧隔离，也不要因为「拿不到驱动模型」
+/// 就放弃隔离，那等于把刚修好的「切后端无效」问题又放回来。隔离保底只在
+/// **确知**是 TCC 时才生效。
+fn nvidia_is_tcc() -> bool {
+    crate::hardware::nvidia_driver_model()
+        .as_deref()
+        .is_some_and(crate::hardware::is_tcc_mode)
+}
+
+/// 校验「显卡加速是否真的生效」：看 N 卡已用显存是否明显高于空载。
+///
+/// - 空载实测约 8 MiB；只要真把层放上去，占用会跳到几百 MiB 以上。
+/// - 阈值取 **256 MiB**：低于它几乎不可能是「已卸载了若干层」。
+/// - **只在能读到显存时才下结论**（N 卡 + nvidia-smi 可用）。读不到时返回
+///   `true`（视为通过），避免在 AMD/Intel 或探测失败时误报。
+async fn gpu_offload_verified() -> bool {
+    match tokio::task::spawn_blocking(crate::hardware::nvidia_used_vram_gb).await {
+        Ok(Some(used_gib)) => used_gib >= 0.25,
+        _ => true,
+    }
+}
 
 /// `ggml-*.dll` 里哪些属于哪个后端。用于决定「当前后端需要哪些文件留在
 /// `backends/` 根下、哪些要挪进池子」。
@@ -1338,7 +1413,7 @@ fn 格式化启动失败(code: i32, 诊断: &str) -> String {
 
     if let Some(说明) = 从引擎输出推断原因(诊断) {
         文案.push('\n');
-        文案.push_str(说明);
+        文案.push_str(&说明);
     } else {
         // 引擎输出没能给出线索，退回按 Windows NTSTATUS 退出码给通用指引。
         文案.push('\n');
@@ -1355,21 +1430,10 @@ fn 格式化启动失败(code: i32, 诊断: &str) -> String {
 /// 从 llama.cpp 的 stderr 里认出已知的失败特征，给出针对性的处置建议。
 ///
 /// 返回 `None` 表示没认出已知特征 —— 调用方会退回按退出码给通用指引。
-fn 从引擎输出推断原因(诊断: &str) -> Option<&'static str> {
+fn 从引擎输出推断原因(诊断: &str) -> Option<String> {
     // CUDA kernel 架构不匹配：引擎编入的设备码里没有这张卡的目标架构。
-    // 官方 Windows CUDA 12.4 预编译包最高只到 86-real / 89-real，
-    // Blackwell（sm_120）需要 CUDA >= 12.8，因此 50 系卡必定踩这个错。
-    if 诊断.contains("invalid device function")
-        || 诊断.contains("no kernel image is available")
-    {
-        return Some(
-            "运行引擎里的 CUDA 内核不是为当前显卡编译的（CUDA error: invalid device function）。\n\
-             原因：官方 Windows CUDA 12.4 预编译引擎，编入的真实架构只到 \
-             RTX 30 系（sm_86）和 RTX 40 系（sm_89）；\
-             RTX 50 系（Blackwell, sm_120）需要 CUDA 12.8 以上才能编出设备码，此引擎不具备。\n\
-             处置：请改用 Vulkan 后端运行（同一引擎目录里已有 llama-server-vulkan.exe），\
-             或先用 CPU 安全模式。若必须用 CUDA，需要换用 CUDA 13 版本的引擎包。",
-        );
+    if 诊断.contains("invalid device function") || 诊断.contains("no kernel image is available") {
+        return Some(说明显卡架构不匹配());
     }
 
     // CUDA 运行时/驱动缺失。
@@ -1380,7 +1444,8 @@ fn 从引擎输出推断原因(诊断: &str) -> Option<&'static str> {
         return Some(
             "运行引擎缺少 CUDA 运行时库，或显卡驱动不可用。\
              请在虚拟机里确认已安装 NVIDIA 驱动（命令 nvidia-smi 能正常输出），\
-             或改用 CPU 安全模式运行。",
+             或改用 CPU 安全模式运行。"
+                .to_string(),
         );
     }
 
@@ -1388,11 +1453,42 @@ fn 从引擎输出推断原因(诊断: &str) -> Option<&'static str> {
     if 诊断.contains("out of memory") || 诊断.contains("CUDA_ERROR_OUT_OF_MEMORY") {
         return Some(
             "显卡显存不足，模型加载失败。请在设置里调小上下文长度，\
-             或把「GPU 层数」降低后再试。",
+             或把「GPU 层数」降低后再试。"
+                .to_string(),
         );
     }
 
     None
+}
+
+/// 「CUDA 内核不是为这张卡编的」——按**本机实际显卡**生成说明。
+///
+/// 2026-09-30 修正：上一版文案写死了「RTX 50 系（sm_120）需要 CUDA 12.8」，
+/// 并建议「改用 Vulkan」。在 P100（Pascal `sm_60`）上这两句**都是错的**：
+/// ① 卡是 `sm_60` 不是 `sm_120`，会把用户往错方向带；
+/// ② 该机处于 TCC 模式，Vulkan 根本用不了 —— 那条建议等于白说。
+///
+/// 现在改成：**只陈述可核实的事实**（引擎编入的架构档位 + 本机卡型号与算力），
+/// 处置按「换另一种加速方式 -> CPU -> 升级驱动 / 换引擎包」给，不再指定 Vulkan。
+fn 说明显卡架构不匹配() -> String {
+    let 本机卡 = match (
+        crate::hardware::primary_nvidia_name(),
+        crate::hardware::nvidia_compute_cap(),
+    ) {
+        (Some(名), Some(算力)) => format!("你的显卡是 {}（算力 {}）", 名, 算力),
+        (Some(名), None) => format!("你的显卡是 {}", 名),
+        _ => "当前显卡".to_string(),
+    };
+    format!(
+        "运行引擎里的 CUDA 内核不是为当前显卡编译的（CUDA error: invalid device function）。\n\
+         原因：当前引擎（CUDA 12.4 预编译包）编入的真实架构是 sm_86（RTX 30 系）\
+         与 sm_89（RTX 40 系），{}不在其中；引擎自带的 PTX 也没能被当前驱动\
+         即时编译（驱动偏旧时会拒绝编译较新版本的 PTX）。\n\
+         处置：① 先在设置里换用另一种显卡加速方式（若本机可用）；\
+         ② 或先用 CPU 安全模式；③ 长期解决需要升级显卡驱动，\
+         或换用包含你这张卡架构的引擎包。",
+        本机卡
+    )
 }
 
 /// 引擎输出没给出线索时，按 Windows NTSTATUS 快速失败码给通用指引。
@@ -1803,9 +1899,17 @@ mod tests {
             文案.contains("CUDA 内核不是为当前显卡编译"),
             "应认出 CUDA 架构不匹配：{文案}"
         );
+        // 必须给出可行动的处置，但**不能**再指定「改用 Vulkan」。
+        // 2026-09-30 纠错：P100 那台机处于 TCC 模式，Vulkan 枚举不到设备，
+        // 那条建议等于把人往坑里带。现在按「换另一种加速方式 -> CPU ->
+        // 升级驱动 / 换引擎包」给，不点名具体后端。
         assert!(
-            文案.contains("Vulkan"),
-            "应给出改用 Vulkan 后端的可行动建议：{文案}"
+            文案.contains("另一种显卡加速方式") && 文案.contains("CPU 安全模式"),
+            "应给出可行动的处置建议：{文案}"
+        );
+        assert!(
+            !文案.contains("改用 Vulkan"),
+            "TCC 模式下 Vulkan 不可用，不能给「改用 Vulkan」这条错误建议：{文案}"
         );
         assert!(
             !文案.contains("qemu64"),
