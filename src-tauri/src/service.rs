@@ -237,6 +237,54 @@ struct KvProfile {
     fixed_fp16: f64,
 }
 
+/// 定位一个模型真实的 GGUF 文件，按可靠性排序返回候选路径。
+///
+/// **为什么需要多个候选**（P1-7，2026-09-30 发现）：原先只读
+/// `model.local_path`，而它**只在「导入本地模型」时才会被填写**
+/// （`model_repo.rs::upsert_imported_model`）—— 清单里的内置模型
+/// （`models.rs::builtin_models`）全部硬编码 `local_path: None`。
+/// 于是**所有内置模型**都拿不到层结构、一律走回落经验公式：
+/// 实测 Qwen3-1.7B 的 KV 被低估 **7.8×**、Ornith-1.5-9B 高估 2.1×。
+/// 低估的直接后果是 8G 卡上按错误预算开出过大上下文 → **OOM**，
+/// 而长上下文正是知识库问答（作品一）的必需项。
+///
+/// 内置模型下载后落在 `install_dir/models/<id>/<清单文件名>`
+/// （见 `models::model_install_path`）。候选顺序：
+/// 1. `local_path` —— 本地导入模型的唯一来源；
+/// 2. `install_dir/models/<id>/<清单文件名>` —— 内置模型的标准落点；
+/// 3. 该模型目录下任意 `*.gguf` —— 用户换量化档重下、文件名与清单不同时兜底。
+///
+/// 逐个 `parse_file`，第一个解析成功的即为事实来源；全失败才回落公式。
+fn kv_profile_candidate_paths(
+    model: &crate::models::ModelMetadata,
+    install_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut 候选: Vec<PathBuf> = Vec::new();
+    if let Some(path) = model.local_path.as_deref().filter(|p| !p.is_empty()) {
+        候选.push(PathBuf::from(path));
+    }
+    let 标准落点 = crate::models::model_install_path(install_dir, model);
+    候选.push(标准落点.clone());
+    if let Some(目录) = 标准落点.parent() {
+        if let Ok(条目) = std::fs::read_dir(目录) {
+            let mut 同目录gguf: Vec<PathBuf> = 条目
+                .flatten()
+                .map(|项| 项.path())
+                .filter(|p| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+                })
+                .collect();
+            // 排序只为让结果确定（目录枚举顺序不保证稳定）；
+            // 标准落点已排在前面，这里只是兜底，不会抢在它之前。
+            同目录gguf.sort();
+            候选.extend(同目录gguf);
+        }
+    }
+    候选
+}
+
 /// 从模型文件读 KV 占用画像（fp16，GiB）。
 ///
 /// 现读模型文件的 GGUF 头，按真实层结构正算：`per_token = 全注意力层数 ×
@@ -249,30 +297,39 @@ struct KvProfile {
 /// 解析失败时回落旧经验公式（文件缺失 / safetensors 原版 / 字段不全），
 /// 保持原有行为不倒退；回落路径的 `fixed_fp16` 取 0，因为旧公式本来就
 /// 只描述线性增长的那一部分。
+///
+/// 候选路径（含内置模型的标准落点）见 `kv_profile_candidate_paths`。
 fn resolve_kv_profile(
     model: &crate::models::ModelMetadata,
+    install_dir: &Path,
     fallback_params_billions: f64,
 ) -> KvProfile {
-    let from_layers = model
-        .local_path
-        .as_deref()
-        .filter(|path| !path.is_empty())
-        .and_then(|path| crate::gguf::parse_file(std::path::Path::new(path)).ok())
-        .map(|meta| KvProfile {
+    // 逐个候选试解析，取第一个成功的；同时把命中的路径带出来写进日志 ——
+    // 这条日志本身就是「层结构到底生效没有」的判据（有它 = 真的读到了）。
+    let 命中 = kv_profile_candidate_paths(model, install_dir)
+        .into_iter()
+        .find_map(|path| {
+            crate::gguf::parse_file(&path)
+                .ok()
+                .map(|meta| (path, meta))
+        });
+
+    if let Some((path, meta)) = 命中 {
+        let profile = KvProfile {
             per_token_fp16: meta.kv_bytes_per_token(KV_ELEMENT_BYTES_FP16)
                 / crate::gguf::每GiB字节,
             fixed_fp16: meta.kv_fixed_gb(KV_ELEMENT_BYTES_FP16),
-        })
-        .filter(|profile| profile.per_token_fp16 > 0.0);
-
-    if let Some(profile) = from_layers {
-        tracing::info!(
-            model_id = %model.id,
-            kv_gib_per_token = profile.per_token_fp16,
-            kv_fixed_gib = profile.fixed_fp16,
-            "resolved KV footprint from real GGUF layer structure"
-        );
-        return profile;
+        };
+        if profile.per_token_fp16 > 0.0 {
+            tracing::info!(
+                model_id = %model.id,
+                gguf = %path.display(),
+                kv_gib_per_token = profile.per_token_fp16,
+                kv_fixed_gib = profile.fixed_fp16,
+                "resolved KV footprint from real GGUF layer structure"
+            );
+            return profile;
+        }
     }
 
     tracing::debug!(
@@ -390,22 +447,37 @@ pub async fn start_service_core(
     // 等于把唯一**可能**可用的 GPU 路径也一并砍掉 —— 引擎静默退回 CPU
     // （实测 8.62 t/s、零提示），比隔离之前的「明确报 CUDA 错」更难诊断
     // （报错至少指向问题，静默变慢只会让人以为一切正常）。
-    // 因此 TCC 卡上**放弃隔离**：两个后端 DLL 都留在目录里，由引擎自己试。
+    // 因此 TCC 卡上把隔离目标**改成 CUDA**（详见下方「实际隔离后端」）。
     let 计算专用模式 = tokio::task::spawn_blocking(nvidia_is_tcc)
         .await
         .unwrap_or(false);
-    let 移动数 = if backend == EngineBackend::Vulkan && 计算专用模式 {
+    // 🔴 **P1-1b（2026-09-30 修正，前身是「跳过隔离」）**
+    //
+    // 保底动作曾经写成「跳过隔离」，但它只保证「不动目录」，不保证
+    // 「CUDA 路径可用」：上一轮 `isolate(Cuda)` 早已把 `ggml-vulkan.dll`
+    // 收进池子，而**若此刻 `ggml-cuda.dll` 恰在池子里**（被更早一次 Vulkan
+    // 隔离收走），跳过不会把它搬回来。表面看根目录仍是「两个 GPU 后端都没
+    // 有/只剩一个」，引擎照常起来，实际是**用 CUDA 冒充 Vulkan 完成了比对**，
+    // 界面还会报「两个后端完全一致」—— 比失败更危险，因为失败会报警。
+    //
+    // 正确动作是**显式隔离到 CUDA**：`isolate_backend_dlls` 是双向的，
+    // 第二步会把 CUDA DLL 从池子搬回根目录，让「TCC 卡上确保 CUDA 可用」
+    // 这个语义真正成立。WARN 必须保留 —— 它是这条分支的唯一出口，
+    // 删掉就再也没有「确实走了保底」的判据了。
+    let 实际隔离后端 = if backend == EngineBackend::Vulkan && 计算专用模式 {
         tracing::warn!(
             "显卡处于 TCC 模式，该模式下 Vulkan 枚举不到设备；\
-             跳过后端 DLL 隔离以保留 CUDA 路径，避免静默退回 CPU"
+             改用 CUDA 隔离并确保 CUDA 运行库回到根目录，避免静默退回 CPU"
         );
-        0
+        EngineBackend::Cuda
     } else {
-        isolate_backend_dlls(&install_dir, backend)
+        backend
     };
+    let 移动数 = isolate_backend_dlls(&install_dir, 实际隔离后端);
     if 移动数 > 0 {
         tracing::info!(
-            backend = backend_label(backend),
+            backend = backend_label(实际隔离后端),
+            请求后端 = backend_label(backend),
             移动文件数 = 移动数,
             "已隔离后端 DLL，确保只加载当前后端的 GPU 模块"
         );
@@ -489,9 +561,11 @@ pub async fn start_service_core(
                 let max_ctx = m.context_length.min(u32::MAX as u64) as u32;
                 let weight_gb = resolve_weight_gb(&m);
                 // 读 GGUF 头是文件 IO：即使只需毫秒，也不该占着 async runtime
-                // 的线程（与上面的硬件探测同理）。
+                // 的线程（与上面的硬件探测同理）。install_dir 一并传进去 ——
+                // 内置模型的 local_path 为空，要靠它拼出 `models/<id>/` 落点。
+                let kv_install_dir = install_dir.clone();
                 let kv_profile = tokio::task::spawn_blocking(move || {
-                    resolve_kv_profile(&m, active_billions)
+                    resolve_kv_profile(&m, &kv_install_dir, active_billions)
                 })
                 .await
                 .unwrap_or(KvProfile {
@@ -788,7 +862,10 @@ const 后端池目录名: &str = ".pool";
 /// **探测失败一律返回 `false`** —— 宁可照旧隔离，也不要因为「拿不到驱动模型」
 /// 就放弃隔离，那等于把刚修好的「切后端无效」问题又放回来。隔离保底只在
 /// **确知**是 TCC 时才生效。
-fn nvidia_is_tcc() -> bool {
+///
+/// `pub(crate)`：后端校验可用性判定（P3-2）也要用 —— TCC 卡上 Vulkan
+/// 根本跑不起来，不该提供这项比对。
+pub(crate) fn nvidia_is_tcc() -> bool {
     crate::hardware::nvidia_driver_model()
         .as_deref()
         .is_some_and(crate::hardware::is_tcc_mode)
@@ -800,10 +877,34 @@ fn nvidia_is_tcc() -> bool {
 /// - 阈值取 **256 MiB**：低于它几乎不可能是「已卸载了若干层」。
 /// - **只在能读到显存时才下结论**（N 卡 + nvidia-smi 可用）。读不到时返回
 ///   `true`（视为通过），避免在 AMD/Intel 或探测失败时误报。
+///
+/// **P2-9**：判定点必须把实测值打进日志 —— 否则「真读到显存且通过」与
+/// 「读不到显存直接放过」在日志上**完全一样**，看日志永远无法确认这道护栏
+/// 有没有真的起作用。2026-09-30 就是靠人工跑一次 `nvidia-smi` 才把两者分开。
 async fn gpu_offload_verified() -> bool {
+    // 阈值 256 MiB：低于它几乎不可能是「已卸载了若干层」。
+    // 用局部 `let` 而非 `const`：常量名会被 `non_upper_case_globals` 判为
+    // 非全大写（中文后跟 `GiB` 这种混排必踩），局部变量无此约束。
+    let 阈值_gib = 0.25_f64;
     match tokio::task::spawn_blocking(crate::hardware::nvidia_used_vram_gb).await {
-        Ok(Some(used_gib)) => used_gib >= 0.25,
-        _ => true,
+        Ok(Some(used_gib)) => {
+            let 通过 = used_gib >= 阈值_gib;
+            tracing::info!(
+                memory_used_mib = (used_gib * 1024.0).round(),
+                threshold_mib = (阈值_gib * 1024.0).round(),
+                verified = 通过,
+                "checked GPU offload against measured used VRAM"
+            );
+            通过
+        }
+        _ => {
+            tracing::info!(
+                threshold_mib = (阈值_gib * 1024.0).round(),
+                verified = true,
+                "used VRAM unavailable (non-NVIDIA or nvidia-smi failed); offload check skipped, treated as passed"
+            );
+            true
+        }
     }
 }
 
@@ -985,6 +1086,46 @@ pub fn available_gpu_backends(install_dir: &Path) -> Vec<EngineBackend> {
         .into_iter()
         .filter(|b| backend_executable(install_dir, *b).is_some())
         .collect()
+}
+
+/// 扫描 `engine/backends/` **根目录实际存在**的 GPU 后端 DLL，推断引擎这一轮
+/// 真正会加载哪个后端 —— 即两次校验到底跑在不在同一个后端上。
+///
+/// **为什么必须实测**（P1-8，2026-09-30「假一致」事故）：`ggml_backend_load_all()`
+/// 只看 DLL 在不在搜索目录，不看可执行文件名（见 `后端池目录名` 的注释）。
+/// 所以「我们想把后端切成什么」与「引擎实际会用什么」是两件事。后端一致性
+/// 校验原先只记录调用方传进去的标签（`backend_label(目标后端)`），于是
+/// **「两轮真的换了后端」与「两轮根本没切过去」在界面和日志上完全无法区分**
+/// —— TCC 卡上就这么输出了「两个后端完全一致」（实测 110.51 / 111.48 字/秒、
+/// 384 字逐字相同，实际两轮都是 CUDA）。
+///
+/// 目录里实际有哪家的 DLL，才是引擎真正会用的后端。与 `文件名属于哪个后端`
+/// 共用同一套前缀判定，保证「隔离谁」与「读到谁」不会各说各话。
+pub fn effective_gpu_backend(install_dir: &Path) -> EngineBackend {
+    let backend_dir = install_dir.join("engine").join("backends");
+    let (mut 有cuda, mut 有vulkan) = (false, false);
+    if let Ok(条目) = std::fs::read_dir(&backend_dir) {
+        for 项 in 条目.flatten() {
+            let Some(名) = 项.path().file_name().and_then(|n| n.to_str()).map(str::to_string)
+            else {
+                continue;
+            };
+            match 文件名属于哪个后端(&名) {
+                Some(BackendFileKind::Cuda) => 有cuda = true,
+                Some(BackendFileKind::Vulkan) => 有vulkan = true,
+                _ => {}
+            }
+        }
+    }
+    // 两个都在时按 CUDA 计：`ggml_backend_load_all()` 的硬编码名字列表里
+    // cuda 排在 vulkan 之前，先注册的先用（2026-09-29 实测：根目录躺着
+    // `ggml-cuda.dll` 时，即使用 `llama-server-vulkan.exe` 启动，
+    // `device_info` 也只有 CUDA0）。
+    match (有cuda, 有vulkan) {
+        (true, _) => EngineBackend::Cuda,
+        (false, true) => EngineBackend::Vulkan,
+        (false, false) => EngineBackend::Cpu,
+    }
 }
 
 /// Which GPU backend the currently selected engine path resolves to. Exposed so
@@ -2424,5 +2565,57 @@ mod tests {
         assert!(EngineBackend::Vulkan.is_gpu());
         assert!(EngineBackend::Cuda.is_gpu());
         assert!(!EngineBackend::Cpu.is_gpu());
+    }
+
+    /// **P1-8 护栏**：`effective_gpu_backend` 必须按**目录里实际存在的 DLL**
+    /// 判后端，而不是按任何标签 —— 它是「两轮是否真的切过后端」的唯一实测依据。
+    #[test]
+    fn effective_gpu_backend_reads_the_actual_directory() {
+        let 根 = 建临时引擎目录();
+        let backends = 根.join("engine").join("backends");
+
+        // 初始：cuda 与 vulkan 的 DLL 都在 → 按引擎加载序取 CUDA（cuda 先注册）。
+        assert_eq!(effective_gpu_backend(&根), EngineBackend::Cuda);
+
+        // 模拟「切到 Vulkan 真的生效了」：cuda DLL 被隔离走 → Vulkan。
+        std::fs::remove_file(backends.join("ggml-cuda.dll")).unwrap();
+        assert_eq!(effective_gpu_backend(&根), EngineBackend::Vulkan);
+
+        // 两个 GPU 后端都没了（只剩共用底座）→ CPU。
+        std::fs::remove_file(backends.join("ggml-vulkan.dll")).unwrap();
+        assert_eq!(effective_gpu_backend(&根), EngineBackend::Cpu);
+
+        清理临时目录(&根);
+    }
+
+    /// **P1-7 护栏**：内置模型（`local_path` 恒为 `None`）也必须能定位到真实
+    /// GGUF —— 候选路径要按 `install_dir/models/<id>/<清单文件名>` 补齐。
+    ///
+    /// 原先只读 `local_path`，导致**所有内置模型**都走回落经验公式
+    /// （实测 Qwen3-1.7B 的 KV 低估 7.8×），8G 卡会按错误预算开出过大上下文 → OOM。
+    #[test]
+    fn builtin_model_resolves_kv_from_install_location() {
+        let 模型 = crate::models::builtin_models()
+            .into_iter()
+            .find(|m| m.id == "qwen3_1_7b_light")
+            .expect("内置清单里有 Qwen3-1.7B");
+        assert!(
+            模型.local_path.is_none(),
+            "内置模型的 local_path 本就为空 —— 这正是 P1-7 的前提"
+        );
+
+        let 安装目录 = PathBuf::from("/tmp/localai-install");
+        let 候选 = kv_profile_candidate_paths(&模型, &安装目录);
+        let 期望 = crate::models::model_install_path(&安装目录, &模型);
+        assert_eq!(
+            候选.first(),
+            Some(&期望),
+            "local_path 为空时，第一个候选必须是内置模型的标准落点"
+        );
+        assert!(
+            期望.ends_with("qwen3_1_7b_light/Qwen3-1.7B-Q8_0.gguf"),
+            "落点不对：{}",
+            期望.display()
+        );
     }
 }

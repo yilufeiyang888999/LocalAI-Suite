@@ -66,7 +66,8 @@ const canRun = computed(() => Boolean(props.availability?.available) && !props.r
       <table class="run-table">
         <thead>
           <tr>
-            <th>后端</th>
+            <th>请求后端</th>
+            <th>实际后端</th>
             <th>速度</th>
             <th>生成长度</th>
             <th>停止原因</th>
@@ -75,12 +76,18 @@ const canRun = computed(() => Boolean(props.availability?.available) && !props.r
         <tbody>
           <tr v-for="run in speedRows" :key="run.backend">
             <td>{{ run.backend }}</td>
+            <td>{{ run.effective_backend || '—' }}</td>
             <td>{{ run.tokens_per_sec.toFixed(2) }} 字/秒</td>
             <td>{{ run.token_count }} 字</td>
             <td>{{ run.stop_type === 'limit' ? '跑满长度' : '自然结束' }}</td>
           </tr>
         </tbody>
       </table>
+
+      <p class="muted footnote">
+        「实际后端」是引擎真正加载的那个（扫描引擎目录得出）。两轮这一列必须**不同**，
+        校验才成立；若相同，本次校验会被直接判为无效。
+      </p>
 
       <p class="muted footnote">
         已恢复到你原来的后端：{{ result.restored_to }}

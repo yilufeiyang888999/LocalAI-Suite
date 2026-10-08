@@ -58,6 +58,19 @@ pub struct 后端输出 {
     /// 每秒生成 token 数。
     #[serde(rename = "tokens_per_sec")]
     pub 每秒token: f64,
+    /// **引擎实际加载的后端** —— 由编排层在每轮启动后扫描
+    /// `engine/backends/` 根目录实际存在的 GPU DLL 得到
+    /// （`service::effective_gpu_backend`），**不是调用方填的标签**。
+    ///
+    /// 这是 2026-09-30「假一致」事故的直接产物：上面那个 `后端` 字段只是
+    /// `backend_label(目标后端)` 的入参，两轮都填同一个值、与「根本没切过去」
+    /// 在界面和日志上**完全无法区分**，于是 TCC 卡上输出了「两个后端完全一致」
+    /// （实测两轮其实都是 CUDA）。有了实测值，编排层才能判定
+    /// 「两轮实际后端相同 → 校验无效」。
+    ///
+    /// `default`：容忍旧版序列化数据缺字段（跨版本读写不炸）。
+    #[serde(rename = "effective_backend", default)]
+    pub 实际后端: String,
 }
 
 /// 两个后端的比对结论。
@@ -228,6 +241,9 @@ async fn 生成一次(端口: u16, 后端名: &str) -> Result<后端输出, Stri
         } else {
             0.0
         },
+        // 实测后端由编排层在 `start_service_core` 之后扫描 `backends/` 目录
+        // 填写 —— 这里是纯 HTTP 层，看不到目录，填不了也不该猜。
+        实际后端: String::new(),
     })
 }
 
@@ -447,6 +463,64 @@ mod tests {
             "输出过短会被固定开销摊薄，且累积误差来不及显现"
         );
     }
+
+    /// **P1-8 护栏**：两轮「实测后端」相同 → 必须判无效，**绝不允许**输出「一致」。
+    ///
+    /// 来自 2026-09-30 的实测事故：TCC 卡上两轮其实都跑 CUDA，界面却报
+    /// 「两个后端输出完全一致，当前配置下可以放心使用任一后端」。
+    /// 根因是校验只记录调用方标签、从不验证后端真的切过。
+    #[test]
+    fn identical_effective_backends_invalidate_the_check() {
+        let 同一 = 校验后端确已切换("CUDA", "CUDA");
+        assert!(同一.is_err(), "两轮实测同后端必须判为无效，不得给出「一致」");
+        let 消息 = 同一.unwrap_err();
+        assert!(消息.contains("未能切换"), "文案要说清「没能切过去」：{消息}");
+        assert!(消息.contains("CUDA"), "文案要带上实测后端名：{消息}");
+        assert!(消息.contains("校验无效"), "要明确宣告本次校验无效：{消息}");
+
+        // 真的切过去了 → 校验前提成立。
+        assert!(校验后端确已切换("CUDA", "Vulkan").is_ok());
+        assert!(校验后端确已切换("Vulkan", "CUDA").is_ok());
+        // 退到 CPU 也算切了（前提成立，可靠性仍由后面的逐字比对决定）。
+        assert!(校验后端确已切换("CUDA", "CPU").is_ok());
+    }
+
+    /// **P1-8 字段契约**：`实际后端` 必须以 ASCII 键 `effective_backend`
+    /// 跨 Tauri 边界，且缺字段时仍可反序列化。
+    ///
+    /// 跨边界一律 ASCII —— `rename_all` 对中文变体名/字段名无效（见
+    /// `verdict_keys_are_ascii_for_the_frontend`），中文键会让前端**静默**
+    /// 取不到值。前端靠这个字段判断「两轮是不是真的换了后端」。
+    #[test]
+    fn effective_backend_serializes_as_ascii_key() {
+        let 值 = serde_json::to_value(后端输出 {
+            后端: "CUDA".to_string(),
+            文本: "x".to_string(),
+            token数: 1,
+            停止原因: "limit".to_string(),
+            耗时秒: 1.0,
+            每秒token: 1.0,
+            实际后端: "Vulkan".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            值.get("effective_backend").and_then(|v| v.as_str()),
+            Some("Vulkan")
+        );
+        assert!(值.get("实际后端").is_none(), "中文键名跨边界会静默失效");
+
+        // 缺字段也能反序列化（旧版数据 / 跨版本读写）。
+        let 反: 后端输出 = serde_json::from_value(serde_json::json!({
+            "backend": "CUDA",
+            "text": "x",
+            "token_count": 1,
+            "stop_type": "limit",
+            "elapsed_sec": 1.0,
+            "tokens_per_sec": 1.0
+        }))
+        .unwrap();
+        assert_eq!(反.实际后端, "");
+    }
 }
 
 /// 暴露给上层的生成入口（保持 `生成一次` 私有，便于将来替换实现）。
@@ -465,8 +539,8 @@ use crate::{
     error::AppResult,
     service::{
         available_gpu_backends, backend_label, current_gpu_backend, current_port,
-        restore_engine_path, start_service_core, stop_service_core, swap_engine_path_for,
-        EngineBackend,
+        effective_gpu_backend, nvidia_is_tcc, restore_engine_path, start_service_core,
+        stop_service_core, swap_engine_path_for, EngineBackend,
     },
 };
 
@@ -498,20 +572,43 @@ pub fn get_backend_check_availability(state: tauri::State<'_, AppState>) -> 自�
         inner.settings.install_dir.clone()
     };
     let 当前 = current_gpu_backend(&state);
-    let 可对比: Vec<EngineBackend> = available_gpu_backends(&install_dir)
-        .into_iter()
-        .filter(|b| *b != 当前)
-        .collect();
+    let 已装 = available_gpu_backends(&install_dir);
+    let mut 可对比: Vec<EngineBackend> = 已装.iter().copied().filter(|b| *b != 当前).collect();
+
+    // ---- P3-2：TCC 卡上不提供 Vulkan 比对 ----
+    //
+    // `available_gpu_backends` 只按「引擎文件在不在」判断，不看本机能不能用。
+    // 而 TCC（计算专用）模式下 Vulkan 枚举不到设备 —— 让用户比一个**本机根本
+    // 跑不起来**的后端，最好的结果是 P1-8 那种「拿 CUDA 冒充」，最坏是白等
+    // 两分钟拿一个假结论。所以从源头剔除，并说明原因。
+    //
+    // 判断放在这里而不是 `available_gpu_backends` 内部：那是个纯路径函数，
+    // 不该为了它去跑 `nvidia-smi`。
+    let 计算专用模式 = nvidia_is_tcc();
+    if 计算专用模式 {
+        可对比.retain(|b| *b != EngineBackend::Vulkan);
+    }
 
     let (可用, 原因) = if 可对比.is_empty() {
-        (
-            false,
-            Some(
-                "当前只安装了一个显卡后端，没有可对比的对象。\
-                 一致性校验需要机器上同时具备 CUDA 与 Vulkan 两个引擎。"
-                    .to_string(),
-            ),
-        )
+        if 计算专用模式 && 已装.contains(&EngineBackend::Vulkan) {
+            (
+                false,
+                Some(
+                    "本机显卡处于 TCC 模式（计算专用），该模式下 Vulkan 枚举不到设备、\
+                     无法作为对比后端，因此没有可对比的其他显卡后端。"
+                        .to_string(),
+                ),
+            )
+        } else {
+            (
+                false,
+                Some(
+                    "当前只安装了一个显卡后端，没有可对比的对象。\
+                     一致性校验需要机器上同时具备 CUDA 与 Vulkan 两个引擎。"
+                        .to_string(),
+                ),
+            )
+        }
     } else if !当前.is_gpu() {
         (
             false,
@@ -575,9 +672,12 @@ pub async fn run_backend_consistency_check(
         start_service_core(&模型, &app, &state).await?;
         let 端口 = current_port(&state)
             .ok_or_else(|| crate::error::AppError::Message("服务未返回监听端口。".to_string()))?;
-        let 甲 = 生成(端口, backend_label(当前后端))
+        let mut 甲 = 生成(端口, backend_label(当前后端))
             .await
             .map_err(crate::error::AppError::Message)?;
+        // 记录本轮**实际**生效的后端 —— 扫 `backends/` 根目录里真正存在的
+        // GPU DLL，而不是我们「想把后端切成什么」。（P1-8）
+        甲.实际后端 = backend_label(effective_gpu_backend(&install_dir)).to_string();
 
         // ---- 第二次：另一个后端 ----
         swap_engine_path_for(&state, &install_dir, 另一后端)?;
@@ -586,8 +686,13 @@ pub async fn run_backend_consistency_check(
         start_service_core(&模型, &app, &state).await?;
         let 端口 = current_port(&state)
             .ok_or_else(|| crate::error::AppError::Message("服务未返回监听端口。".to_string()))?;
-        let 乙 = 生成(端口, backend_label(另一后端))
+        let mut 乙 = 生成(端口, backend_label(另一后端))
             .await
+            .map_err(crate::error::AppError::Message)?;
+        乙.实际后端 = backend_label(effective_gpu_backend(&install_dir)).to_string();
+
+        // ---- P1-8：校验前提自证 ----
+        校验后端确已切换(&甲.实际后端, &乙.实际后端)
             .map_err(crate::error::AppError::Message)?;
 
         Ok::<_, crate::error::AppError>(比对(&甲.文本, &乙.文本).into_自检结果(甲, 乙))
@@ -621,4 +726,25 @@ impl 比对报告 {
             已恢复到: String::new(),
         }
     }
+}
+
+/// **校验前提自证**：两轮「实测后端」必须真的不同，否则本次校验无效。
+///
+/// 这是 P1-8，也是 2026-09-30「假一致」事故的直接产物。那天在 TCC 卡上，
+/// 两轮其实都跑 CUDA（`backend_check.rs` 里那个「Vulkan」只是调用方填的标签），
+/// 隔离保底又没能把 CUDA DLL 摆回根目录，结果界面报出
+/// **「两个后端输出完全一致，当前配置下可以放心使用任一后端」** —— 结论完全
+/// 错误，而且**没有任何护栏能抓到**：失败会报警，「没切过去」不会。
+///
+/// 抽成纯函数是为了让这条判据可在单测里钉死（见
+/// `identical_effective_backends_invalidate_the_check`）。
+fn 校验后端确已切换(第一轮: &str, 第二轮: &str) -> Result<(), String> {
+    if 第一轮 == 第二轮 {
+        return Err(format!(
+            "未能切换后端：两轮实际都跑在 {第一轮} 上，本次校验无效，「一致」结论不成立。\
+             常见原因：①显卡处于 TCC 模式，Vulkan 枚举不到设备；\
+             ②后端 DLL 隔离未生效。请查看日志中「已隔离后端 DLL」与 TCC 相关提示确认。"
+        ));
+    }
+    Ok(())
 }

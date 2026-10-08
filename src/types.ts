@@ -86,7 +86,14 @@ export interface BackendCheckAvailability {
 
 /** 一个后端的一次生成结果。 */
 export interface BackendRun {
+  /** 本轮**请求**的后端（调用方标签）：CUDA / Vulkan。 */
   backend: string;
+  /**
+   * 本轮**引擎实际加载**的后端 —— 由后端扫描 `engine/backends/` 根目录里
+   * 真正存在的 GPU DLL 得出，不是调用方标签。两轮此值相同即代表
+   * **没能切换后端**，校验结论不成立（后端会直接报错）。
+   */
+  effective_backend: string;
   text: string;
   token_count: number;
   /** limit = 打满 n_predict；stop = 命中 EOS。 */
