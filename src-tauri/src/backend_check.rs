@@ -16,6 +16,7 @@
 //!    「长度不同」有内容分歧与提前停止两种原因，必须先靠这个字段区分开，
 //!    否则会把「停止判定差异」误读成「精度差异」。
 
+use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -464,6 +465,78 @@ mod tests {
         );
     }
 
+    /// **P3-2 护栏**：TCC 卡上剔除 Vulkan；只有强制放行时才放出来。
+    ///
+    /// 这两种情况**按钮都是灰的**，唯一的区别是原因文案 —— 所以文案差异必须
+    /// 被断言，否则「TCC 剔除了 Vulkan」与「压根只装了一个后端」永远分不清。
+    /// 2026-10-08 在 P100 上就差点把「按钮灰」直接记成 P3-2 通过。
+    #[test]
+    fn tcc_hides_vulkan_unless_forced() {
+        let 两个后端 = [EngineBackend::Cuda, EngineBackend::Vulkan];
+
+        // ① TCC + 未强制：Vulkan 被剔除 → 无可对比 → 不可用 + TCC 专属文案。
+        let (可用, 可对比, 原因) = 计算自检可用性(&两个后端, EngineBackend::Cuda, true, false);
+        assert!(!可用, "TCC 卡上不应放行 Vulkan 比对");
+        assert!(可对比.is_empty());
+        let 文案 = 原因.expect("不可用时必须给出原因");
+        assert!(文案.contains("TCC 模式"), "文案要说明是本机 TCC 所致：{文案}");
+        assert!(文案.contains("无法作为对比后端"), "{文案}");
+
+        // ② TCC + 强制放行：Vulkan 回来 → 可用（回归测试专用旁路）。
+        let (可用, 可对比, 原因) = 计算自检可用性(&两个后端, EngineBackend::Cuda, true, true);
+        assert!(可用, "强制放行后应可用，否则回归跑不了 B 组");
+        assert_eq!(可对比, vec![EngineBackend::Vulkan]);
+        assert!(原因.is_none());
+
+        // ③ 非 TCC：Vulkan 正常保留（WDDM 卡上不得被改动）。
+        let (可用, 可对比, _) = 计算自检可用性(&两个后端, EngineBackend::Cuda, false, false);
+        assert!(可用);
+        assert_eq!(可对比, vec![EngineBackend::Vulkan]);
+
+        // ④ 只装了一个后端：不可用，但**不得**归因到 TCC。
+        let (可用, _, 原因) = 计算自检可用性(&[EngineBackend::Cuda], EngineBackend::Cuda, true, false);
+        assert!(!可用);
+        let 文案 = 原因.expect("不可用时必须给出原因");
+        assert!(!文案.contains("TCC"), "只有一个后端时不该归因到 TCC：{文案}");
+        assert!(文案.contains("只安装了一个显卡后端"), "{文案}");
+
+        // ⑤ 当前在 CPU 模式：不可用（换后端比对本身不成立）。
+        let (可用, _, 原因) = 计算自检可用性(&两个后端, EngineBackend::Cpu, false, false);
+        assert!(!可用);
+        assert!(原因.unwrap().contains("CPU 模式"));
+
+        // ⑥ 强制放行救不了「只有一个后端」：它只解除 TCC 剔除，
+        //    不会凭空造出一个不存在的后端。
+        let (可用, _, _) = 计算自检可用性(&[EngineBackend::Cuda], EngineBackend::Cuda, true, true);
+        assert!(!可用, "强制放行不等价于「可对比后端存在」");
+    }
+
+    /// **强制放行开关的开关**：标志文件在才算放行。
+    ///
+    /// 这条决定了回归时能不能在 P100 上跑到 P1-8 / P1-1b —— 2026-10-08
+    /// 就是因为按不动按钮，B 组四项全废。反向断言（无文件即不放行）同样重要：
+    /// 放行被永久留在目录里，等于保护静默失效。
+    #[test]
+    fn force_flag_file_is_detected_only_when_present() {
+        let 根 = std::env::temp_dir().join(format!(
+            "localai-force-flag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let backends = 根.join("engine").join("backends");
+        std::fs::create_dir_all(&backends).unwrap();
+
+        assert!(!标志文件放行(&根), "没有标志文件时不得放行");
+
+        std::fs::write(backends.join(强制自检标志文件), b"").unwrap();
+        assert!(标志文件放行(&根), "标志文件在就必须放行");
+
+        let _ = std::fs::remove_dir_all(&根);
+    }
+
     /// **P1-8 护栏**：两轮「实测后端」相同 → 必须判无效，**绝不允许**输出「一致」。
     ///
     /// 来自 2026-09-30 的实测事故：TCC 卡上两轮其实都跑 CUDA，界面却报
@@ -544,6 +617,113 @@ use crate::{
     },
 };
 
+/// 环境变量：强制放行后端一致性自检（**仅用于回归测试**）。
+///
+/// **为什么需要它**：P3-2 会在 TCC 卡上把 Vulkan 从「可对比后端」里剔除，
+/// 按钮随之变灰 —— 对普通用户这是对的（本机确实跑不起来 Vulkan），
+/// 但它**同时把 P1-8（两轮实测后端相同 → 报「校验无效」）的代码路径一起封死**：
+/// 2026-10-08 在 P100 上做 0.1.4 回归时，第四节 B 组四项一项都执行不了。
+///
+/// 放行之后这台上会发生什么（可预期的结果）：第二轮请求 Vulkan，但
+/// `start_service_core` 的 TCC 保底把它改成 CUDA 隔离 → 两轮实测后端**都是
+/// CUDA** → 界面报「未能切换后端…本次校验无效」 —— 这正是 P1-8 要验的行为。
+/// 也就是说，这个开关让 **P1-8 与 P1-1b 一次运行验完**。
+const 强制自检环境变量: &str = "LOCALAI_FORCE_BACKEND_CHECK";
+
+/// 标志文件（放在 `engine/backends/` 下）：与上面等价，但不必折腾环境变量。
+///
+/// 运维习惯用标志文件；而且**环境变量容易忘删** —— 忘了删就是「保护永久失效」，
+/// 标志文件在目录里一眼可见。两种方式都会打 WARN 留痕，不允许静默放行。
+const 强制自检标志文件: &str = "force_backend_check.flag";
+
+/// 环境变量是否放行。
+///
+/// 与标志文件判定分开写，是为了让单测能只测后者 —— `std::env::set_var`
+/// 在多线程测试里本就不安全（edition 2024 起更是 `unsafe`），不值得为它冒险。
+fn 环境变量放行() -> bool {
+    std::env::var(强制自检环境变量)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// 标志文件是否放行。
+fn 标志文件放行(install_dir: &Path) -> bool {
+    install_dir
+        .join("engine")
+        .join("backends")
+        .join(强制自检标志文件)
+        .is_file()
+}
+
+/// 是否被强制放行，以及来源（写进日志，便于事后区分）。
+fn 强制开启自检来源(install_dir: &Path) -> Option<&'static str> {
+    if 环境变量放行() {
+        return Some("环境变量");
+    }
+    if 标志文件放行(install_dir) {
+        return Some("标志文件");
+    }
+    None
+}
+
+/// 自检可用性判定（**纯函数**，便于把每条分支在单测里钉死）。
+///
+/// `已装` = 引擎目录里实际存在的 GPU 后端；`当前` = 用户正在用的后端。
+/// 返回 `(可用, 可对比后端, 不可用原因)`。
+fn 计算自检可用性(
+    已装: &[EngineBackend],
+    当前: EngineBackend,
+    计算专用模式: bool,
+    强制放行: bool,
+) -> (bool, Vec<EngineBackend>, Option<String>) {
+    let mut 可对比: Vec<EngineBackend> = 已装.iter().copied().filter(|b| *b != 当前).collect();
+
+    // ---- P3-2：TCC 卡上不提供 Vulkan 比对 ----
+    //
+    // `available_gpu_backends` 只按「引擎文件在不在」判断，不看本机能不能用。
+    // 而 TCC（计算专用）模式下 Vulkan 枚举不到设备 —— 让用户比一个**本机根本
+    // 跑不起来**的后端，最好的结果是 P1-8 那种「拿 CUDA 冒充」，最坏是白等
+    // 两分钟拿一个假结论。所以从源头剔除，并说明原因。
+    // （`强制放行` 是回归测试用的旁路，见 `强制自检环境变量`。）
+    if 计算专用模式 && !强制放行 {
+        可对比.retain(|b| *b != EngineBackend::Vulkan);
+    }
+
+    let (可用, 原因) = if 可对比.is_empty() {
+        // ⚠️ 两种「没有可对比对象」的文案**必须不同**：按钮灰在两种情况下
+        // 表现完全一样，只有这段文字能区分「TCC 剔除了 Vulkan」与
+        // 「压根只装了一个后端」。分不开，就等于这条判据不存在。
+        if 计算专用模式 && 已装.contains(&EngineBackend::Vulkan) {
+            (
+                false,
+                Some(
+                    "本机显卡处于 TCC 模式（计算专用），该模式下 Vulkan 枚举不到设备、\
+                     无法作为对比后端，因此没有可对比的其他显卡后端。"
+                        .to_string(),
+                ),
+            )
+        } else {
+            (
+                false,
+                Some(
+                    "当前只安装了一个显卡后端，没有可对比的对象。\
+                     一致性校验需要机器上同时具备 CUDA 与 Vulkan 两个引擎。"
+                        .to_string(),
+                ),
+            )
+        }
+    } else if !当前.is_gpu() {
+        (
+            false,
+            Some("当前正在使用 CPU 模式，无法进行显卡后端比对。".to_string()),
+        )
+    } else {
+        (true, None)
+    };
+
+    (可用, 可对比, 原因)
+}
+
 /// 自检能不能跑。前端据此决定按钮是否可用，避免点了才报错。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct 自检可用性 {
@@ -573,50 +753,26 @@ pub fn get_backend_check_availability(state: tauri::State<'_, AppState>) -> 自�
     };
     let 当前 = current_gpu_backend(&state);
     let 已装 = available_gpu_backends(&install_dir);
-    let mut 可对比: Vec<EngineBackend> = 已装.iter().copied().filter(|b| *b != 当前).collect();
-
-    // ---- P3-2：TCC 卡上不提供 Vulkan 比对 ----
-    //
-    // `available_gpu_backends` 只按「引擎文件在不在」判断，不看本机能不能用。
-    // 而 TCC（计算专用）模式下 Vulkan 枚举不到设备 —— 让用户比一个**本机根本
-    // 跑不起来**的后端，最好的结果是 P1-8 那种「拿 CUDA 冒充」，最坏是白等
-    // 两分钟拿一个假结论。所以从源头剔除，并说明原因。
-    //
     // 判断放在这里而不是 `available_gpu_backends` 内部：那是个纯路径函数，
     // 不该为了它去跑 `nvidia-smi`。
     let 计算专用模式 = nvidia_is_tcc();
-    if 计算专用模式 {
-        可对比.retain(|b| *b != EngineBackend::Vulkan);
+
+    // 回归测试旁路（P3-2 的例外）。放行必然留 WARN —— 不允许「悄悄放行」：
+    // 否则日志里就分不清「本机真有两个可跑的后端」与「保护被关掉了」。
+    let 强制来源 = 强制开启自检来源(&install_dir);
+    if let Some(来源) = 强制来源 {
+        tracing::warn!(
+            source = 来源,
+            env = 强制自检环境变量,
+            flag = 强制自检标志文件,
+            tcc = 计算专用模式,
+            "后端一致性自检被强制放行（仅供回归测试）：即使 Vulkan 跑不起来也会放行，\
+             本次结论只用于验证「校验能否如实报告后端未切换」，不能当作「两个后端都可用」"
+        );
     }
 
-    let (可用, 原因) = if 可对比.is_empty() {
-        if 计算专用模式 && 已装.contains(&EngineBackend::Vulkan) {
-            (
-                false,
-                Some(
-                    "本机显卡处于 TCC 模式（计算专用），该模式下 Vulkan 枚举不到设备、\
-                     无法作为对比后端，因此没有可对比的其他显卡后端。"
-                        .to_string(),
-                ),
-            )
-        } else {
-            (
-                false,
-                Some(
-                    "当前只安装了一个显卡后端，没有可对比的对象。\
-                     一致性校验需要机器上同时具备 CUDA 与 Vulkan 两个引擎。"
-                        .to_string(),
-                ),
-            )
-        }
-    } else if !当前.is_gpu() {
-        (
-            false,
-            Some("当前正在使用 CPU 模式，无法进行显卡后端比对。".to_string()),
-        )
-    } else {
-        (true, None)
-    };
+    let (可用, 可对比, 原因) =
+        计算自检可用性(&已装, 当前, 计算专用模式, 强制来源.is_some());
 
     自检可用性 {
         可用,

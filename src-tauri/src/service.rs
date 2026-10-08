@@ -462,17 +462,19 @@ pub async fn start_service_core(
     //
     // 正确动作是**显式隔离到 CUDA**：`isolate_backend_dlls` 是双向的，
     // 第二步会把 CUDA DLL 从池子搬回根目录，让「TCC 卡上确保 CUDA 可用」
-    // 这个语义真正成立。WARN 必须保留 —— 它是这条分支的唯一出口，
-    // 删掉就再也没有「确实走了保底」的判据了。
-    let 实际隔离后端 = if backend == EngineBackend::Vulkan && 计算专用模式 {
+    // 这个语义真正成立。
+    //
+    // 🔴 决策本身抽在 `选择实际隔离后端` 里（纯函数）—— 原因见该函数注释：
+    // 这条分支在升过驱动的 P100 上**真机不可达**，只能靠单测兜底。
+    let 实际隔离后端 = 选择实际隔离后端(backend, 计算专用模式);
+    if 实际隔离后端 != backend {
+        // WARN 必须保留 —— 它是这条分支的唯一出口，删掉就再也没有
+        // 「确实走了保底」的判据了。
         tracing::warn!(
             "显卡处于 TCC 模式，该模式下 Vulkan 枚举不到设备；\
              改用 CUDA 隔离并确保 CUDA 运行库回到根目录，避免静默退回 CPU"
         );
-        EngineBackend::Cuda
-    } else {
-        backend
-    };
+    }
     let 移动数 = isolate_backend_dlls(&install_dir, 实际隔离后端);
     if 移动数 > 0 {
         tracing::info!(
@@ -869,6 +871,31 @@ pub(crate) fn nvidia_is_tcc() -> bool {
     crate::hardware::nvidia_driver_model()
         .as_deref()
         .is_some_and(crate::hardware::is_tcc_mode)
+}
+
+/// 这一轮**实际**要隔离到哪个后端 —— TCC 卡上请求 Vulkan 时保底成 CUDA（P1-1b）。
+///
+/// 抽成纯函数不是为了好看，而是**因为这条分支在真机上不可达**：
+///
+/// `backend` 来自 `detect_backend(settings.llama_server_path)`，而该路径由
+/// `ensure_engine_ready` 按 `hardware.backend` 覆写；`select_backend` 的判据是
+/// 「NVIDIA 且驱动 ≥ 551.78」，**它不看 TCC**。所以升到 582.78 的 P100 上
+/// 引擎路径恒为 `llama-server-cuda.exe`、`backend` 恒为 `Cuda`，
+/// `backend == Vulkan && 计算专用模式` **永远不成立** —— 2026-10-08 想按清单
+/// 在虚机上复现这条 WARN，就是这么卡住的。
+///
+/// 这条分支真正保护的是**驱动低于 551.78 的 TCC 卡**（那时 `select_backend`
+/// 会判 Vulkan，而 TCC 下 Vulkan 枚举不到设备 → 静默落 CPU 8.62 t/s）。
+/// 本机恰好是「升驱动前属于该场景、升驱动后脱离该场景」，于是它成了纯防御代码。
+///
+/// **不可达的分支必须由单测兜底，否则等于没验证。** 见
+/// `tcc_turns_vulkan_isolation_into_cuda`。
+fn 选择实际隔离后端(请求后端: EngineBackend, 计算专用模式: bool) -> EngineBackend {
+    if 请求后端 == EngineBackend::Vulkan && 计算专用模式 {
+        EngineBackend::Cuda
+    } else {
+        请求后端
+    }
 }
 
 /// 校验「显卡加速是否真的生效」：看 N 卡已用显存是否明显高于空载。
@@ -2586,6 +2613,63 @@ mod tests {
         assert_eq!(effective_gpu_backend(&根), EngineBackend::Cpu);
 
         清理临时目录(&根);
+    }
+
+    /// **P1-1b 护栏**：TCC 卡上请求 Vulkan → 实际隔离到 CUDA（四项分支全覆盖）。
+    ///
+    /// 为什么必须靠单测：这条分支的进入条件是
+    /// `backend == Vulkan && 计算专用模式`，而 `backend` 由
+    /// `ensure_engine_ready` 按 `hardware.backend` 覆写、`select_backend`
+    /// 只看驱动版本（≥ 551.78 即判 CUDA，不看 TCC）。升过驱动的 P100 上
+    /// `backend` 恒为 `Cuda` → 保底分支**真机不可达**，2026-10-08 在虚机上
+    /// 按 0.1.4 清单复现时正是卡在这里。真机测不到的分支，只能由这里兜底。
+    ///
+    /// ⚠️ 反向断言同样重要：**非 TCC 时绝不能把 Vulkan 改成 CUDA** ——
+    /// WDDM 卡上 Vulkan 是正常路径，误改会让「切后端」静默失效。
+    #[test]
+    fn tcc_turns_vulkan_isolation_into_cuda() {
+        // ① TCC + Vulkan → 保底成 CUDA。
+        assert_eq!(
+            选择实际隔离后端(EngineBackend::Vulkan, true),
+            EngineBackend::Cuda,
+            "TCC 卡上 Vulkan 枚举不到设备，必须改用 CUDA 隔离"
+        );
+        // ② 非 TCC + Vulkan → 原样，不许改写。
+        assert_eq!(
+            选择实际隔离后端(EngineBackend::Vulkan, false),
+            EngineBackend::Vulkan,
+            "WDDM 卡上 Vulkan 是正常路径，不得改成 CUDA"
+        );
+        // ③ TCC + CUDA → 原样（本来就是对的）。
+        assert_eq!(
+            选择实际隔离后端(EngineBackend::Cuda, true),
+            EngineBackend::Cuda
+        );
+        // ④ TCC + CPU → 原样：CPU 安全模式本来就要清掉所有 GPU 后端，
+        //    不能被保底逻辑改成「留 CUDA」。
+        assert_eq!(
+            选择实际隔离后端(EngineBackend::Cpu, true),
+            EngineBackend::Cpu,
+            "CPU 安全模式必须绕开 GPU 路径，保底逻辑不能干预"
+        );
+    }
+
+    /// `选择实际隔离后端` 只在「请求 Vulkan 且确知 TCC」时改变结果 ——
+    /// 这条不变式保证 `start_service_core` 里「`实际隔离后端 != backend`
+    /// 就打 WARN」等价于「只有保底分支打 WARN」。
+    #[test]
+    fn isolation_backend_changes_only_on_tcc_vulkan() {
+        for 请求 in [EngineBackend::Cpu, EngineBackend::Cuda, EngineBackend::Vulkan] {
+            for tcc in [false, true] {
+                let 实际 = 选择实际隔离后端(请求, tcc);
+                let 应改变 = 请求 == EngineBackend::Vulkan && tcc;
+                assert_eq!(
+                    实际 != 请求,
+                    应改变,
+                    "请求 {请求:?} / TCC={tcc}：是否改写与预期不符（实际 {实际:?}）"
+                );
+            }
+        }
     }
 
     /// **P1-7 护栏**：内置模型（`local_path` 恒为 `None`）也必须能定位到真实
