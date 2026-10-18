@@ -68,7 +68,7 @@ const canRun = computed(() => Boolean(props.availability?.available) && !props.r
           <tr>
             <th>请求后端</th>
             <th>实际后端</th>
-            <th>速度</th>
+            <th>速度（解码）</th>
             <th>生成长度</th>
             <th>停止原因</th>
           </tr>
@@ -77,7 +77,12 @@ const canRun = computed(() => Boolean(props.availability?.available) && !props.r
           <tr v-for="run in speedRows" :key="run.backend">
             <td>{{ run.backend }}</td>
             <td>{{ run.effective_backend || '—' }}</td>
-            <td>{{ run.tokens_per_sec.toFixed(2) }} token/秒</td>
+            <td>
+              {{ run.tokens_per_sec.toFixed(2) }} token/秒
+              <span v-if="run.speed_source !== 'engine'" class="muted" title="引擎没报解码速度，这里用请求往返耗时估算，含首次 shader 编译等一次性开销">
+                （墙钟，含首次编译）
+              </span>
+            </td>
             <td>{{ run.token_count }} token</td>
             <td>{{ run.stop_type === 'limit' ? '跑满长度' : '自然结束' }}</td>
           </tr>
@@ -93,9 +98,10 @@ const canRun = computed(() => Boolean(props.availability?.available) && !props.r
         已恢复到你原来的后端：{{ result.restored_to }}
       </p>
       <p class="muted footnote">
-        提示：两个后端的速度通常接近，瓶颈多在显存带宽；但少数组合（例如新架构配
-        Vulkan）可能相差数倍，那是后端实现效率的差异，不代表算错了。校验的意义是
-        确认输出可靠，而不是挑选更快的后端。
+        提示：两个后端的速度通常接近（同一档显存带宽下多在 25% 以内），瓶颈在显存带宽，
+        不在后端实现。若某一轮明显偏慢，先看它是不是<strong>今天第一次跑该后端</strong> ——
+        首次要编译 shader 管线，那段开销会算进耗时，不代表后端本身慢。
+        校验的意义是 确认输出可靠，而不是挑选更快的后端。
       </p>
     </template>
 

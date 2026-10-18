@@ -53,12 +53,28 @@ pub struct 后端输出 {
     /// 停止原因：`limit`（打满）或 `stop`（命中 EOS）。
     #[serde(rename = "stop_type")]
     pub 停止原因: String,
-    /// 本次生成耗时（秒），顺带给出真实速度读数。
+    /// 本次生成的**墙钟**耗时（秒）：请求发出到响应解析完，**含图构建与首次
+    /// shader 编译**。用它算速度会在"当日首跑某后端"时严重偏低，故只作回退。
     #[serde(rename = "elapsed_sec")]
     pub 耗时秒: f64,
-    /// 每秒生成 token 数。
+    /// 每秒生成 token 数。来源见 `speed_source`。
     #[serde(rename = "tokens_per_sec")]
     pub 每秒token: f64,
+    /// 速度读数的来源，决定这个数能不能当性能指标用：
+    ///
+    /// - `engine` = 引擎自报的 `timings.predicted_per_second`，**纯解码速度**，
+    ///   不含图构建与首次 shader 编译 —— 与清单 A5 门槛「≥100 t/s」同口径；
+    /// - `wall` = 请求往返墙钟回退值（引擎没给 `timings` 时），**含一次性开销**。
+    ///
+    /// 🔴 为什么必须分开：2026-10-18 实测**同一个模型、同一个 Vulkan 后端**，
+    /// 当次首跑报 `15.96`、热身后报 `54.65`（3.4 倍）。拿墙钟值判 A5 门槛
+    /// 会得出完全相反的结论 —— 当时据此写下"Vulkan 只有 CUDA 的 26%"，
+    /// 后来被证伪（真实稳态折扣 0.77~1.04×）。
+    ///
+    /// 缺字段按 `wall` 解释：旧版本产出的 `tokens_per_sec` 一律是这个算法，
+    /// 这是**已知事实而非猜测**，且方向保守（标成不可靠）。
+    #[serde(rename = "speed_source", default = "旧数据速度来源")]
+    pub 速度来源: String,
     /// **引擎实际加载的后端** —— 由编排层在每轮启动后扫描
     /// `engine/backends/` 根目录实际存在的 GPU DLL 得到
     /// （`service::effective_gpu_backend`），**不是调用方填的标签**。
@@ -172,6 +188,36 @@ pub fn 比对(甲: &str, 乙: &str) -> 比对报告 {
     }
 }
 
+/// 旧版本产出的 `tokens_per_sec` 是「token 数 ÷ 请求往返墙钟」，缺字段时按此解释。
+///
+/// 不能默认成 `engine`：那会把含编译开销的值当成纯解码速度，正是 3.4 倍误差的来源。
+fn 旧数据速度来源() -> String {
+    "wall".to_string()
+}
+
+/// 速度读数与来源。**纯函数**，便于单测覆盖「引擎给了」与「引擎没给」两条路。
+///
+/// 优先级：引擎自报 `timings.predicted_per_second` → 墙钟 `token 数 ÷ 耗时`。
+/// 引擎值非正数或非有限值时也回退（0 表示它没测到，不能当成"极慢"）。
+fn 解析速度(体: &serde_json::Value, token数: u32, 墙钟秒: f64) -> (f64, &'static str) {
+    if let Some(值) = 体
+        .get("timings")
+        .and_then(|t| t.get("predicted_per_second"))
+        .and_then(|v| v.as_f64())
+    {
+        if 值.is_finite() && 值 > 0.0 {
+            return ((值 * 100.0).round() / 100.0, "engine");
+        }
+    }
+    if 墙钟秒 > 0.0 && token数 > 0 {
+        return (
+            (f64::from(token数) / 墙钟秒 * 100.0).round() / 100.0,
+            "wall",
+        );
+    }
+    (0.0, "wall")
+}
+
 /// 发起一次确定性生成。
 ///
 /// **只用标准字段**，原因见模块头注释 —— 塞非标准字段会让两个后端产生与本功能
@@ -231,17 +277,16 @@ async fn 生成一次(端口: u16, 后端名: &str) -> Result<后端输出, Stri
         return Err(format!("{后端名} 后端没有返回任何内容"));
     }
 
+    let (每秒token, 速度来源) = 解析速度(&体, token数, 耗时);
+
     Ok(后端输出 {
         后端: 后端名.to_string(),
         文本,
         token数,
         停止原因,
         耗时秒: (耗时 * 100.0).round() / 100.0,
-        每秒token: if 耗时 > 0.0 {
-            (f64::from(token数) / 耗时 * 100.0).round() / 100.0
-        } else {
-            0.0
-        },
+        每秒token,
+        速度来源: 速度来源.to_string(),
         // 实测后端由编排层在 `start_service_core` 之后扫描 `backends/` 目录
         // 填写 —— 这里是纯 HTTP 层，看不到目录，填不了也不该猜。
         实际后端: String::new(),
@@ -595,12 +640,18 @@ mod tests {
             停止原因: "limit".to_string(),
             耗时秒: 1.0,
             每秒token: 1.0,
+            速度来源: "engine".to_string(),
             实际后端: "Vulkan".to_string(),
         })
         .unwrap();
         assert_eq!(
             值.get("effective_backend").and_then(|v| v.as_str()),
             Some("Vulkan")
+        );
+        assert_eq!(
+            值.get("speed_source").and_then(|v| v.as_str()),
+            Some("engine"),
+            "速度来源必须以 ASCII 键跨边界，前端据此标「引擎解码 / 含首次编译」"
         );
         assert!(值.get("实际后端").is_none(), "中文键名跨边界会静默失效");
 
@@ -615,6 +666,45 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(反.实际后端, "");
+        assert_eq!(
+            反.速度来源, "wall",
+            "旧数据的速度是墙钟算的，缺字段必须按 wall 解释（标成不可靠），\
+             不能默认成 engine —— 那会把含编译开销的值当纯解码速度"
+        );
+    }
+
+    /// **速度口径**：引擎给了 `timings.predicted_per_second` 就用它（纯解码），
+    /// 没给才回退墙钟，且来源要如实标出。
+    ///
+    /// 2026-10-18 事故：同一模型、同一 Vulkan 后端，当日首跑报 15.96、热身后报
+    /// 54.65（3.4 倍）—— 墙钟把首次 shader 编译算进了"解码速度"。据此得到的
+    /// 「Vulkan 只有 CUDA 26%」被证伪，真实稳态折扣 0.77~1.04×。
+    #[test]
+    fn speed_prefers_engine_timings_over_wall_clock() {
+        // 引擎给了：必须用引擎值，哪怕墙钟算出来差得很远。
+        let 有 = serde_json::json!({"timings": {"predicted_per_second": 54.653}});
+        let (速, 源) = 解析速度(&有, 384, 24.095);
+        assert_eq!(源, "engine");
+        assert!((速 - 54.65).abs() < 0.01, "应取引擎自报值并保留两位：{速}");
+
+        // 引擎没给：回退墙钟，且必须标成 wall（调用方才能提示"含首次编译"）。
+        let 无 = serde_json::json!({"content": "x"});
+        let (速, 源) = 解析速度(&无, 384, 24.0);
+        assert_eq!(源, "wall");
+        assert!((速 - 16.0).abs() < 0.01, "384 / 24 s = 16 t/s：{速}");
+
+        // 引擎给了 0 / 负数 → 视为没测到，仍回退（0 不能当"极慢"用）。
+        for 坏值 in [0.0_f64, -1.0] {
+            let 体 = serde_json::json!({"timings": {"predicted_per_second": 坏值}});
+            let (速, 源) = 解析速度(&体, 384, 8.0);
+            assert_eq!(源, "wall", "引擎值 {坏值} 不可用时应回退墙钟");
+            assert!((速 - 48.0).abs() < 0.01, "384 / 8 s = 48 t/s：{速}");
+        }
+
+        // 两边都没有 → 0，来源仍标 wall（不伪造一个看起来正常的数）。
+        let (速, 源) = 解析速度(&无, 0, 0.0);
+        assert_eq!(速, 0.0);
+        assert_eq!(源, "wall");
     }
 }
 

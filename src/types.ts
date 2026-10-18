@@ -104,6 +104,16 @@ export interface BackendRun {
   stop_type: string;
   elapsed_sec: number;
   tokens_per_sec: number;
+  /**
+   * `tokens_per_sec` 的来源：
+   * - `engine` = 引擎自报 `timings.predicted_per_second`，**纯解码速度**
+   *   （不含图构建与首次 shader 编译），与 A5 门槛「≥100 t/s」同口径；
+   * - `wall` = 请求往返墙钟回退值，**含一次性开销** —— 当日首跑某后端时会
+   *   严重偏低（实测同模型同后端 15.96 vs 54.65，差 3.4 倍）。
+   *
+   * 旧版本产出的数据没有这个字段，后端按 `wall` 解释。
+   */
+  speed_source: 'engine' | 'wall';
 }
 
 /** 比对结论。 */
