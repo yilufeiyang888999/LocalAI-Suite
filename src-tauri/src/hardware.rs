@@ -13,6 +13,11 @@ pub struct HardwareInfo {
     pub cpu: CpuInfo,
     pub memory: MemoryInfo,
     pub disk: DiskInfo,
+    /// 硬件探测推荐的**首选**后端，用来决定「装哪个引擎」（`App.vue::prepareEngineAndStart`）。
+    ///
+    /// 🔴 **不是**服务当前实际加载的后端 —— 那个只认 `starting llama-server … backend=`
+    /// 或 `显存对账 … backend=`。名字保留 `backend` 是为了不打断已发布的跨语言边界
+    /// （改字段名前端会静默读不到，且不报错）。
     pub backend: BackendType,
     pub needs_manual_tier: bool,
     pub summary: String,
@@ -160,8 +165,16 @@ pub(crate) fn detect_hardware() -> HardwareInfo {
         "未检测到独立显卡，运行速度会较慢，适合简单问答。".to_string()
     };
 
+    // 🔴 `preferred_backend` 的语义：**硬件探测给出的首选后端**（决定装哪个
+    // 引擎），**不是本轮服务实际加载的后端**。后者由 service.rs 打印：
+    //   `starting llama-server … backend=` / `显存对账 … backend=`
+    //
+    // 早先这个字段叫 `backend`，但它在本机跑 Vulkan 的那一轮**仍然报 CUDA**
+    // （2026-10-18 B-4 实跑：两轮的后端切换是真的，但这一行没跟着变）。
+    // 两个 `backend` 语义不同、名字相同 ⇒ 拿这一行判「本轮实际后端」会得到
+    // 「两轮都跑 CUDA」的**假阴性**，进而把一次有效校验判成无效。
     tracing::info!(
-        backend = ?backend,
+        preferred_backend = ?backend,
         gpu = %gpu_name,
         gpu_vram_gb,
         gpu_count = gpu_list.len(),
@@ -563,12 +576,30 @@ fn merge_gpus(mut primary: Vec<GpuInfo>, secondary: Vec<GpuInfo>) -> Vec<GpuInfo
     primary
 }
 
+/// **P2-6 纯函数**：本次 WMI 结果与「上次成功结果」之间取哪个。
+///
+/// 规则：**只增不减** —— 本次读到的条目比上次更少 ⇒ 视作 WMI 抖动，沿用上次。
+/// 为什么可以这么做：这个列表只用于**展示非 NVIDIA 显卡**（加速可用性、显存大小
+/// 都只认 nvidia-smi），少一条不该让界面上的显卡数量跳来跳去。
+/// 代价：真换卡/拔卡要重启 APP 才反映 —— 对展示字段可接受。
+#[cfg(windows)]
+fn 取较长的适配器列表(上次: Option<&Vec<GpuInfo>>, 本次: Vec<GpuInfo>) -> Vec<GpuInfo> {
+    match 上次 {
+        Some(旧) if 旧.len() > 本次.len() => 旧.clone(),
+        _ => 本次,
+    }
+}
+
 /// Enumerate every display adapter via WMI (`Win32_VideoController`). Best-effort:
 /// any COM/query failure yields an empty list so hardware detection never fails.
 #[cfg(windows)]
 fn detect_gpus_via_wmi() -> Vec<GpuInfo> {
     use serde::Deserialize;
     use wmi::{COMLibrary, WMIConnection};
+
+    /// **P2-6**：同机实测 `gpu_count` 曾出现 **3 → 1 → 3**（WMI 不稳）。
+    /// 记住上一次成功读到的列表，本次更少时沿用（见 `取较长的适配器列表`）。
+    static 上次成功: std::sync::Mutex<Option<Vec<GpuInfo>>> = std::sync::Mutex::new(None);
 
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
@@ -590,7 +621,8 @@ fn detect_gpus_via_wmi() -> Vec<GpuInfo> {
         return Vec::new();
     };
 
-    rows.into_iter()
+    let 本次: Vec<GpuInfo> = rows
+        .into_iter()
         .enumerate()
         .filter_map(|(index, row)| {
             let name = row.name?.trim().to_string();
@@ -616,7 +648,22 @@ fn detect_gpus_via_wmi() -> Vec<GpuInfo> {
                 driver_version: row.driver_version.unwrap_or_default(),
             })
         })
-        .collect()
+        .collect();
+
+    // 毒化锁不 panic（硬件检测不该因为一次线程 panic 就整体失败）。
+    let mut 缓存 = 上次成功
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let 输出 = 取较长的适配器列表(缓存.as_ref(), 本次);
+    if 缓存.as_ref().map(|旧| 旧.len()) != Some(输出.len()) {
+        tracing::debug!(
+            previous = 缓存.as_ref().map(|旧| 旧.len()),
+            current = 输出.len(),
+            "WMI 适配器列表长度变化（P2-6：更少时沿用上次）"
+        );
+    }
+    *缓存 = Some(输出.clone());
+    输出
 }
 
 #[cfg(not(windows))]
@@ -673,6 +720,31 @@ mod tests {
         // 空串 / 异常输出同样不能判成 TCC（探测失败要保守）。
         assert!(!is_tcc_mode(""));
         assert!(!is_tcc_mode("N/A"));
+    }
+
+    /// **P2-6 护栏**：WMI 读到的适配器列表「只增不减」。
+    ///
+    /// 正反两面都要钉：
+    /// ① 本次更少（WMI 抖动）→ 沿用上次（否则界面显卡数 3 → 1 → 3 乱跳）；
+    /// ② 本次更多（真发现了新适配器）→ **必须采纳** —— 不能因为「只增不减」
+    ///    把新出现的卡吞掉，那样就从「去噪」变成了「永久错误」。
+    #[cfg(windows)]
+    #[test]
+    fn wmi_adapter_list_never_shrinks() {
+        let 三块 = vec![
+            gpu("NVIDIA GeForce RTX 5060 Laptop GPU", 8.0),
+            gpu("Intel(R) UHD Graphics", 0.0),
+            gpu("Microsoft Basic Display Adapter", 0.0),
+        ];
+        let 一块 = vec![gpu("NVIDIA GeForce RTX 5060 Laptop GPU", 8.0)];
+        // ① 抖动：本次 1 块、上次 3 块 → 沿用 3 块
+        assert_eq!(取较长的适配器列表(Some(&三块), 一块.clone()).len(), 3);
+        // ② 增长：本次 3 块、上次 1 块 → 采纳本次（3 块）
+        assert_eq!(取较长的适配器列表(Some(&一块), 三块.clone()).len(), 3);
+        // ③ 首次（还没有上次）→ 采纳本次
+        assert_eq!(取较长的适配器列表(None, 一块.clone()).len(), 1);
+        // ④ 一样多 → 采纳本次（等价替换，不把旧值锁死）
+        assert_eq!(取较长的适配器列表(Some(&一块), 一块.clone()).len(), 1);
     }
 
     fn gpu(name: &str, vram_gb: f64) -> GpuInfo {

@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>本地AI模型一键部署助手 · 使用教程</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --ink: #1f2430;
+    --ink-2: #4b5563;
+    --ink-3: #8b93a1;
+    --line: #e5e7eb;
+    --line-2: #eef0f3;
+    --brand: #4f46e5;
+    --brand-soft: #eef0ff;
+    --ok: #0f9d58;
+    --ok-soft: #e9f7ef;
+    --warn: #b45309;
+    --warn-soft: #fdf6e3;
+    --bad: #c0392b;
+    --bad-soft: #fdecea;
+    --code-bg: #f2f3f5;
+    --radius: 10px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 15px;
+    line-height: 1.78;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--brand); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ---------- 布局 ---------- */
+  .wrap { display: flex; align-items: flex-start; max-width: 1240px; margin: 0 auto; gap: 28px; padding: 0 20px 80px; }
+  .toc {
+    position: sticky; top: 20px; flex: 0 0 232px; margin-top: 20px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 16px 12px; max-height: calc(100vh - 40px); overflow-y: auto;
+  }
+  .toc h4 { margin: 0 0 10px 8px; font-size: 12px; letter-spacing: .08em; color: var(--ink-3); font-weight: 700; }
+  .toc ol { list-style: none; margin: 0; padding: 0; counter-reset: s; }
+  .toc > ol > li { margin-bottom: 2px; }
+  .toc a {
+    display: block; padding: 6px 8px; border-radius: 7px; color: var(--ink-2);
+    font-size: 13.5px; line-height: 1.5; border-left: 2px solid transparent;
+  }
+  .toc a:hover { background: var(--brand-soft); color: var(--brand); text-decoration: none; }
+  .toc a.active { background: var(--brand-soft); color: var(--brand); font-weight: 600; border-left-color: var(--brand); }
+  .toc .sub a { padding-left: 22px; font-size: 12.5px; color: var(--ink-3); }
+  main { flex: 1; min-width: 0; padding-top: 20px; }
+
+  /* ---------- 页头 ---------- */
+  .hero {
+    background: linear-gradient(135deg, #4f46e5 0%, #6366f1 55%, #818cf8 100%);
+    color: #fff; border-radius: 14px; padding: 30px 32px; margin-bottom: 24px;
+  }
+  .hero h1 { margin: 0 0 8px; font-size: 27px; letter-spacing: .01em; }
+  .hero p { margin: 0; opacity: .93; font-size: 15px; }
+  .hero .chips { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .hero .chip {
+    background: rgba(255,255,255,.18); border: 1px solid rgba(255,255,255,.3);
+    border-radius: 999px; padding: 3px 12px; font-size: 12.5px;
+  }
+
+  /* ---------- 区块 ---------- */
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 26px 30px; margin-bottom: 20px; }
+  section > h2 {
+    margin: 0 0 6px; font-size: 20px; display: flex; align-items: center; gap: 10px;
+  }
+  section > h2 .num {
+    flex: 0 0 26px; height: 26px; border-radius: 7px; background: var(--brand); color: #fff;
+    font-size: 14px; display: inline-flex; align-items: center; justify-content: center; font-weight: 700;
+  }
+  section > h2 + .lead { margin: 0 0 18px; color: var(--ink-2); font-size: 14.5px; }
+  h3 { margin: 26px 0 10px; font-size: 16.5px; padding-left: 10px; border-left: 3px solid var(--brand); }
+  h4 { margin: 18px 0 8px; font-size: 14.5px; color: var(--ink-2); }
+  p { margin: 8px 0; }
+  ul, ol { margin: 8px 0; padding-left: 22px; }
+  li { margin: 4px 0; }
+  code {
+    font-family: var(--mono); font-size: 13px; background: var(--code-bg);
+    padding: 1.5px 6px; border-radius: 5px; color: #b0357a;
+  }
+  pre {
+    background: #1f2430; color: #e6e9ef; padding: 14px 16px; border-radius: 8px;
+    overflow-x: auto; font-family: var(--mono); font-size: 13px; line-height: 1.65; margin: 10px 0;
+  }
+  pre code { background: none; color: inherit; padding: 0; }
+
+  /* ---------- 表格 ---------- */
+  .tbl { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13.8px; }
+  .tbl th, .tbl td { border: 1px solid var(--line); padding: 8px 11px; text-align: left; vertical-align: top; }
+  .tbl th { background: #fafbfc; font-weight: 600; color: var(--ink-2); white-space: nowrap; }
+  .tbl tr:nth-child(even) td { background: #fcfcfd; }
+  .tbl td:first-child { white-space: nowrap; }
+
+  /* ---------- 提示块 ---------- */
+  .note { border-radius: 8px; padding: 11px 15px; margin: 12px 0; font-size: 13.8px; border: 1px solid; }
+  .note b { font-weight: 700; }
+  .note.tip  { background: var(--ok-soft);   border-color: #b7e4c7; color: #14663a; }
+  .note.warn { background: var(--warn-soft); border-color: #f2d99b; color: #7c4a03; }
+  .note.bad  { background: var(--bad-soft);  border-color: #f3c0ba; color: #8c2016; }
+  .note.info { background: var(--brand-soft);border-color: #c7cbfa; color: #3730a3; }
+
+  /* ---------- 步骤卡 ---------- */
+  .step {
+    display: flex; gap: 14px; padding: 14px 0; border-bottom: 1px dashed var(--line);
+  }
+  .step:last-child { border-bottom: none; }
+  .step .badge {
+    flex: 0 0 30px; height: 30px; border-radius: 8px; background: var(--brand-soft); color: var(--brand);
+    font-weight: 700; display: flex; align-items: center; justify-content: center; font-size: 14px;
+    border: 1px solid #c7cbfa;
+  }
+  .step .body { flex: 1; min-width: 0; }
+  .step .body > strong { display: block; font-size: 15px; margin-bottom: 2px; }
+  .step .body > .what { color: var(--ink-2); font-size: 13.8px; }
+  .step .meta { margin-top: 6px; font-size: 13px; color: var(--ink-3); }
+  .step .meta b { color: var(--ink-2); }
+
+  /* ---------- 架构图 ---------- */
+  .arch { margin: 14px 0; font-size: 13.5px; }
+  .arch .layer {
+    border: 1px solid var(--line); border-radius: 9px; padding: 10px 14px; background: #fbfbfd; margin-bottom: 0;
+  }
+  .arch .layer .lt { font-weight: 700; font-size: 13.5px; margin-bottom: 4px; }
+  .arch .layer .lb { color: var(--ink-2); font-size: 13px; }
+  .arch .arrow { text-align: center; color: var(--ink-3); font-size: 12px; padding: 4px 0; line-height: 1.5; }
+  .arch .row { display: flex; gap: 10px; }
+  .arch .row > * { flex: 1; }
+  .arch .cell { border: 1px solid var(--line); border-radius: 9px; padding: 9px 12px; background: #fbfbfd; }
+  .arch .cell b { display: block; font-size: 13px; }
+  .arch .cell span { color: var(--ink-3); font-size: 12.3px; }
+  .arch .hl { border-color: #c7cbfa; background: var(--brand-soft); }
+
+  .kv { display: grid; grid-template-columns: 132px 1fr; gap: 6px 14px; font-size: 13.8px; margin: 10px 0; }
+  .kv dt { color: var(--ink-3); }
+  .kv dd { margin: 0; }
+
+  .footnote { color: var(--ink-3); font-size: 12.6px; margin-top: 10px; }
+  .stamp { color: var(--ink-3); font-size: 12.5px; text-align: center; padding: 8px 0 0; }
+
+  @media (max-width: 900px) {
+    .wrap { flex-direction: column; gap: 0; }
+    .toc { position: static; flex: none; width: 100%; max-height: none; }
+    .toc ol { columns: 2; }
+    section { padding: 20px 18px; }
+    .hero { padding: 24px 20px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ============ 目录 ============ -->
+  <nav class="toc">
+    <h4>目 录</h4>
+    <ol>
+      <li><a href="#s1">这个项目是什么</a></li>
+      <li><a href="#s2">安装</a></li>
+      <li><a href="#s3">七步上手</a></li>
+      <li><a href="#s4">三种问答模式</a></li>
+      <li><a href="#s5">接入第三方应用</a></li>
+      <li><a href="#s6">设置项速查</a></li>
+      <li><a href="#s7">遇到问题怎么办</a></li>
+      <li><a href="#s8">附录：端口与路径</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+    <div class="hero">
+      <h1>本地AI模型一键部署助手 · 使用教程</h1>
+      <p>从「下载安装包」到「问出第一个问题」，全部在本机完成 —— 数据不出门，也不联网调用云端模型。</p>
+      <div class="chips">
+        <span class="chip">版本 0.1.6</span>
+        <span class="chip">Windows 10 / 11 64 位</span>
+        <span class="chip">Tauri + llama.cpp</span>
+        <span class="chip">无需命令行即可使用</span>
+      </div>
+    </div>
+
+    <!-- ============ 1 ============ -->
+    <section id="s1">
+      <h2><span class="num">一</span>这个项目是什么</h2>
+      <p class="lead">一句话：<b>把「在 Windows 上跑起一个本地大模型」这件事，从一长串命令行操作，变成一个装上就能点的桌面软件。</b></p>
+
+      <p>手工部署本地模型，绕不开这几道坎：认显卡、算显存、挑量化档、去镜像站找几十 GB 的文件、编译或找对版本的推理引擎、敲一长串启动参数。任何一步错了，大概率只得到一句语焉不详的报错。这个软件把这条链路整段接管了。</p>
+
+      <h3>它替你做了什么</h3>
+      <table class="tbl">
+        <thead><tr><th>手工部署</th><th>这个软件</th></tr></thead>
+        <tbody>
+          <tr><td>认显卡型号、查显存、估能跑多大的模型</td><td>硬件体检 + 场景推荐，直接给出「这台机器能跑哪几个」和理由</td></tr>
+          <tr><td>去 HuggingFace / ModelScope 找 gguf 文件，几十 GB 慢慢下</td><td>一键下载：自动测速选线路、断点续传、可暂停、可限速</td></tr>
+          <tr><td>自己编译或找对版本的 llama.cpp，配 CUDA / Vulkan</td><td>自动下载匹配本机显卡的后端引擎，失败自动退到 CPU 模式</td></tr>
+          <tr><td>敲 <code>llama-server</code> 的一堆参数（层数、上下文、KV 量化）</td><td>按可用显存自动算参数量，用户不用懂</td></tr>
+          <tr><td>自己找聊天界面接上去</td><td>内置对话界面，另带企业知识库问答与智能问数</td></tr>
+          <tr><td>出问题只能看日志猜</td><td>故障自查 + 一键修复 + 脱敏诊断日志导出</td></tr>
+        </tbody>
+      </table>
+
+      <h3>能力总览</h3>
+      <table class="tbl">
+        <thead><tr><th>能力</th><th>说明</th><th>前置条件</th></tr></thead>
+        <tbody>
+          <tr><td><b>模型部署</b></td><td>硬件体检 → 场景推荐 → 一键下载 → 自动起服务；支持导入已有的 <code>.gguf</code> 文件</td><td>无</td></tr>
+          <tr><td><b>通用对话</b></td><td>流式回答、三种角色预设（日常助手 / 文案写作 / 代码助手）、可调「严谨↔创意」、多会话管理、记录只存本机</td><td>装好一个模型</td></tr>
+          <tr><td><b>企业知识库问答</b></td><td>拿企业自己的文档回答问题，并给出引用出处</td><td>另起「作品一」服务（8092）</td></tr>
+          <tr><td><b>智能问数</b></td><td>一个入口问三类问题：<b>制度类</b>（查制度）、<b>数据类</b>（查业务数据，附口径与 SQL）、<b>动作类</b>（起草单据，受角色权限约束）</td><td>另起「作品二」服务（8095 + 8096）</td></tr>
+          <tr><td><b>对外接口</b></td><td>本机 AI 以 OpenAI 兼容接口暴露，可被 Cherry Studio、Cursor、Continue.dev 等直接调用；可开局域网访问</td><td>服务在跑</td></tr>
+          <tr><td><b>微调包</b></td><td>模型目录里带旁车配置时，启动会自动挂上 LoRA 适配器并套用配套对话模板，并在日志里向引擎核对是否真的生效</td><td>模型包随附配置</td></tr>
+        </tbody>
+      </table>
+
+      <h3>整体结构</h3>
+      <div class="arch">
+        <div class="layer hl">
+          <div class="lt">桌面应用（Tauri 2 + Vue 3 + Rust）</div>
+          <div class="lb">界面：七步向导 + 聊天区 ｜ 后端：硬件检测、显存测算、下载器、引擎管理、服务生命周期、日志、SQLite</div>
+        </div>
+        <div class="arrow">↓ 由应用负责：下载 / 校验 / 启动 / 监控 / 停止</div>
+        <div class="layer">
+          <div class="lt">推理引擎 llama-server（llama.cpp）</div>
+          <div class="lb">OpenAI 兼容 HTTP 接口，<b>默认端口 8080</b>（本机当前配置为 8000）· 是本机所有 AI 能力的源头</div>
+        </div>
+        <div class="arrow">↑ 可选：两个独立的本地 Python 服务通过 HTTP 调用它</div>
+        <div class="row">
+          <div class="cell">
+            <b>作品一 · 知识库（8092）</b>
+            <span>检索 + 引用，附重排服务 8085</span>
+          </div>
+          <div class="cell">
+            <b>作品二 · 智能问数（8096）</b>
+            <span>三条链路编排，附问数服务 8095</span>
+          </div>
+        </div>
+      </div>
+      <div class="note info">
+        <b>这两个服务不随本应用启动。</b>它们各自属于一个独立仓库，需要用到对应模式时单独起（见 §4）。只用「通用对话」的话，完全不用管它们。
+      </div>
+
+      <h3>本版概况</h3>
+      <dl class="kv">
+        <dt>当前版本</dt><dd>0.1.6（2026-10-16 构建）</dd>
+        <dt>运行环境</dt><dd>Windows 10 / 11 64 位；有 NVIDIA 显卡会快很多，没有也能跑（CPU 模式，速度较慢）</dd>
+        <dt>自动化测试</dt><dd>Rust 侧单元测试 <b>216 条全通过</b>（含反例与假引擎端到端用例）</dd>
+        <dt>数据位置</dt><dd>模型、引擎、聊天记录、日志全部在本机；默认放在安装时选定的目录下</dd>
+      </dl>
+      <p class="footnote">教程对应界面以 0.1.6 为准。截图与文案如有出入，以软件内实际显示为准。</p>
+    </section>
+
+    <!-- ============ 2 ============ -->
+    <section id="s2">
+      <h2><span class="num">二</span>安装</h2>
+      <p class="lead">三步：下安装包 → 选保存位置 → 双击装完。</p>
+
+      <h3>2.1 先看这台电脑够不够</h3>
+      <table class="tbl">
+        <thead><tr><th>项目</th><th>建议</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>系统</td><td>Windows 10 / 11 64 位</td><td>软件是 Windows 桌面应用</td></tr>
+          <tr><td>内存</td><td>16 GB 以上</td><td>8 GB 只能跑最小的模型</td></tr>
+          <tr><td>显卡</td><td>NVIDIA 独立显卡（推荐）</td><td>没有独显也能用，但会走 CPU 模式，回答明显变慢</td></tr>
+          <tr><td>磁盘</td><td>至少 50 GB 空闲</td><td>模型按 4 GB ~ 30 GB 一个算，另外还有推理引擎</td></tr>
+        </tbody>
+      </table>
+
+      <h3>2.2 安装包</h3>
+      <p>文件名：<code>本地AI模型一键部署助手_0.1.6_x64-setup.exe</code></p>
+      <table class="tbl">
+        <thead><tr><th>校验项</th><th>值</th></tr></thead>
+        <tbody>
+          <tr><td>文件大小</td><td>8,956,184 字节</td></tr>
+          <tr><td>SHA256（前 8 位）</td><td><code>564EC844</code></td></tr>
+          <tr><td>文件版本</td><td>0.1.6</td></tr>
+        </tbody>
+      </table>
+      <div class="note warn">
+        <b>拿到多个同名安装包时，认指纹、别认文件名。</b>同名文件被重新构建过时，文件名不会变，内容会变。装完后可以打开软件右侧「设置 → 关于」看版本号，应显示 <b>0.1.6</b>。
+      </div>
+
+      <h3>2.3 安装步骤</h3>
+      <ol>
+        <li>双击安装包（Windows 可能提示「未知发布者」，选「仍要运行」）。</li>
+        <li>选择安装位置，一路「下一步」到完成。</li>
+        <li>从开始菜单或桌面图标启动。</li>
+      </ol>
+
+      <h3>2.4 首次启动会发生什么</h3>
+      <ul>
+        <li>软件自动做一次<b>硬件体检</b>，并准备好<b>推理引擎</b>（后台下载，界面上会有进度提示）。</li>
+        <li>Windows 可能弹窗询问是否允许运行本地服务 —— 选<b>「仍要运行」</b>，否则服务起不来。</li>
+        <li>如果上一次用过某个模型，软件会尝试<b>自动把它重新拉起来</b>，不需要重新配置。</li>
+      </ul>
+
+      <h3>2.5 想换地方放模型</h3>
+      <p>默认放在安装时选定的目录下。空间不够时，到右侧「设置」改「AI文件保存位置」，建议指到大容量磁盘（例如 D 盘）。已有的模型不会自动搬过去 —— 换目录后重新下载或重新导入即可。</p>
+    </section>
+
+    <!-- ============ 3 ============ -->
+    <section id="s3">
+      <h2><span class="num">三</span>七步上手</h2>
+      <p class="lead">主界面的卡片是按顺序编号的，跟着往下点就行。左侧是主流程（1→7），右侧是三个随时可用的面板。</p>
+
+      <div class="step">
+        <div class="badge">1</div>
+        <div class="body">
+          <strong>硬件体检</strong>
+          <div class="what">自动识别显卡、显存、内存、CPU 核心数，判断这台电脑适合跑哪一档模型。</div>
+          <div class="meta"><b>要做什么：</b>看一眼结果即可。如果识别得不对（比如双显卡机器认错了），可以手动指定显存档位再重新推荐。<b>识别不到独显</b>通常意味着驱动没装或版本太老 —— 下面第 1 步的故障自查会给出驱动下载入口。</div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="badge">2</div>
+        <div class="body">
+          <strong>选择使用场景</strong>
+          <div class="what">四选一：<b>日常聊天问答</b> / <b>写文案·写报告</b> / <b>写代码</b> / <b>通用</b>。</div>
+          <div class="meta"><b>为什么影响推荐：</b>不同用途看重的能力不一样（中文长文表达、代码理解、通用表现），选完下面的推荐模型会跟着变。</div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="badge">3</div>
+        <div class="body">
+          <strong>推荐模型</strong>
+          <div class="what">最多列三个候选，每个都写了「为什么推荐它」。已装过的会标「已安装」，按钮变成「直接使用」。</div>
+          <div class="meta"><b>要做什么：</b>挑一个点「开始安装」。<b>越大的模型越聪明，也越慢、越占显存</b>；拿不准就先装推荐列表第一个。</div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="badge">4</div>
+        <div class="body">
+          <strong>安装进度</strong>
+          <div class="what">显示下载 → 校验文件 → 启动服务 三个阶段。下载中可以<b>暂停 / 继续 / 取消</b>。</div>
+          <div class="meta"><b>默认线路：</b>先试 ModelScope，失败自动换 hf-mirror。下载慢可以在「设置」里限速，避免把整条带宽占满。</div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="badge">5</div>
+        <div class="body">
+          <strong>聊天</strong>
+          <div class="what">装好就能问。三种模式：<b>通用对话 / 知识库问答 / 智能问数</b>（详见 §4）。</div>
+          <div class="meta"><b>通用对话下还有：</b>角色预设（日常助手 / 文案写作 / 代码助手）、「严谨 ↔ 创意」滑杆、左侧会话列表（可重命名、删除）、「清空上下文」（保留历史消息，但让 AI 忘掉之前的内容）。</div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="badge">6</div>
+        <div class="body">
+          <strong>已安装模型</strong>
+          <div class="what">所有下载过或导入过的模型都在这。可以<b>切换当前模型、检查更新、停止服务、启动、卸载、导入本地模型</b>。</div>
+          <div class="meta">
+            <b>带「微调包」角标的模型</b>：启动时会自动挂上它自己的 LoRA 适配器并套用配套对话模板，不需要你手动配。<br />
+            <b>停止 / 启动不会丢配置</b>：改了端口或想换模型时，先在这里停止、再启动即可。<br />
+            <b>卸载</b>时会问一次「是否连同聊天记录一起删除」—— 取消就只删模型、保留记录。
+          </div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="badge">7</div>
+        <div class="body">
+          <strong>在其他应用中使用本地AI</strong>
+          <div class="what">列出本机 AI 的调用地址与密钥，并给出常用客户端的填入模板，一键复制。</div>
+          <div class="meta">详见 §5。</div>
+        </div>
+      </div>
+
+      <h3>右侧三个面板（随时可用）</h3>
+      <table class="tbl">
+        <thead><tr><th>面板</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><b>设置 / 离线导入</b></td><td>保存位置、下载限速与线路、开机自启、AI 自称名字、谁可以调用、端口、知识库与问数服务地址；展开后还有代理、日志级别、自定义运行参数、导入本地模型、数据管理与「关于」。</td></tr>
+          <tr><td><b>故障自查</b></td><td>点「开始检查」逐项体检（显存、运行库、模型文件、显卡驱动、磁盘空间等），能一键修的会给按钮。附「导出诊断日志（已脱敏）」。</td></tr>
+          <tr><td><b>后端一致性校验</b></td><td>拿同一个问题分别跑两个显卡后端，比对输出是否一致 —— 用于确认「换了后端之后结果没变味」。<b>校验期间会重启两次服务，聊天会短暂不可用。</b></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ============ 4 ============ -->
+    <section id="s4">
+      <h2><span class="num">四</span>三种问答模式</h2>
+      <p class="lead">「聊天」区顶部三个标签页。三者<b>依赖的服务不同、擅长的东西也不同</b>。</p>
+
+      <table class="tbl">
+        <thead>
+          <tr><th>对比项</th><th>通用对话</th><th>知识库问答</th><th>智能问数</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>依赖</td><td>本软件自己（已装模型）</td><td>额外起作品一 8092</td><td>额外起作品二 8095 + 8096</td></tr>
+          <tr><td>擅长</td><td>闲聊、写作、写代码、翻译总结</td><td>按企业自己的文档回答问题</td><td>查制度 / 查业务数据 / 起草单据</td></tr>
+          <tr><td>结果形态</td><td>一段自然语言回答</td><td>回答 + <b>引用出处</b></td><td>回答 + <b>口径说明 / SQL / 结果表 / 执行轨迹 / 权限结论</b></td></tr>
+          <tr><td>多轮上下文</td><td>有（记得前文）</td><td>无（每次独立检索）</td><td>无（每次独立判断）</td></tr>
+          <tr><td>开箱可用</td><td>装好模型即可</td><td>需另起服务</td><td>需另起服务</td></tr>
+        </tbody>
+      </table>
+
+      <h3>4.1 通用对话</h3>
+      <ul>
+        <li>直接在输入框提问。回答是「边想边出字」的流式输出，可以随时点<b>「停止」</b>打断。</li>
+        <li>左上角可切换<b>角色预设</b>（日常助手 / 文案写作 / 代码助手），影响回答的语气与侧重。</li>
+        <li>右侧滑杆：往左更严谨、往右更有创意。</li>
+        <li>下方绿色框里显示的是 <b>「其他程序调用本机AI的地址」</b>（OpenAI 兼容），可以直接复制走。</li>
+        <li>如果当前跑在「CPU 模式」，会有一条提示条和<b>「恢复显卡加速」</b>按钮 —— 点一下会重试显卡。</li>
+      </ul>
+
+      <h3>4.2 企业知识库问答</h3>
+      <p>切到「知识库问答」标签后，顶部会显示服务是否连上、连的是哪个地址、库里有几份文档几块内容。</p>
+      <p><b>怎么把服务起起来：</b>到作品一目录下运行它的启动器（它会一并把检索用的重排服务也带起来）：</p>
+      <pre><code>cd "D:/Ivan-File/7-AI-Code/RAG-Embedding"
+python scripts/启动-服务.py</code></pre>
+      <p class="footnote">只想单独起知识库服务本身，也可以用 <code>python scripts/知识库服务.py</code>。</p>
+
+      <div class="note warn">
+        <b>有一类失败不会报错，只会一直答不出来 —— 生成端端口对不上。</b>
+        知识库服务内部默认去 <code>http://127.0.0.1:8000</code> 找生成引擎；如果本软件的「接口端口」不是这个值，提问时会一直返回「资料不足 / 生成失败」，而服务本身照常 200 响应。
+        软件检测到这种不一致会直接提示，按提示带上 <code>--生成端 http://127.0.0.1:&lt;实际端口&gt;</code> 重启它即可。
+      </div>
+
+      <h3>4.3 智能问数</h3>
+      <p>一个入口，三种问题不用自己分类（路由是系统的责任）：</p>
+      <table class="tbl">
+        <thead><tr><th>类型</th><th>问什么</th><th>看点</th></tr></thead>
+        <tbody>
+          <tr><td><b>制度类</b></td><td>「不合格品应该怎么处理？」</td><td>给出<b>引用出处</b>（哪份制度、哪一节）</td></tr>
+          <tr><td><b>数据类</b></td><td>「上月哪家供应商不良率最高？」</td><td><b>口径说明</b> + 生成的 SQL + 结果表</td></tr>
+          <tr><td><b>动作类</b></td><td>「给东莞精诚出一份质量整改通知」</td><td>要看<b>角色</b>：权限不够会被明确拒绝，且<b>不生成任何单据</b></td></tr>
+        </tbody>
+      </table>
+      <p><b>怎么把服务起起来：</b>到作品二目录下运行：</p>
+      <pre><code>cd "D:/Ivan-File/7-AI-Code/ChatBI"
+python scripts/启动-服务.py</code></pre>
+      <p>它的「知识问答」链路会转发给作品一，所以那条链路要求 <b>8092 也开着</b>。界面会逐条显示三条链路的可达情况，缺哪条会直接点名。</p>
+
+      <div class="note info">
+        <b>「发起角色」是干什么的：</b>决定「能不能提交申请 / 对外发文」。切换角色再问同一个问题，就能看到权限约束的效果 —— 被拒时会告诉你<b>需要什么角色</b>，而不是一句「失败」。
+        <br /><span class="footnote">说明：当前角色是调用方自己选的标签，用于演示权限关口与留痕；真实部署应接入统一身份认证。</span>
+      </div>
+
+      <h3>4.4 想一次把全部服务起齐</h3>
+      <p>三个仓库的交叉演示有一条命令（先手动启动本软件的 AI 服务，再跑它）：</p>
+      <pre><code>cd "D:/Ivan-File/7-AI-Code/AI大模型应用开发实战训练营/整合演示"
+python 一键启动.py            # 体检 → 起缺的服务 → 全链路自证
+python 一键启动.py --状态      # 只看现状，不动现场
+python 一键启动.py --停        # 停掉两条支线（不动本软件的引擎）</code></pre>
+      <p class="footnote">它只按依赖顺序<b>转交</b>给各仓库自己的启动器，本身不拼任何服务的启动命令 —— 避免同一份配置两处定义。</p>
+    </section>
+
+    <!-- ============ 5 ============ -->
+    <section id="s5">
+      <h2><span class="num">五</span>接入第三方应用</h2>
+      <p class="lead">本机的 AI 服务是 <b>OpenAI 兼容接口</b>，任何支持「自定义 OpenAI 地址」的软件都能直接接上。</p>
+
+      <h3>5.1 三个值</h3>
+      <table class="tbl">
+        <thead><tr><th>填什么</th><th>值</th></tr></thead>
+        <tbody>
+          <tr><td>Base URL</td><td><code>http://127.0.0.1:&lt;端口&gt;/v1</code>（端口以「聊天」页显示的地址为准）</td></tr>
+          <tr><td>API Key</td><td><code>sk-no-key-required</code>（本地服务不校验，随便填一个非空值也行）</td></tr>
+          <tr><td>模型名</td><td>填当前模型的 ID，或任意字符串（llama.cpp 不挑）</td></tr>
+        </tbody>
+      </table>
+      <div class="note tip">
+        软件内「在其他应用中使用本地AI」那块会<b>按你当前的端口和模型自动算好</b>，带一键复制按钮和每个应用的逐步说明 —— 优先照那里抄，别手打。
+      </div>
+
+      <h3>5.2 常用应用</h3>
+      <table class="tbl">
+        <thead><tr><th>应用</th><th>关键动作</th></tr></thead>
+        <tbody>
+          <tr><td><b>Cherry Studio</b></td><td>设置 → 模型服务 → 添加 → 提供商类型选 OpenAI → 填地址 / 密钥 / 模型名</td></tr>
+          <tr><td><b>Chatbox</b></td><td>设置 → AI 模型提供方选 OpenAI API → 把 API Host 改成上面的 Base URL</td></tr>
+          <tr><td><b>Cursor</b></td><td>Settings → Models → 填 OpenAI API Key → 打开「Override OpenAI Base URL」→ Verify</td></tr>
+          <tr><td><b>Continue.dev</b></td><td>编辑 <code>~/.continue/config.yaml</code>，软件内提供整段可复制配置</td></tr>
+          <tr><td><b>其他</b></td><td>任何标称「OpenAI 兼容」的应用，按 §5.1 三个值填即可</td></tr>
+        </tbody>
+      </table>
+      <p class="footnote">可用接口：<code>/v1/models</code>、<code>/v1/chat/completions</code>、<code>/v1/completions</code>。</p>
+
+      <h3>5.3 让局域网其他设备也能用</h3>
+      <ol>
+        <li>右侧「设置」→「谁可以调用本机AI」改成<b>「局域网内其他设备也可访问」</b>。</li>
+        <li>保存后，到「已安装模型」里<b>停止服务再启动</b>（端口监听方式改了，必须重启才生效）。</li>
+        <li>重启后「聊天」页会多出一条局域网地址，形如 <code>http://192.168.x.x:&lt;端口&gt;/v1</code>，在别的设备上用它。</li>
+      </ol>
+      <div class="note bad">
+        <b>开之前想清楚：</b>开启后，同一局域网内任何人都能直接调用你的本机 AI，<b>没有密码保护</b>。只在可信网络（家庭 / 公司内网）开。
+      </div>
+    </section>
+
+    <!-- ============ 6 ============ -->
+    <section id="s6">
+      <h2><span class="num">六</span>设置项速查</h2>
+      <p class="lead">右侧「设置 / 离线导入」面板。带 ⚙️ 的在「网络与高级设置」折叠区里，普通用户不用碰。</p>
+
+      <table class="tbl">
+        <thead><tr><th>设置项</th><th>默认</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>AI文件保存位置</td><td>安装时选定</td><td>模型与引擎都放这里。空间不够就选大容量磁盘。</td></tr>
+          <tr><td>下载限速</td><td>不限速</td><td>可选 1 / 5 / 10 MB/s，避免下载占满整条带宽。</td></tr>
+          <tr><td>下载线路</td><td>自动测速</td><td>也可固定为 ModelScope 或 hf-mirror。</td></tr>
+          <tr><td>开机时自动启动本软件</td><td>关</td><td>勾上后随系统启动。</td></tr>
+          <tr><td>AI 自称名字</td><td>空</td><td>空 = 让模型自己回答「你是谁」；填了就按这个名字自称。</td></tr>
+          <tr><td>谁可以调用本机AI</td><td>仅本机</td><td>改成局域网后<b>必须重启服务</b>才生效。</td></tr>
+          <tr><td>接口端口</td><td>8080</td><td>改了要重启服务；<b>知识库服务内部若写死别的端口，会对不上</b>（见 §4.2）。</td></tr>
+          <tr><td>知识库服务地址</td><td><code>http://127.0.0.1:8092</code></td><td>作品一服务地址，留空用默认值。</td></tr>
+          <tr><td>智能问数服务地址</td><td><code>http://127.0.0.1:8096</code></td><td>作品二编排服务地址，留空用默认值。</td></tr>
+          <tr><td>⚙️ 代理地址</td><td>空</td><td>自动下载不可用时才需要。</td></tr>
+          <tr><td>⚙️ 日志详细程度</td><td>常规（INFO）</td><td>排查问题时可临时改成 DEBUG。</td></tr>
+          <tr><td>⚙️ 自定义运行参数</td><td>空</td><td>追加给推理引擎的原始参数，例如 <code>--threads 8</code>。<b>风险自负</b>。</td></tr>
+          <tr><td>⚙️ 导入本地模型文件</td><td>—</td><td>手头已有 <code>.gguf</code> 文件时，直接导进来，不用重新下载。</td></tr>
+        </tbody>
+      </table>
+
+      <h3>数据管理 / 清理</h3>
+      <table class="tbl">
+        <thead><tr><th>操作</th><th>影响</th></tr></thead>
+        <tbody>
+          <tr><td>打开数据文件夹 / 日志文件夹</td><td>只打开，不改动</td></tr>
+          <tr><td>一键清空所有聊天记录</td><td>删会话与消息，模型和设置不受影响。<b>不可撤销</b></td></tr>
+          <tr><td>一键卸载全部模型</td><td>自动下载的模型文件被删除；本地导入的只取消跟踪、文件保留。引擎不动。<b>不可撤销</b></td></tr>
+          <tr><td>重置到出厂设置</td><td>模型、引擎、聊天记录、设置、日志全清（二次确认）。<b>需关掉软件重新打开才生效。</b></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ============ 7 ============ -->
+    <section id="s7">
+      <h2><span class="num">七</span>遇到问题怎么办</h2>
+      <p class="lead">顺序：<b>先用内置的故障自查，再对着下面的表找。</b></p>
+
+      <h3>7.1 内置三条路</h3>
+      <ol>
+        <li><b>「故障自查」→ 开始检查</b>：逐项体检（显存、运行库、模型文件、显卡驱动、磁盘空间…），能自动修的直接给按钮。</li>
+        <li><b>「导出诊断日志（已脱敏）」</b>：一键打包日志，用于反馈问题。</li>
+        <li><b>「后端一致性校验」</b>：怀疑「换了显卡后端之后结果变味」时用。</li>
+      </ol>
+
+      <h3>7.2 常见问题对照</h3>
+      <table class="tbl">
+        <thead><tr><th>现象</th><th>多半是什么</th><th>怎么办</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>回答很慢，一条要等很久</td>
+            <td>跑在 CPU 模式，或模型对这台机器太大</td>
+            <td>看聊天区有没有「CPU 模式」提示条 → 点「恢复显卡加速」；仍不行就换更小的模型（回到第 3 步重新装）</td>
+          </tr>
+          <tr>
+            <td>启动服务时 Windows 弹窗拦截</td>
+            <td>系统防火墙 / 安全提示</td>
+            <td>选<b>「仍要运行」</b>；仍被拦就到 Windows 安全中心放行</td>
+          </tr>
+          <tr>
+            <td>下载很慢或反复失败</td>
+            <td>线路不通</td>
+            <td>「设置 → 下载线路」换成另一条；或设置里配代理；已有 gguf 文件就直接「导入本地模型」</td>
+          </tr>
+          <tr>
+            <td>改了口 / 改了局域网设置，没生效</td>
+            <td>端口是启动时绑定的</td>
+            <td>到「已安装模型」<b>先停止、再启动</b>服务</td>
+          </tr>
+          <tr>
+            <td>知识库问答一直「资料不足 / 生成失败」，但不报错</td>
+            <td>知识库服务内部的生成端端口和本软件当前端口不一致</td>
+            <td>看界面上的不一致提示，按它给的命令带 <code>--生成端</code> 重启知识库服务</td>
+          </tr>
+          <tr>
+            <td>「智能问数」显示部分链路不可达</td>
+            <td>「知识问答」那条依赖作品一（8092），它没起</td>
+            <td>另两条（数据问数、动作执行）照常可用；要用知识问答就去起 8092</td>
+          </tr>
+          <tr>
+            <td>端口在监听、进程也在，但所有请求超时</td>
+            <td>服务控制台窗口被鼠标拖选，进程的下一次输出被永久阻塞</td>
+            <td>到那个服务的窗口<b>按一下 Esc</b>，不用重启</td>
+          </tr>
+          <tr>
+            <td>日志文件找不到</td>
+            <td>文件名带日期后缀</td>
+            <td>在数据目录的 <code>logs</code> 文件夹里，形如 <code>localai.log.2026-10-16</code>（<b>不是</b> <code>localai.log</code>）</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>7.3 反馈问题时要带什么</h3>
+      <ol>
+        <li>「导出诊断日志（已脱敏）」产生的 zip。</li>
+        <li>「设置 → 关于」里的版本号（例如 0.1.6）—— <b>同一版本号可能对应不同构建，最好连安装包指纹一起给</b>。</li>
+        <li>你做了什么、期望什么、实际看到什么。</li>
+      </ol>
+    </section>
+
+    <!-- ============ 8 ============ -->
+    <section id="s8">
+      <h2><span class="num">八</span>附录：端口与路径</h2>
+
+      <h3>8.1 端口一览</h3>
+      <table class="tbl">
+        <thead><tr><th>端口</th><th>服务</th><th>归属</th><th>谁负责启动</th></tr></thead>
+        <tbody>
+          <tr><td><b>8080</b>（可改）</td><td>推理引擎 llama-server</td><td>本软件</td><td>软件自己（本机当前配置为 8000）</td></tr>
+          <tr><td>8085</td><td>重排服务</td><td>作品一 RAG-Embedding</td><td>它的 <code>scripts/启动-服务.py</code></td></tr>
+          <tr><td>8092</td><td>知识库服务</td><td>作品一</td><td>同上</td></tr>
+          <tr><td>8095</td><td>问数服务</td><td>作品二 ChatBI</td><td>它的 <code>scripts/启动-服务.py</code></td></tr>
+          <tr><td>8096</td><td>编排服务（对外唯一入口）</td><td>作品二</td><td>同上</td></tr>
+        </tbody>
+      </table>
+      <p class="footnote">前两个归属方的服务，也可以用整合演示的一条命令统一拉起（见 §4.4）。</p>
+
+      <h3>8.2 目录一览</h3>
+      <table class="tbl">
+        <thead><tr><th>东西</th><th>位置</th></tr></thead>
+        <tbody>
+          <tr><td>本软件源码</td><td><code>D:\Ivan-File\7-AI-Code\Local-AI</code></td></tr>
+          <tr><td>安装包</td><td><code>…\Local-AI\src-tauri\target\release\bundle\nsis\</code></td></tr>
+          <tr><td>模型与引擎（默认）</td><td>安装时选定的保存位置，例如 <code>D:\Ivan-File\10-LocalAI-Installer</code></td></tr>
+          <tr><td>作品一 · 知识库</td><td><code>D:\Ivan-File\7-AI-Code\RAG-Embedding</code></td></tr>
+          <tr><td>作品二 · 智能问数</td><td><code>D:\Ivan-File\7-AI-Code\ChatBI</code></td></tr>
+          <tr><td>跨仓库整合演示</td><td><code>…\AI大模型应用开发实战训练营\整合演示</code></td></tr>
+          <tr><td>日志</td><td>数据目录下的 <code>logs\</code>，文件名带日期后缀</td></tr>
+        </tbody>
+      </table>
+
+      <h3>8.3 三作品与本软件的关系</h3>
+      <table class="tbl">
+        <thead><tr><th>作品</th><th>是什么</th><th>在本软件里的入口</th></tr></thead>
+        <tbody>
+          <tr><td>作品一</td><td>企业知识库问答（检索 + 引用 + 拒答）</td><td>「聊天 → 知识库问答」</td></tr>
+          <tr><td>作品二</td><td>智能问数：制度 / 数据 / 动作三条链路</td><td>「聊天 → 智能问数」</td></tr>
+          <tr><td>作品三</td><td>本软件本身（承载前两个作品的底座）；另含一项微调实践，产物以「微调包」形式随模型交付</td><td>整个应用</td></tr>
+        </tbody>
+      </table>
+
+      <div class="note tip">
+        <b>最省事的上手路径：</b>装好 → 硬件体检 → 选「日常聊天问答」→ 装推荐列表第一个模型 → 直接开问。<br />
+        等通用对话用顺手了，再按 §4 把知识库问答和智能问数接上来。
+      </div>
+
+      <p class="stamp">本地AI模型一键部署助手 · 使用教程 · 对应版本 0.1.6</p>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  // 滚动时高亮当前目录项
+  (function () {
+    var links = Array.prototype.slice.call(document.querySelectorAll('.toc a'));
+    var targets = links.map(function (a) { return document.querySelector(a.getAttribute('href')); });
+    function onScroll() {
+      var pos = window.scrollY + 120;
+      var idx = 0;
+      for (var i = 0; i < targets.length; i++) {
+        if (targets[i] && targets[i].offsetTop <= pos) idx = i;
+      }
+      links.forEach(function (a, i) { a.classList.toggle('active', i === idx); });
+    }
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+  })();
+</script>
+</body>
+</html>

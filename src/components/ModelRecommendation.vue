@@ -13,7 +13,7 @@ function speedText(item: RecommendedModel) {
   if (item.estimated_tps === null || item.estimated_tps === undefined) {
     return `速度 ${item.speed_label}`;
   }
-  return `速度 约 ${item.estimated_tps.toFixed(1)} 字/秒`;
+  return `速度 约 ${item.estimated_tps.toFixed(1)} token/秒`;
 }
 
 /** 预估来自显存带宽 ÷ 权重体积，鼠标悬停时说明口径，避免用户误以为是实测。 */

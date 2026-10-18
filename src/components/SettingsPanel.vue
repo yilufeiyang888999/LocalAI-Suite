@@ -4,6 +4,8 @@ import { openPath } from '@tauri-apps/plugin-opener';
 import { computed, watch, ref, onMounted } from 'vue';
 import type { AppSettings, MirrorSource } from '../types';
 import { displayNameFromModelId } from '../utils/markdown';
+import { DEFAULT_KB_BASE_URL, normalizeKbBaseUrl } from '../utils/kb';
+import { DEFAULT_CHATBI_BASE_URL, normalizeChatbiBaseUrl } from '../utils/chatbi';
 import {
   clearAllChatRecords,
   getAppVersion,
@@ -34,6 +36,8 @@ const servicePort = ref(8080);
 const aiDisplayName = ref('');
 const extraArgs = ref('');
 const logLevel = ref('INFO');
+const kbBaseUrl = ref(DEFAULT_KB_BASE_URL);
+const chatbiBaseUrl = ref(DEFAULT_CHATBI_BASE_URL);
 // 实际版本号从后端读（与日志首行 version= 同源），不再写死在模板里 ——
 // 之前硬编码 "0.1.0（MVP）"，升级到 0.1.2 后界面仍显示 0.1.0，用户无法
 // 从界面确认装的是哪个包。
@@ -71,6 +75,8 @@ function syncFromProps() {
   aiDisplayName.value = props.settings?.ai_display_name ?? '';
   extraArgs.value = props.settings?.extra_launch_args ?? '';
   logLevel.value = props.settings?.log_level ?? 'INFO';
+  kbBaseUrl.value = props.settings?.kb_base_url ?? DEFAULT_KB_BASE_URL;
+  chatbiBaseUrl.value = props.settings?.chatbi_base_url ?? DEFAULT_CHATBI_BASE_URL;
 }
 
 async function chooseInstallDir() {
@@ -122,6 +128,10 @@ async function save() {
       ai_display_name: aiDisplayName.value.trim() || null,
       extra_launch_args: extraArgs.value.trim() || null,
       log_level: logLevel.value,
+      // 规范化后再存：容忍用户只填 `127.0.0.1:8092`，并去掉末尾斜杠
+      kb_base_url: normalizeKbBaseUrl(kbBaseUrl.value),
+      // 同一条纪律：规范化后再存（容忍 `127.0.0.1:8096` 简写、去掉末尾斜杠）
+      chatbi_base_url: normalizeChatbiBaseUrl(chatbiBaseUrl.value),
       // 引擎/模型路径由后端自动管理（安装、导入、切换时自动设置），
       // 这里只透传现有值，不从只读展示框取值。
       llama_server_path: props.settings.llama_server_path ?? null,
@@ -259,6 +269,30 @@ async function doResetToFactory() {
         开启后，局域网内任何人都能直接调用本机AI，且没有密码保护。请仅在可信网络（如家庭/公司内网）开启。
       </p>
       <p class="muted">固定端口后，其他程序的调用地址就不会再变。修改后需在聊天区停止再启动AI服务才生效。</p>
+    </div>
+
+    <div class="field">
+      <label>
+        知识库服务地址
+        <input v-model="kbBaseUrl" :placeholder="DEFAULT_KB_BASE_URL" />
+      </label>
+      <p class="muted">
+        「聊天」页里「知识库问答」所依赖的独立本地服务，不随本应用启动 —— 需在 RAG-Embedding 目录下运行
+        <code>python scripts/知识库服务.py</code>。留空则用 {{ DEFAULT_KB_BASE_URL }}。
+      </p>
+    </div>
+
+    <div class="field">
+      <label>
+        智能问数服务地址
+        <input v-model="chatbiBaseUrl" :placeholder="DEFAULT_CHATBI_BASE_URL" />
+      </label>
+      <p class="muted">
+        「聊天」页里「智能问数」所依赖的独立本地服务（查制度 / 查数据 / 起草单据三合一），同样不随本应用启动
+        —— 需在 ChatBI 目录下运行 <code>python scripts/启动-服务.py</code>（它管 8095 + 8096 两个端口）。
+        它的「知识问答」链路会转发给上面的知识库服务，所以那条链路要求两者都开着。
+        留空则用 {{ DEFAULT_CHATBI_BASE_URL }}。
+      </p>
     </div>
 
     <details class="advanced-settings">

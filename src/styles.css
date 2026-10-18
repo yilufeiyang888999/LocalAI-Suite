@@ -141,6 +141,9 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
 .installed-model-header h3 { margin: 0; font-size: 17px; }
 .current-badge { border-radius: 999px; background: #dff7e7; color: #1d6b34; padding: 4px 8px; font-size: 12px; font-weight: 700; }
 .update-badge { border-radius: 999px; background: #fff4de; color: #a8620a; padding: 4px 8px; font-size: 12px; font-weight: 700; }
+/* 「微调包」角标：模型旁车配置存在。与「有新版本」区分开色系 ——
+   一个是「该升级」，一个是「已带微调」，不该长得一样。 */
+.finetune-badge { border-radius: 999px; background: #e7edff; color: #2a49a8; padding: 4px 8px; font-size: 12px; font-weight: 700; }
 .update-status { margin: 8px 0 0; color: #2f6df6; font-size: 12px; line-height: 1.5; }
 .model-path { margin: 8px 0 0; color: #667085; font-size: 12px; line-height: 1.5; word-break: break-all; }
 .installed-model-card .primary-button { white-space: nowrap; }

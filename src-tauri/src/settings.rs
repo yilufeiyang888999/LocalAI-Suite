@@ -30,7 +30,36 @@ pub struct AppSettings {
     /// upstream vendor identity.
     #[serde(default)]
     pub ai_display_name: Option<String>,
+    /// 知识库问答服务的地址（作品一，**独立的 Python 进程**，见 RAG-Embedding 仓库）。
+    ///
+    /// 🔴 APP **只做探活与调用，不负责拉起那个进程** —— 它需要 Python 运行时和
+    /// 独立的模型/索引，属于另一条交付链（跨进程边界，见 CLAUDE.md「对接方式」）。
+    /// 服务未启动时，前端给出启动引导而不是静默失败。
+    ///
+    /// 默认 8092 必须与 `RAG-Embedding/scripts/知识库服务.py` 的 `监听端口` 一致；
+    /// 改那边端口时要同步这里。
+    #[serde(default = "default_kb_base_url")]
+    pub kb_base_url: String,
+    /// 智能问数 + 动作执行服务的地址（作品二 · ChatBI，**独立的 Python 进程**，见 ChatBI 仓库）。
+    ///
+    /// 🔴 与 `kb_base_url` 同一条边界：APP **只探活与调用，不负责拉起那个进程**。
+    /// 它是 8096「编排服务」—— 一个入口三条链路（知识问答 / 数据问数 / 动作执行），
+    /// 其中知识问答那条链路是**HTTP 转发**给 8092 的（作品一），所以这个地址是可用的
+    /// 前提是 8092 也在跑。服务未启动时前端给出启动引导，而不是静默失败。
+    ///
+    /// 默认 8096 必须与 `ChatBI/scripts/编排服务.py` 的 `默认端口` 一致；
+    /// 改那边端口时要同步这里。
+    #[serde(default = "default_chatbi_base_url")]
+    pub chatbi_base_url: String,
     pub instance_id: String,
+}
+
+fn default_kb_base_url() -> String {
+    "http://127.0.0.1:8092".to_string()
+}
+
+fn default_chatbi_base_url() -> String {
+    "http://127.0.0.1:8096".to_string()
 }
 
 fn default_service_host() -> String {
@@ -69,6 +98,8 @@ impl Default for AppSettings {
             llama_server_path: None,
             local_model_path: None,
             ai_display_name: None,
+            kb_base_url: default_kb_base_url(),
+            chatbi_base_url: default_chatbi_base_url(),
             instance_id: Uuid::new_v4().to_string(),
         }
     }
@@ -235,6 +266,7 @@ mod tests {
         incoming.autostart = true;
         incoming.extra_launch_args = Some("--ctx-size 8192".to_string());
         incoming.service_host = "0.0.0.0".to_string();
+        incoming.kb_base_url = "http://127.0.0.1:9999".to_string();
 
         let sanitized = sanitize_settings_update(&current, incoming);
 
@@ -246,8 +278,49 @@ mod tests {
         assert!(sanitized.autostart);
         assert_eq!(sanitized.extra_launch_args.as_deref(), Some("--ctx-size 8192"));
         assert_eq!(sanitized.service_host, "0.0.0.0");
+        assert_eq!(sanitized.kb_base_url, "http://127.0.0.1:9999");
         // And the two protected pointers still come from `current`.
         assert_eq!(sanitized.local_model_path, current.local_model_path);
         assert_eq!(sanitized.llama_server_path, current.llama_server_path);
+    }
+
+    /// 旧 `config.json` 里没有 `kb_base_url` / `chatbi_base_url`（0.1.5 及更早写的）。
+    /// 若 `#[serde(default = ...)]` 没生效，升级后**读取设置会整体失败**
+    /// ——`load_settings` 用的是 `serde_json::from_str(...)?`，是 `?` 不是 `unwrap_or_default`，
+    /// 所以少一个字段就会让 APP 起不来。这条护栏专门盯这个。
+    ///
+    /// 🔴 下面这份 JSON **照抄自真机的 `data/config.json`**（2026-10-09 取，其 mtime 早于
+    ///    本次改动、文件里确实没有这两个字段，是一份天然的真实旧配置），**不是手写近似值**。
+    ///    第一版凭想象写了两处：`"mirror_source": "Auto"`（serde 是
+    ///    `rename_all = "snake_case"`，序列化名是小写 `"auto"`）、`"extra_launch_args": null`
+    ///    （真实旧配置里是 `"--ctx-size 16384"`）。**测试数据一错，这条护栏就从没真正验证过。**
+    #[test]
+    fn legacy_config_without_kb_base_url_still_loads() {
+        let 旧配置 = r#"{
+  "install_dir": "D:\\Ivan-File\\10-LocalAI-Installer",
+  "download_speed_limit": null,
+  "mirror_source": "auto",
+  "proxy": null,
+  "log_level": "INFO",
+  "autostart": false,
+  "extra_launch_args": "--ctx-size 16384",
+  "service_host": "127.0.0.1",
+  "service_port": 8000,
+  "llama_server_path": "D:\\Ivan-File\\10-LocalAI-Installer\\engine\\backends\\llama-server-cuda.exe",
+  "local_model_path": "D:\\Ivan-File\\10-LocalAI-Installer\\models\\Spark-X2.5-4B-Q6_K\\Spark-X2.5-4B-Q6_K.gguf",
+  "ai_display_name": null,
+  "instance_id": "11111111-2222-3333-4444-555555555555"
+}"#;
+
+        let 设置: AppSettings =
+            serde_json::from_str(旧配置).expect("缺 kb_base_url 的旧配置必须仍能反序列化");
+
+        // 补默认值（这条护栏要证明的核心）
+        assert_eq!(设置.kb_base_url, "http://127.0.0.1:8092");
+        assert_eq!(设置.chatbi_base_url, "http://127.0.0.1:8096");
+        // 其余字段必须**原样读回来**，不能被默认值顶掉
+        assert_eq!(设置.service_port, 8000);
+        assert_eq!(设置.extra_launch_args.as_deref(), Some("--ctx-size 16384"));
+        assert_eq!(设置.instance_id, "11111111-2222-3333-4444-555555555555");
     }
 }

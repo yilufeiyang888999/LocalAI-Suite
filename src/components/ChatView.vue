@@ -14,6 +14,24 @@ import {
 } from '../api/tauri';
 import type { AppSettings, ChatMessage, ChatSession, RolePreset, ServiceInfo } from '../types';
 import { parseMessage, systemPromptFor } from '../utils/markdown';
+import KbCitations from './KbCitations.vue';
+import ChatbiTrace from './ChatbiTrace.vue';
+import {
+  askChatbi,
+  chatbiMetaToPlainText,
+  normalizeChatbiBaseUrl,
+  probeChatbiService,
+  toChatbiMessageMeta
+} from '../utils/chatbi';
+import type { ChatbiProbeResult } from '../utils/chatbi';
+import {
+  askKb,
+  kbMetaToPlainText,
+  normalizeKbBaseUrl,
+  probeKbService,
+  toKbMessageMeta
+} from '../utils/kb';
+import type { KbProbeResult } from '../utils/kb';
 
 const props = defineProps<{
   service: ServiceInfo | null;
@@ -32,6 +50,116 @@ const loadingHistory = ref(false);
 const error = ref<string | null>(null);
 const temperature = ref(0.7);
 let abortController: AbortController | null = null;
+
+// ---------------------------------------------------------------------------
+// 知识库模式（作品一 · 对接）
+// ---------------------------------------------------------------------------
+/**
+ * 知识库会话在 `chat_sessions.model_id` 里用这个哨兵值。
+ *
+ * 它**不是模型**：`create_chat_session` 只校验非空、不查模型表（见 `chat.rs`），
+ * 唯一用途是把知识库问答的历史与普通聊天**在同一个列表里分开显示**。
+ * 用哨兵值而不是新表，是为了不引入版本化迁移 —— 项目当时也没有迁移机制。
+ */
+const KB_SESSION_KEY = '__kb__';
+/**
+ * 智能问数会话在 `chat_sessions.model_id` 里的哨兵值。与 `KB_SESSION_KEY` 同一个理由：
+ * 它不是模型，只是把一个模式的历史与其它模式**在同一个列表里分开显示**，
+ * 从而不必引入版本化迁移。
+ */
+const CHATBI_SESSION_KEY = '__chatbi__';
+const mode = ref<'chat' | 'kb' | 'chatbi'>('chat');
+const kbBaseUrl = computed(() => normalizeKbBaseUrl(props.settings?.kb_base_url));
+const kbProbe = ref<KbProbeResult | null>(null);
+const kbBusy = ref(false);
+
+// ---------------------------------------------------------------------------
+// 智能问数 / 动作执行模式（作品二 · 对接）
+// ---------------------------------------------------------------------------
+/**
+ * 作品二对外只有**一个入口**（编排服务 8096），它背后是三条链路。
+ * 所以 APP 里只需要**一个模式**：用户不必先知道自己问的是制度类、数据类还是动作类问题
+ * —— 那是系统的责任（路由），不是用户的负担。
+ */
+const chatbiBaseUrl = computed(() => normalizeChatbiBaseUrl(props.settings?.chatbi_base_url));
+const chatbiProbe = ref<ChatbiProbeResult | null>(null);
+const chatbiBusy = ref(false);
+/**
+ * 发起动作的**角色** —— 决定「能不能做写动作」。
+ *
+ * 🔴 角色是**调用方自己填的标签**，不是认证结果。真实部署要接 SSO / 网关注入；
+ *    这里做的是「有这道关口 + 有留痕」，以及让越权这件事在界面上一眼看得到。
+ */
+const chatbiRole = ref<string>('');
+
+const 角色选项 = computed(() => chatbiProbe.value?.health?.权限?.角色 ?? []);
+
+/** 探活后把角色对齐服务端的「默认角色」（最少权限），避免界面默认给出更大权限。 */
+watch(角色选项, (列表) => {
+  if (!列表.length) return;
+  if (!chatbiRole.value || !列表.includes(chatbiRole.value)) {
+    chatbiRole.value = chatbiProbe.value?.health?.权限?.默认角色 ?? 列表[0];
+  }
+});
+
+async function 探活智能问数() {
+  chatbiBusy.value = true;
+  try {
+    chatbiProbe.value = await probeChatbiService(chatbiBaseUrl.value);
+  } finally {
+    chatbiBusy.value = false;
+  }
+}
+
+/** 输入框占位：每个模式举一个**真实可用**的例子（比「输入你想问的问题」有用得多）。 */
+const 问句占位 = computed(() => {
+  if (mode.value === 'kb') return '向知识库提问，例如：不合格品应该怎么处理？';
+  if (mode.value === 'chatbi') {
+    return '制度类「不合格品应该怎么处理？」／ 数据类「上月哪家供应商不良率最高？」／ 动作类「给东莞精诚出一份质量整改通知」';
+  }
+  return '输入你想问的问题';
+});
+
+/** 三条链路的下游是否都通。8096 活着 ≠ 三条链路都通（知识问答那条依赖 8092）。 */
+const 链路断的 = computed(() => {
+  const 链 = chatbiProbe.value?.health?.链路;
+  if (!链) return [];
+  return Object.entries(链)
+    .filter(([, v]) => v.可达 === false)
+    .map(([k]) => k);
+});
+
+/** 当前模式下"会话归属谁"：普通模式认模型，另两个模式各认自己的哨兵值。 */
+const 会话模型键 = computed(() => {
+  if (mode.value === 'kb') return KB_SESSION_KEY;
+  if (mode.value === 'chatbi') return CHATBI_SESSION_KEY;
+  return props.service?.model_id ?? null;
+});
+
+/**
+ * 知识库服务**内部**用的生成端地址 vs APP 实际在跑的端口。
+ *
+ * 🔴 这是一条真实存在的静默失败路径：知识库服务默认写死 `http://127.0.0.1:8000`，
+ * 而 APP 的 `service_port` 用户可配。不一致时服务照常 200 返回，只是每次答案都是
+ * 「资料不足 / (生成失败)」——**不报错，只是没结果**。所以必须显式核对并提示。
+ */
+const 生成端不一致 = computed(() => {
+  const 服务端 = kbProbe.value?.health?.deps?.generate;
+  const 端口 = props.service?.port;
+  if (!服务端 || !端口) return null;
+  const 抓到 = 服务端.match(/:(\d+)\s*$/);
+  if (!抓到) return null;
+  return Number(抓到[1]) === 端口 ? null : 服务端;
+});
+
+async function 探活知识库() {
+  kbBusy.value = true;
+  try {
+    kbProbe.value = await probeKbService(kbBaseUrl.value);
+  } finally {
+    kbBusy.value = false;
+  }
+}
 
 // The AI's self-reported name — opt-in. Empty unless the user set a custom
 // name in settings, in which case systemPromptFor prepends an identity clause.
@@ -78,18 +206,37 @@ const roleOptions: { value: RolePreset; label: string }[] = [
 ];
 
 watch(
-  () => props.service?.model_id,
-  async (modelId) => {
-    if (!modelId) return;
-    await refreshSessions();
-    if (!currentSession.value) await loadOrCreateSession(modelId);
+  [() => props.service?.model_id, mode],
+  async () => {
+    await 装载当前模式();
   },
   { immediate: true }
 );
 
+/** 切模式 / 换模型时重新装载：会话列表、当前会话、消息，全部按当前模式隔离。 */
+async function 装载当前模式() {
+  const 键 = 会话模型键.value;
+  currentSession.value = null;
+  messages.value = [];
+  if (!键) {
+    sessions.value = [];
+    return;
+  }
+  await refreshSessions();
+  await loadOrCreateSession(键);
+  if (mode.value === 'kb') void 探活知识库();
+  if (mode.value === 'chatbi') void 探活智能问数();
+}
+
 async function refreshSessions() {
   try {
-    sessions.value = await getChatSessions();
+    const 全部 = await getChatSessions();
+    // 三种模式的历史分开显示：各自只看到自己的会话，互不混入
+    sessions.value = 全部.filter((会话) => {
+      if (mode.value === 'kb') return 会话.model_id === KB_SESSION_KEY;
+      if (mode.value === 'chatbi') return 会话.model_id === CHATBI_SESSION_KEY;
+      return 会话.model_id !== KB_SESSION_KEY && 会话.model_id !== CHATBI_SESSION_KEY;
+    });
   } catch (err) {
     error.value = String(err);
   }
@@ -99,7 +246,7 @@ async function loadOrCreateSession(modelId: string) {
   loadingHistory.value = true;
   error.value = null;
   try {
-    sessions.value = await getChatSessions();
+    await refreshSessions();
     currentSession.value = sessions.value.find((session) => session.model_id === modelId) ?? null;
     if (!currentSession.value) {
       currentSession.value = await createChatSession(modelId);
@@ -128,12 +275,18 @@ async function selectSession(session: ChatSession) {
 }
 
 async function newSession() {
-  if (!props.service?.model_id) {
-    error.value = 'AI服务还没有启动，无法新建对话。';
+  const 键 = 会话模型键.value;
+  if (!键) {
+    error.value =
+      mode.value === 'kb'
+        ? '知识库服务还没连上，无法新建对话。'
+        : mode.value === 'chatbi'
+          ? '智能问数服务还没连上，无法新建对话。'
+          : 'AI服务还没有启动，无法新建对话。';
     return;
   }
   try {
-    const session = await createChatSession(props.service.model_id, currentRole.value);
+    const session = await createChatSession(键, currentRole.value);
     sessions.value = [session, ...sessions.value];
     currentSession.value = session;
     messages.value = [];
@@ -203,9 +356,11 @@ async function copyText(text: string) {
 }
 
 async function send() {
+  if (mode.value === 'kb') return sendKb();
+  if (mode.value === 'chatbi') return sendChatbi();
   if (!input.value.trim() || sending.value) return;
   if (!props.service?.port || !props.service.model_id) {
-    error.value = 'AI服务还没有启动，请先完成安装或在设置中配置本地运行引擎。';
+    error.value = 'AI服务还没有启动，请先完成安装或在设置中运行本地AI服务。';
     return;
   }
   if (!currentSession.value) {
@@ -286,6 +441,129 @@ async function send() {
     }
   }
 }
+
+/**
+ * 知识库问答。
+ *
+ * 用独立函数而不是在 `send()` 里塞 if：两条链路的**失败模式完全不同**
+ * （一个失败于模型服务，一个失败于检索服务），混在一起后错误提示只能含糊地说"失败"，
+ * 用户不知道该修哪一头。
+ *
+ * 这里是**非流式** —— 一次拿全 `answer + citations`。检索必须先跑完才有料给生成端，
+ * 本来也不存在"边检索边出字"；代价是这几秒界面只能转圈。
+ */
+async function sendKb() {
+  if (!input.value.trim() || sending.value) return;
+  // 连不上就别发 —— 直接给引导，而不是让 fetch 抛一个语焉不详的网络错误
+  if (!kbProbe.value?.ok) {
+    error.value = `知识库服务没连上（${kbProbe.value?.reason ?? '尚未检测'}）。请按上方提示启动它，或到设置里改地址。`;
+    return;
+  }
+  const 问句 = input.value.trim();
+  if (!currentSession.value) {
+    await loadOrCreateSession(KB_SESSION_KEY);
+  }
+  if (!currentSession.value) return;
+
+  const session = currentSession.value;
+  messages.value.push({ role: 'user', content: 问句 });
+  messages.value.push({ role: 'assistant', content: '' });
+  const 助手消息 = messages.value[messages.value.length - 1];
+  input.value = '';
+  sending.value = true;
+  error.value = null;
+  abortController = new AbortController();
+
+  try {
+    await saveChatMessage(session.id, 'user', 问句);
+    const 答案 = await askKb(kbBaseUrl.value, 问句, abortController.signal);
+    助手消息.content = (答案.answer ?? '').trim() || '（空）';
+    助手消息.kb = toKbMessageMeta(答案);
+  } catch (错) {
+    if ((错 as Error)?.name !== 'AbortError') {
+      error.value = `知识库问答失败：${String(错)}`;
+    }
+  } finally {
+    sending.value = false;
+    abortController = null;
+    if (助手消息.content.trim() && 助手消息.kb) {
+      // 落库只存纯文本（表里没有放引用的列）—— 失败不该让界面上的答案消失
+      try {
+        await saveChatMessage(session.id, 'assistant', kbMetaToPlainText(助手消息.content, 助手消息.kb));
+      } catch {
+        /* 落库尽力而为 */
+      }
+    } else if (!助手消息.content.trim()) {
+      messages.value = messages.value.filter((消息) => 消息 !== 助手消息);
+    }
+  }
+}
+
+/**
+ * 智能问数 / 动作执行。
+ *
+ * 与 `sendKb` 分开成独立函数，理由同作品一那条：**三条链路的失败模式完全不同**
+ * （检索不到 / 口径错 / 单据依据不切题），混在一个函数里错误提示只能含糊说「失败」。
+ *
+ * 🔴 **越权（HTTP 403）在这里是正常返回，不是异常。** 服务端把 403 和 200 都当
+ *    「带完整应答的业务结论」，前端照常渲染 —— 越权单独一块红框（见 ChatbiTrace），
+ *    与「依据不切题」同理：这类问题**表面上没有任何异常**，混在正文里就没人会注意到。
+ */
+async function sendChatbi() {
+  if (!input.value.trim() || sending.value) return;
+  // 连不上就别发 —— 直接给引导，而不是让 fetch 抛一个语焉不详的网络错误
+  if (!chatbiProbe.value?.ok) {
+    error.value = `智能问数服务没连上（${chatbiProbe.value?.reason ?? '尚未检测'}）。请按上方提示启动它，或到设置里改地址。`;
+    return;
+  }
+  const 问句 = input.value.trim();
+  if (!currentSession.value) {
+    await loadOrCreateSession(CHATBI_SESSION_KEY);
+  }
+  if (!currentSession.value) return;
+
+  const session = currentSession.value;
+  messages.value.push({ role: 'user', content: 问句 });
+  messages.value.push({ role: 'assistant', content: '' });
+  const 助手消息 = messages.value[messages.value.length - 1];
+  input.value = '';
+  sending.value = true;
+  error.value = null;
+  abortController = new AbortController();
+
+  try {
+    await saveChatMessage(session.id, 'user', 问句);
+    const 应答 = await askChatbi(
+      chatbiBaseUrl.value,
+      问句,
+      chatbiRole.value || chatbiProbe.value?.health?.权限?.默认角色 || '操作员',
+      abortController.signal
+    );
+    助手消息.content = (应答.回答 ?? '').trim() || '（空）';
+    助手消息.chatbi = toChatbiMessageMeta(应答);
+  } catch (错) {
+    if ((错 as Error)?.name !== 'AbortError') {
+      error.value = `智能问数失败：${String(错)}`;
+    }
+  } finally {
+    sending.value = false;
+    abortController = null;
+    if (助手消息.content.trim() && 助手消息.chatbi) {
+      // 落库只存纯文本（表里没有放轨迹的列）—— 失败不该让界面上的答案消失
+      try {
+        await saveChatMessage(
+          session.id,
+          'assistant',
+          chatbiMetaToPlainText(助手消息.content, 助手消息.chatbi)
+        );
+      } catch {
+        /* 落库尽力而为 */
+      }
+    } else if (!助手消息.content.trim()) {
+      messages.value = messages.value.filter((消息) => 消息 !== 助手消息);
+    }
+  }
+}
 </script>
 
 <template>
@@ -294,13 +572,116 @@ async function send() {
       <span class="step-badge">5</span>
       <div>
         <h2>聊天</h2>
-        <p>服务启动后即可在这里和本地AI对话，聊天记录会保存在本机。</p>
+        <p>
+          直接对话，或让本机助手查制度、查数据、起草单据（后两者会给出依据与执行轨迹）。
+          聊天记录保存在本机。
+        </p>
       </div>
     </div>
-    <div class="chat-status" :class="props.service?.status">
+
+    <div class="mode-switch">
+      <button class="mode-chip" :class="{ active: mode === 'chat' }" @click="mode = 'chat'">
+        通用对话
+      </button>
+      <button class="mode-chip" :class="{ active: mode === 'kb' }" @click="mode = 'kb'">
+        知识库问答
+      </button>
+      <button class="mode-chip" :class="{ active: mode === 'chatbi' }" @click="mode = 'chatbi'">
+        智能问数
+      </button>
+    </div>
+
+    <!-- 知识库服务状态。未连接时必须给出「怎么启动」—— 只说失败等于没说。 -->
+    <div v-if="mode === 'kb'" class="kb-status" :class="kbProbe?.ok ? 'ok' : 'down'">
+      <template v-if="kbProbe?.ok">
+        <div class="kb-status-head">
+          <span>
+            已连接 <code>{{ kbBaseUrl }}</code> · {{ kbProbe.health?.docs }} 份文档 /
+            {{ kbProbe.health?.blocks }} 块 · {{ kbProbe.health?.chain }}
+          </span>
+          <button class="secondary-button" :disabled="kbBusy" @click="探活知识库">
+            {{ kbBusy ? '检测中' : '重新检测' }}
+          </button>
+        </div>
+      </template>
+      <template v-else>
+        <div class="kb-status-head">
+          <strong>知识库服务未连接</strong>
+          <button class="secondary-button" :disabled="kbBusy" @click="探活知识库">
+            {{ kbBusy ? '检测中' : '重新检测' }}
+          </button>
+        </div>
+        <p v-if="kbProbe?.reason" class="kb-status-reason">原因：{{ kbProbe.reason }}</p>
+        <p class="kb-status-help">
+          它是一个独立的本地服务（不随本 APP 启动），需要在 RAG-Embedding 目录下单独运行：
+        </p>
+        <code class="kb-cmd">python scripts/知识库服务.py</code>
+        <p class="kb-status-help">
+          地址当前为 <code>{{ kbBaseUrl }}</code>，可在右侧「设置」里修改。
+        </p>
+      </template>
+      <div v-if="生成端不一致" class="kb-mismatch">
+        它现在用的生成端是 <code>{{ 生成端不一致 }}</code>，而本机 AI 服务在
+        <code>http://127.0.0.1:{{ props.service?.port }}</code>。
+        不一致时提问会一直得到「资料不足 / 生成失败」（**不会报错**）。按实际端口重启它：
+        <code>--生成端 http://127.0.0.1:{{ props.service?.port }}</code>
+      </div>
+    </div>
+
+    <!-- 智能问数服务状态。与知识库同一条纪律：未连接时必须给出「怎么启动」，只说失败等于没说。 -->
+    <div v-if="mode === 'chatbi'" class="kb-status" :class="chatbiProbe?.ok ? 'ok' : 'down'">
+      <template v-if="chatbiProbe?.ok">
+        <div class="kb-status-head">
+          <span>
+            已连接 <code>{{ chatbiBaseUrl }}</code> · 编排服务 v{{ chatbiProbe.health?.版本 }} · 链路
+            <template v-if="链路断的.length">部分可达（缺 {{ 链路断的.join('、') }}）</template>
+            <template v-else>三条全通</template>
+          </span>
+          <button class="secondary-button" :disabled="chatbiBusy" @click="探活智能问数">
+            {{ chatbiBusy ? '检测中' : '重新检测' }}
+          </button>
+        </div>
+        <!--
+          🔴 「服务在跑」不等于「三条链路都通」：知识问答那条是 HTTP 转发给 8092（作品一）的，
+             8092 没起时 8096 照样 200。所以必须逐条显示，不能只看服务在不在。
+        -->
+        <p v-if="链路断的.length" class="cb-partial">
+          下游不可达：<code v-for="名 in 链路断的" :key="名">{{ 名 }}</code>
+          —— 「知识问答」依赖 8092（作品一，去 RAG-Embedding 目录用它的启动器起）。
+          缺它只是这一条链路不可用，另外两条照常。
+        </p>
+        <div class="cb-role-row">
+          <span>发起角色</span>
+          <select v-model="chatbiRole" class="cb-role">
+            <option v-for="名 in 角色选项" :key="名" :value="名">{{ 名 }}</option>
+          </select>
+          <span class="cb-role-hint">
+            决定能不能提交申请 / 对外发文。角色不够时服务端回 403 且**不生成任何单据**。
+          </span>
+        </div>
+      </template>
+      <template v-else>
+        <div class="kb-status-head">
+          <strong>智能问数服务未连接</strong>
+          <button class="secondary-button" :disabled="chatbiBusy" @click="探活智能问数">
+            {{ chatbiBusy ? '检测中' : '重新检测' }}
+          </button>
+        </div>
+        <p v-if="chatbiProbe?.reason" class="kb-status-reason">原因：{{ chatbiProbe.reason }}</p>
+        <p class="kb-status-help">
+          它是一个独立的本地服务（不随本 APP 启动），需要在 ChatBI 目录下单独运行：
+        </p>
+        <code class="kb-cmd">python scripts/启动-服务.py</code>
+        <p class="kb-status-help">
+          地址当前为 <code>{{ chatbiBaseUrl }}</code>，可在右侧「设置」里修改。
+        </p>
+      </template>
+    </div>
+
+    <div v-if="mode === 'chat'" class="chat-status" :class="props.service?.status">
       {{ props.service?.message ?? 'AI服务尚未启动。' }}
     </div>
-    <div v-if="apiEndpoint" class="api-endpoint">
+    <div v-if="mode === 'chat' && apiEndpoint" class="api-endpoint">
       <div class="api-endpoint-title">其他程序调用本机AI的地址（兼容 OpenAI 接口）</div>
       <div class="api-endpoint-row">
         <span class="api-label">本机</span>
@@ -351,7 +732,7 @@ async function send() {
 
       <div class="chat-main">
         <div class="chat-toolbar">
-          <div class="role-picker">
+          <div v-if="mode === 'chat'" class="role-picker">
             <button
               v-for="role in roleOptions"
               :key="role.value"
@@ -363,13 +744,17 @@ async function send() {
               {{ role.label }}
             </button>
           </div>
-          <div class="temperature">
+          <div v-if="mode === 'chat'" class="temperature">
             <span>更严谨</span>
             <input v-model.number="temperature" type="range" min="0" max="1" step="0.05" />
             <span>更有创意</span>
           </div>
+          <span v-if="mode === 'kb'" class="kb-hint">问答不带上下文，每次都是独立检索</span>
+          <span v-if="mode === 'chatbi'" class="kb-hint">
+            一个入口三种问题：制度类 / 数据类 / 动作类。不带上下文，每次独立判断。
+          </span>
           <button class="link-button" :disabled="!currentSession || !messages.length" @click="clearContext">
-            清空上下文
+            {{ mode === 'chat' ? '清空上下文' : '清空问答记录' }}
           </button>
         </div>
 
@@ -402,13 +787,20 @@ async function send() {
                   <pre><code>{{ block.code }}</code></pre>
                 </div>
               </template>
-              <span v-if="sending && index === messages.length - 1 && !message.content" class="typing">正在思考…</span>
+              <KbCitations v-if="message.kb" :meta="message.kb" />
+              <ChatbiTrace v-if="message.chatbi" :meta="message.chatbi" />
+              <span v-if="sending && index === messages.length - 1 && !message.content" class="typing">
+                {{ mode === 'kb' ? '正在检索并生成…' : mode === 'chatbi' ? '正在路由并取数…' : '正在思考…' }}
+              </span>
             </div>
           </div>
         </div>
 
         <form class="chat-input" @submit.prevent="send">
-          <input v-model="input" placeholder="输入你想问的问题" />
+          <input
+            v-model="input"
+            :placeholder="问句占位"
+          />
           <button v-if="sending" type="button" class="secondary-button" @click="stopGeneration">停止</button>
           <button class="primary-button" :disabled="sending">{{ sending ? '生成中' : '发送' }}</button>
         </form>
@@ -419,6 +811,111 @@ async function send() {
 </template>
 
 <style scoped>
+.mode-switch {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+.mode-chip {
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: transparent;
+  border-radius: 999px;
+  padding: 5px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.mode-chip.active {
+  background: rgba(99, 102, 241, 0.15);
+  border-color: rgba(99, 102, 241, 0.5);
+  font-weight: 600;
+}
+.kb-status {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.kb-status.ok {
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  color: #065f46;
+}
+.kb-status.down {
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(217, 119, 6, 0.3);
+  color: #92400e;
+}
+.kb-status-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.kb-status code,
+.kb-cmd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: rgba(0, 0, 0, 0.07);
+  padding: 1px 6px;
+  border-radius: 4px;
+  user-select: all;
+}
+.kb-cmd {
+  display: inline-block;
+  padding: 6px 10px;
+}
+.kb-status-reason,
+.kb-status-help {
+  margin: 0;
+  opacity: 0.9;
+}
+.kb-mismatch {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(146, 64, 14, 0.35);
+}
+.kb-hint {
+  font-size: 12px;
+  opacity: 0.7;
+}
+.cb-partial {
+  margin: 0;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(146, 64, 14, 0.35);
+}
+.cb-partial code,
+.cb-role {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.cb-partial code {
+  background: rgba(0, 0, 0, 0.07);
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin: 0 2px;
+}
+.cb-role-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(6, 95, 70, 0.25);
+}
+.cb-role {
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  border-radius: 6px;
+  padding: 3px 8px;
+  background: rgba(255, 255, 255, 0.6);
+  font-size: 13px;
+}
+.cb-role-hint {
+  font-size: 12px;
+  opacity: 0.75;
+}
 .api-endpoint {
   display: flex;
   flex-direction: column;

@@ -26,6 +26,12 @@ pub struct AppStateInner {
     /// switch so the loop exits on its next iteration. The field is `None`
     /// when no watchdog is currently running.
     pub watchdog_stop: Option<Arc<AtomicBool>>,
+    /// 上一次「后端一致性自检被强制放行」时看到的来源（`None` = 上一次没有放行）。
+    ///
+    /// **P3-5**：可用性结论每刷新一次就会重算一次，而放行 WARN 原先每次都打，
+    /// 同一个状态能刷出好几条一样的日志。这里记下上次状态，**只在状态变化时打**。
+    /// 但两个方向的变化都要留痕 —— 放行 → WARN，解除 → INFO，**绝不能静默**。
+    pub 强制放行上次来源: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -64,6 +70,7 @@ impl AppState {
                 data_dir,
                 db_path,
                 watchdog_stop: None,
+                强制放行上次来源: None,
             })),
         }
     }

@@ -342,6 +342,156 @@ fn resolve_kv_profile(
     }
 }
 
+/// 取「本次启动要用的模型元数据」：**清单 → 数据库 → 磁盘**三级逐级回退。
+///
+/// 🔴 **P2-11（2026-10-16 第一次修复）**：`catalog::effective_models` 只由「内置
+/// 清单 + 在线清单缓存」拼成，**从不含 `is_imported = 1` 的导入模型** —— 而导入
+/// 模型的 id 形如 `local-<文件主名>`，在那里必然查不到。修复前这里只查清单，于是
+/// 导入模型的元数据恒为 `None`，启动参数（`-ngl` / 上下文）直接落到
+/// `DEFAULT_CUDA_PARAMS`：本机 8G 卡与虚机 16G 卡**算出同一组 24 层 / 4096**
+/// （两台机器、两个不同模型，同日复现），P100 的 16 GB 只用到 6424 MiB。
+///
+/// 🔴 **P2-11 续二（同日第二次修复）**：补上第二级之后，P100 上**照旧** 24 层 /
+/// 4096 —— 因为「库里查得到这一行」本身还是个**假设**。真实用法是把 `.gguf` 丢进
+/// `models/<目录>/` 再由界面扫描发现它：`installed_model_info` 算得出 id、UI 也
+/// 拿得到，**但没有任何一处把它写进库**（`switch_installed_model` 只设置路径与
+/// 当前模型指针，不落库）。于是两级全落空，而且**全程静默** —— `find_model`
+/// 查不到是「正常结果」不是错误，`Ok(None)` 分支不打日志，日志里与「一切正常」
+/// 同形。所以第三级改为直接读**磁盘上的文件本身**
+/// （见 `model_repo::从文件读取模型元数据`），并在第二级落空时补一条 DEBUG，
+/// 把试过的候选 id 一并打出来 —— 否则「库里有行但 id 是第三种写法」这种最难查的
+/// 失配，在日志里永远不露头。
+///
+/// **回落失败 ≠ 启动失败**：库读不出来只当「未知模型」，退回 `DEFAULT_CUDA_PARAMS`
+/// —— 那是本函数存在之前的既有行为，不会更坏；但**必须留一条 WARN**，否则
+/// 「回落生效」与「回落没生效」在日志里同形。
+///
+/// 抽成独立函数是为了能被单测直接钉住。判据有四条，缺一条都会漏掉一类真问题：
+/// ① 导入 id 能从库里取回完整元数据；② **库里没有行**、磁盘上有文件时也能取回；
+/// ③ 内置 id 的结果一字不变；④ 库里磁盘都没有时老老实实返回 `None`（不许乱猜）。
+fn 查找启动模型(
+    data_dir: &Path,
+    db_path: &Path,
+    install_dir: &Path,
+    current_model_path: Option<&Path>,
+    model_id: &str,
+) -> Option<crate::models::ModelMetadata> {
+    // ① 内置 / 在线清单。
+    if let Some(model) = crate::catalog::effective_models(data_dir)
+        .into_iter()
+        .find(|m| m.id == model_id)
+    {
+        return Some(model);
+    }
+    // ② 数据库（含老库 `imported-…` 写法的兼容，见 `model_repo::候选标识`）。
+    match crate::model_repo::find_model(db_path, model_id) {
+        Ok(Some(model)) => {
+            // 这条日志是「回落真的发生了」的判据 —— 它出现，就说明模型不在
+            // 清单里（内置模型永远走不到这里）。参数也一并记下，因为下一次
+            // 排查「-ngl 为什么是这个值」时，先要看的就是元数据对不对。
+            tracing::info!(
+                model_id = %model.id,
+                file_size_mb = model.file_size_mb,
+                context_length = model.context_length,
+                parameters_raw = model.parameters_raw,
+                "模型不在内置/在线清单里，已从本地库取回完整元数据用于计算启动参数"
+            );
+            return Some(model);
+        }
+        // 查不到是**正常结果**（模型可能压根没进过库），但必须留痕。
+        Ok(None) => {
+            tracing::debug!(
+                model_id = %model_id,
+                试过的候选 = ?crate::model_repo::候选标识(model_id),
+                "库里没有这个模型的元数据行，转从磁盘上的 GGUF 兜底"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                model_id = %model_id,
+                error = %err,
+                "从本地库读取模型元数据失败，按未知模型处理（启动参数将用兜底默认值）"
+            );
+        }
+    }
+    // ③ 磁盘：文件在，元数据就一定有 —— 这是最后的事实来源。
+    for 路径 in 磁盘候选路径(install_dir, current_model_path, model_id) {
+        if let Some(model) = crate::model_repo::从文件读取模型元数据(model_id, &路径) {
+            tracing::info!(
+                model_id = %model.id,
+                路径 = %路径.display(),
+                file_size_mb = model.file_size_mb,
+                context_length = model.context_length,
+                parameters_raw = model.parameters_raw,
+                "清单与本地库里都没有这个模型，已改从磁盘上的 GGUF 现场读取元数据"
+            );
+            return Some(model);
+        }
+    }
+    None
+}
+
+/// 按 `model_id` 反查磁盘上可能的 `.gguf` 落点（P2-11 续二的第 ③ 级）。
+///
+/// 命名口径与 `models::installed_model_info` **逐字一致**（同一个 `导入模型标识`）：
+/// 两边只要差一个字符，就会出现「UI 拿到的 id 与本函数算的 id 谁也不认谁」——
+/// 这类失配在日志里只表现为「没查到」，最难定位，所以宁可共用同一个函数。
+fn 磁盘候选路径(
+    install_dir: &Path,
+    current_model_path: Option<&Path>,
+    model_id: &str,
+) -> Vec<PathBuf> {
+    let mut 候选: Vec<PathBuf> = Vec::new();
+
+    // ① 当前正在用的那个文件 —— 用户刚在界面上选过它，命中率最高，也最可信。
+    //    **必须排在目录扫描之前，且不能被排序打乱**：一个目录里可能同时躺着
+    //    同名的不同量化档，一旦选错那份，算出的启动参数就与用户选的模型不符。
+    if let Some(路径) = current_model_path.filter(|路径| 主名对得上(路径, model_id)) {
+        候选.push(路径.to_path_buf());
+    }
+
+    // ② 托管目录 `models/<目录>/<文件>.gguf`：手工拷进来、靠扫描发现的那种模型
+    //    就落在这里，而库里没有它们的行 —— 本函数要救的正是这一种。
+    let mut 目录候选: Vec<PathBuf> = Vec::new();
+    if let Ok(目录们) = std::fs::read_dir(install_dir.join("models")) {
+        for 目录 in 目录们.flatten() {
+            let Ok(文件们) = std::fs::read_dir(目录.path()) else {
+                continue;
+            };
+            for 文件 in 文件们.flatten() {
+                let 路径 = 文件.path();
+                let 是gguf = 路径
+                    .extension()
+                    .and_then(|后缀| 后缀.to_str())
+                    .is_some_and(|后缀| 后缀.eq_ignore_ascii_case("gguf"));
+                if 是gguf && 主名对得上(&路径, model_id) {
+                    目录候选.push(路径);
+                }
+            }
+        }
+    }
+    // 排序 + 去重**只作用于目录扫描这一段**：目录枚举顺序不保证稳定，不排的话
+    // 同一台机器两次启动可能选到不同文件，日志就不可比了。① 的位置不受影响。
+    目录候选.sort();
+    目录候选.dedup();
+    for 路径 in 目录候选 {
+        if !候选.contains(&路径) {
+            候选.push(路径);
+        }
+    }
+
+    候选
+}
+
+/// 文件主名经 `导入模型标识` 之后是否就是这个 id（与扫描侧同一口径）。
+///
+/// 只比主名、不比后缀：`<主名>.gguf` 与 `<主名>.GGUF` 是同一个模型。
+fn 主名对得上(path: &Path, model_id: &str) -> bool {
+    path.file_stem()
+        .and_then(|主名| 主名.to_str())
+        .is_some_and(|主名| crate::models::导入模型标识(主名) == model_id)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineBackend {
     Cpu,
@@ -364,7 +514,19 @@ pub async fn start_model_service(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> AppResult<ServiceInfo> {
-    start_service_core(&model_id, &app, &state).await
+    let 结果 = start_service_core(&model_id, &app, &state).await;
+    // 启动失败此前**一条日志都不留**（错误只回给前端弹窗），日志里于是出现
+    // 「有 `starting llama-server`、却没有对应的 `llama-server running`」这种
+    // 断头现场 —— 2026-10-16 P100 的日志里就有一例（`qwen3_1_7b_light`：
+    // 起了、没起来、也不知道为什么）。补一条 WARN，让原因在日志里可查。
+    if let Err(错误) = &结果 {
+        tracing::warn!(
+            model_id = %model_id,
+            错误 = %错误,
+            "启动服务失败（前端同时会收到这条错误）"
+        );
+    }
+    结果
 }
 
 /// Start the local `llama-server` for `model_id`, falling back to CPU safe mode
@@ -420,12 +582,25 @@ pub async fn start_service_core(
         "service_status_changed",
         &service_status(state),
     );
-    let (host, extra_args) = {
+    let host = {
         let inner = state.inner.lock().expect("state lock poisoned");
-        let host = inner.settings.service_host.clone();
-        let extra = parse_extra_args(inner.settings.extra_launch_args.as_deref().unwrap_or(""));
-        (host, extra)
+        inner.settings.service_host.clone()
     };
+    // 附加参数只在**这里**算一次：三个启动分支（激进参数 / 保守参数 / CPU 兜底）
+    // 共用同一份，且配置文件有问题时**在任何一次拉起之前**就失败，不会先起一次再报错。
+    let (extra_args, 旁车生效项) = 推导附加参数(state, &model_path)?;
+    if !旁车生效项.is_empty() {
+        // 🔴 「已并入本次启动命令行」这句**只在这条路径上说** —— 这里是真的要起进程。
+        // 接管路径（`recover_service`）也调同一个推导函数，但那里没有起进程、没有
+        // 往任何命令行里加参数。2026-10-16 实机踩到：那行原先写在被共用的
+        // `model_sidecar::读取旁车参数` 里，于是接管日志里出现了「已…附加」，
+        // 而那个进程根本不是本次起的 —— 日志宣称了没发生的动作。
+        tracing::info!(
+            模型 = %model_path.display(),
+            附加参数 = ?旁车生效项,
+            "已把模型旁车配置并入本次启动命令行（自定义对话模板 / LoRA 适配器）"
+        );
+    }
     let configured_port = {
         let inner = state.inner.lock().expect("state lock poisoned");
         inner.settings.service_port
@@ -534,13 +709,25 @@ pub async fn start_service_core(
             .filter(|free| *free > 0.0)
             .unwrap_or(total_vram);
         tracing::info!(total_vram_gb = total_vram, usable_vram_gb = vram, "computing GPU launch params from usable VRAM");
-        let data_dir = {
+        let (data_dir, db_path, current_model_path) = {
             let inner = state.inner.lock().expect("state lock poisoned");
-            inner.data_dir.clone()
+            (
+                inner.data_dir.clone(),
+                inner.db_path.clone(),
+                inner.settings.local_model_path.clone(),
+            )
         };
-        let model = crate::catalog::effective_models(&data_dir)
-            .into_iter()
-            .find(|m| m.id == model_id);
+        // 🔴 P2-11：这里**必须**走「清单 → 数据库 → 磁盘」三级查找。
+        // 只查清单的话，导入模型（清单里天生没有它们）恒拿到 None；
+        // 只加数据库还不够 —— 扫目录发现的模型（手工把 gguf 放进 models/）
+        // **从不进库**，两级仍然全落空、且全程静默。三层缺一不可。
+        let model = 查找启动模型(
+            &data_dir,
+            &db_path,
+            &install_dir,
+            current_model_path.as_deref(),
+            model_id,
+        );
         match (vram > 0.0, model) {
             (true, Some(m)) => {
                 // 权重取真实文件大小，KV 现读 GGUF 层结构，两者都是 GiB。
@@ -635,9 +822,21 @@ pub async fn start_service_core(
                     "显卡加速没能生效，当前用的是普通（CPU）速度，生成会明显偏慢。\
                      可以点「恢复显卡加速」重试，或在设置里换一种加速方式。"
                         .to_string(),
+                    &extra_args,
                 );
             }
-            set_running(app, state, child, false, "AI服务已启动，可以开始聊天。".to_string())
+            // 【B-1 新增】档 2：`--n-gpu-layers 999` 只是**请求**。
+            //
+            // 档 1 的阈值固定 256 MiB，只抓得到「完全没上卡」；显存不足时引擎会
+            // **静默**少卸几层，启动成功、健康检查 200、速度掉一半，外面看不出来。
+            // 这里按「计划全量却装不下权重」补这一段灰色地带。
+            //
+            // 只 WARN 不阻断：部分卸载是「能跑但慢」，判成失败会把可用变不可用。
+            // 位置在健康检查之后（`:812` 已过）⇒ 权重早已加载完，读显存不会读到半载值。
+            if backend.is_gpu() {
+                核对计划全量卸载(&model_path, params.n_gpu_layers, backend).await;
+            }
+            set_running(app, state, child, false, "AI服务已启动，可以开始聊天。".to_string(), &extra_args)
         }
         Err(error) => {
             if backend == EngineBackend::Cpu {
@@ -657,10 +856,34 @@ pub async fn start_service_core(
                 kv_quant: false,
             };
             if conservative != params {
-                tracing::warn!(%model_id, backend = ?backend, error = %error, "GPU launch failed; retrying with conservative GPU params");
+                // 🔴 参数必须写进日志（P2-14）。`llama-server running` 那一行**不带**
+                // 启动参数，所以降级成功之后「用的是保守参数」在外面看不出来 ——
+                // 而保守参数把上下文压到 4096，肉眼聊天时完全无感，只有遇到长文才暴露。
+                tracing::warn!(
+                    %model_id,
+                    backend = ?backend,
+                    error = %error,
+                    gpu_layers = ?conservative.n_gpu_layers,
+                    ctx_size = conservative.ctx_size,
+                    "GPU launch failed; retrying with conservative GPU params"
+                );
                 set_starting(app, state, model_id, &host, port, false);
                 if let Ok(child) = launch_service(&server_path, &model_path, &host, port, &conservative, &extra_args, startup_timeout).await {
-                    return set_running(app, state, child, false, "AI服务已启动，可以开始聊天。".to_string());
+                    // 成功也要**明确记成「这是一次降级」**：否则「自动调参正常」与
+                    // 「降级到 4096 才起来」在日志里同形（本项目铁律：降级/跳过
+                    // 必须与「通过」可区分）。前端文案同样区分开。
+                    tracing::info!(
+                        %model_id,
+                        gpu_layers = ?conservative.n_gpu_layers,
+                        ctx_size = conservative.ctx_size,
+                        "已用**保守参数**启动（自动调参那一组没跑起来）—— 上下文被压到 4096，长文场景会明显变短"
+                    );
+                    // 【B-1】保守参数**仍是 999 层**（只压上下文），所以这条判据在这里同样适用 ——
+                    // 而且更需要：能走到这里说明激进那组已经起不来了，显存本来就紧。
+                    // ⚠️ 不走上面那条 812 的「没上卡」分支（它 return 了），两条不是重复：
+                    //    那条报的是「显存停在空载」，这条报的是「上了卡但没全上去」。
+                    核对计划全量卸载(&model_path, conservative.n_gpu_layers, backend).await;
+                    return set_running(app, state, child, false, "AI服务已启动，但用的是更保守的参数（上下文更短）。".to_string(), &extra_args);
                 }
             }
 
@@ -716,6 +939,7 @@ pub async fn start_service_core(
                     child,
                     true,
                     "显卡加速暂时没启动成功，已切换到更稳妥的 CPU 模式。".to_string(),
+                    &extra_args,
                 ),
                 Err(safe_error) => {
                     let info = set_failed(app, state, safe_error.to_string());
@@ -770,6 +994,27 @@ pub fn stop_service_core(app: &AppHandle, state: &AppState) -> ServiceInfo {
     info
 }
 
+/// 现在该不该去读持久化记录、尝试接管一个「上次留下的」进程？
+///
+/// 🔴 **本会话已经在管服务时不许接管**（P2-13，2026-10-16 P100 实机抓到）。
+/// 反例就是那天 14:50 的日志：前端重新加载页面时会**再调一次** `recover_service`，
+/// 而它只看**持久化记录** —— 那条记录在本会话写出新值之前，还是**上一个会话**的旧值。
+/// 偏巧本会话正在起一个新服务（`Starting`、端口已 listening），健康探测于是通过：
+/// 一个**正在加载的新进程**被认成「上次留下的旧进程」。同一次竞态的四个指纹：
+///
+/// 1. `reattached … model_id=local-Ornith-1.5-9B-Q8_0` 与同一时刻回执核对的
+///    `期望=…\qwen3_1_7b_light\…` **互相矛盾**（状态里最终留下的是错的那个）；
+/// 2. 那个刚起的服务**从没打过自己的** `llama-server running model_id=Some("qwen3_1_7b_light")`；
+/// 3. 4 秒内出现**两个** `service watchdog spawned`，其中一个紧接着退出；
+/// 4. 随后 `llama-server running model_id=Some("local-Ornith…")` 报的是**旧模型名**，
+///    而进程其实是新的那个 ⇒ 持久化记录被写成「旧 model_id + 新 pid」。
+///
+/// `Failed` **不在**排除之列：既然起步就失败，本会话手里没有服务，此时去接管一个
+/// 真正的残留进程仍是原语义 —— 这次只排除「本会话自己正在管」的两态。
+fn 应当尝试接管(当前状态: &ServiceStatus) -> bool {
+    !matches!(当前状态, ServiceStatus::Starting | ServiceStatus::Running)
+}
+
 /// Reattach to a `llama-server` left running by a previous app session, or clean
 /// it up if it is no longer healthy. Should be called once on startup before the
 /// frontend decides whether to auto-start a fresh service.
@@ -778,6 +1023,18 @@ pub async fn recover_service(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> AppResult<ServiceInfo> {
+    // 先看本会话的状态：已经在管（或正在起）服务时直接返回当前状态，
+    // **连持久化记录都不读** —— 那一份此刻代表的是上个会话，不是现场（见 `应当尝试接管`）。
+    // 锁必须在调 `service_status` 之前释放：那是同一个 Mutex，同线程重入 = 自死锁。
+    let 跳过接管 = {
+        let inner = state.inner.lock().expect("state lock poisoned");
+        !应当尝试接管(&inner.service.status)
+    };
+    if 跳过接管 {
+        tracing::debug!("recover_service：本会话已有服务，跳过接管（避免把新起的进程认成旧进程）");
+        return Ok(service_status(&state));
+    }
+
     let (db_path, persisted) = {
         let inner = state.inner.lock().expect("state lock poisoned");
         (inner.db_path.clone(), load_service_state(&inner.db_path)?)
@@ -816,6 +1073,53 @@ pub async fn recover_service(
         // Reattach path: the old process is alive and answering, so we want
         // the same auto-restart safety net as a freshly spawned service.
         spawn_service_watchdog(app.clone(), (*state).clone());
+
+        // 【2026-10-16 新增】接管路径**也要问一次引擎**。
+        //
+        // 2026-10-16 老李重启 APP，日志里那一行 `reattached to previous llama-server`
+        // 走的就是这里 —— 它**不进 `set_running`**，于是上一版加的回执核对在这条路上
+        // **一次都没跑**（设计时预告过这条边界，当天就被实测确认）。
+        //
+        // 而 reattach 恰恰是**日常最常见**的路径（每次重启 APP 都走它），也是**最该查**
+        // 的一条：接管的进程不是本次起的，APP 对它一无所知 —— 连「端口上跑的是哪个模型」
+        // 都拿不出证据（「端口在听 + /health 200」回答不了这个问题）。
+        //
+        // 期望值用**当前**配置重新推导 ⇒ 用户改过配置时这里会报「对不上」，那是**正确**的
+        // （进程是旧的），措辞由 `回执场景::接管旧进程` 负责区分，不会引到「微调没生效」。
+        //
+        // 推导失败**不能**让接管失败（否则 APP 起不来），但也不许静默 —— 打 WARN 说明
+        // 本次没核对，并点明「下次启动服务会因此失败」（旁车配置损坏时的真实后果）。
+        let 模型路径 = {
+            let inner = state.inner.lock().expect("state lock poisoned");
+            inner.settings.local_model_path.clone()
+        };
+        match &模型路径 {
+            None => tracing::debug!("接管路径：设置里没有模型路径，本次不做回执核对"),
+            Some(模型路径) => match 推导附加参数(&state, 模型路径) {
+                Err(错误) => tracing::warn!(
+                    错误 = %错误,
+                    "接管路径：附加参数推导失败，本次不核对 —— **这不代表微调没生效**，\
+                     但这个配置问题会让下次启动服务直接失败"
+                ),
+                Ok((附加参数, _)) => {
+                    if let Some(host) = info.host.clone() {
+                        let 模型路径 = 模型路径.clone();
+                        let 端口 = persisted.port;
+                        tokio::spawn(async move {
+                            核对引擎回执(
+                                &host,
+                                端口,
+                                Some(&模型路径),
+                                &附加参数,
+                                回执场景::接管旧进程,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            },
+        }
+
         return Ok(info);
     }
 
@@ -1298,6 +1602,69 @@ fn resolve_paths(state: &AppState) -> AppResult<(PathBuf, PathBuf, PathBuf)> {
     Ok((server_path, model_path, install_dir))
 }
 
+/// 推导**最终**传给引擎的附加参数 = 设置里的额外启动参数 + 该模型的旁车配置。
+///
+/// 做成一个函数是**为了防止两处定义各自漂移**：`start_service_core`（拉起新进程）
+/// 与 `recover_service`（接管旧进程后核对回执）都要用同一份口径 ——
+/// 本项目已经栽过一次「同一份数据两处定义，改一处跑另一处不报错、只给错报告」。
+///
+/// 模型旁车配置（`<模型主名>.launch.json`）解决的是这个：微调出来的 adapter 有两个
+/// 必须与训练时一致的部署条件 —— 挂载 LoRA、以及与训练契约**相同**的对话模板 ——
+/// 而两者都只是 llama.cpp 的启动参数。APP 原先一个都不传，于是「实验室里修好了模板，
+/// 生产上照旧」：模板不一致时引擎会把模型输出整段判进 `reasoning_content`、
+/// `content` 变空串，同一份 adapter 的增益从 `+39.1 pp` 塌到 `+4.3 pp`
+/// （D23 报告「四·补十」缺口 1/3）。
+///
+/// 🔴 配置损坏 / 引用的文件缺失一律当场失败 —— 静默跳过会让服务「看起来正常」。
+/// 注意先在锁内把设置读完、**锁外**再做文件 I/O（锁内做 I/O 是本项目踩过的自死锁形态）。
+///
+/// 返回值第二项是**真正并入最终参数**的旁车项（被用户手写参数盖掉的不算）。
+/// 之所以把它交出来：光看第一项分不清「这些参数是谁带来的」，而「已并入启动命令行」
+/// 这句日志**只有真正拉起进程的那条路径才有资格说** —— 接管路径也调本函数，
+/// 但那里没有起进程、没有附加任何参数（2026-10-16 实机踩过，见 `model_sidecar.rs`）。
+fn 推导附加参数(
+    state: &AppState,
+    模型路径: &Path,
+) -> AppResult<(Vec<String>, Vec<(String, String)>)> {
+    let mut 参数 = {
+        let inner = state.inner.lock().expect("state lock poisoned");
+        parse_extra_args(inner.settings.extra_launch_args.as_deref().unwrap_or(""))
+    };
+    let 旁车生效项 = 并入旁车项(&mut 参数, crate::model_sidecar::读取旁车参数(模型路径)?);
+    Ok((参数, 旁车生效项))
+}
+
+/// 把旁车项并入最终参数，返回**真正并入**的那些（被用户手写参数盖掉的不算）。
+///
+/// 抽成纯函数的原因：它决定「已并入本次启动命令行」这句日志的**真值**。
+/// 本项目刚在「日志宣称了没发生的动作」上栽过一次（见 `model_sidecar.rs`
+/// 里 `读取旁车参数` 的那段注释），所以这条链上最容易错的一环必须有判据兜着。
+///
+/// 已知边界：`--lora` 与 `--lora-scaled` 在这里算**两个标志** —— 用户手写
+/// `--lora-scaled x:0` 时，旁车给的 `--lora` 仍会并入，引擎会挂两次适配器。
+/// 属于既有行为，本轮不改；真要改得先有「适配器参数族」的口径。
+fn 并入旁车项(
+    参数: &mut Vec<String>,
+    旁车项: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut 生效: Vec<(String, String)> = Vec::new();
+    for (标志, 值) in 旁车项 {
+        // 用户在设置里手写的同名标志优先，避免 llama.cpp 收到两份（重复的
+        // `--lora` 会挂载两次适配器；重复的 `--chat-template-file` 只认最后一个）。
+        let 用户已指定 = 参数
+            .iter()
+            .any(|词| 词 == &标志 || 词.starts_with(&format!("{}=", 标志)));
+        if 用户已指定 {
+            tracing::info!(标志 = %标志, "设置里的同名启动参数优先，不使用模型旁车配置里的这一项");
+            continue;
+        }
+        参数.push(标志.clone());
+        参数.push(值.clone());
+        生效.push((标志, 值));
+    }
+    生效
+}
+
 fn set_starting(
     app: &AppHandle,
     state: &AppState,
@@ -1431,6 +1798,7 @@ fn set_running(
     child: Child,
     safe_mode: bool,
     message: String,
+    附加参数: &[String],
 ) -> AppResult<ServiceInfo> {
     let info = {
         let mut inner = state.inner.lock().expect("state lock poisoned");
@@ -1466,7 +1834,542 @@ fn set_running(
     let _ = app.emit("service_status_changed", &info);
     spawn_service_watchdog(app.clone(), state.clone());
     tracing::info!(model_id = ?info.model_id, port = ?info.port, safe_mode, "llama-server running");
+
+    // 【2026-10-16 新增】服务真的起来了 ⇒ 再**问一次引擎**，把「参数传过去了」
+    // 升级为「引擎确实生效了」。
+    //
+    // 为什么必须放在这里、而且必须是「问」而不是「信」：`--lora` 与
+    // `--chat-template-file` 都是**我们自己填进命令行的标签**，写进去了不等于
+    // 引擎接受了（把「调用方填的标签」当「引擎实测值」，是本项目翻过五次车的
+    // 那类错误）。2026-10-16 实机验证证明这两件事都问得出来，见
+    // `model_sidecar.rs` 的「启动之后：问引擎要回执」一节与报告「四·补十一-4」。
+    //
+    // 放在 `set_running` 而不是 `start_service_core` 的末尾：这里是**四个成功
+    // 路径共同的汇合点**（激进参数 / 保守参数 / 显卡未生效 / CPU 兜底），
+    // 改一处就全覆盖，将来新增分支也不会漏。异步 spawn，不拖慢返回。
+    //
+    // 先判「有没有值得核对的东西」再 spawn：用户只是在设置里写了 `--ctx-size`
+    // 时不该白起一个任务、更不该白打两行日志。条件与 `核对引擎回执` 的内部
+    // 早退条件一致（那边是兜底，这边是省一次 spawn）。
+    let 有微调产物 = !crate::model_sidecar::期望的适配器(附加参数).is_empty()
+        || crate::model_sidecar::期望的对话模板(附加参数).is_some();
+    if 有微调产物 {
+        if let (Some(port), Some(host)) = (info.port, info.host.clone()) {
+            let 附加参数 = 附加参数.to_vec();
+            tokio::spawn(async move {
+                // 模型路径传 `None`：这条路径下进程是我们**亲手**按 `model_path` 起的，
+                // 「跑的是哪个模型」不需要再问（接管路径才需要，见 `回执场景`）。
+                核对引擎回执(&host, port, None, &附加参数, 回执场景::本次启动).await;
+            });
+        }
+    }
+
     Ok(info)
+}
+
+/// 这次回执核对是从**哪条路径**来的 —— 决定「对不上」怎么归因、给什么建议。
+///
+/// 两条路径的**起点不同**，所以判据也不同：
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum 回执场景 {
+    /// 刚刚亲手拉起的进程：命令行就是本次传的 ⇒ 对不上就是真对不上。
+    本次启动,
+    /// 接管（reattach）上一个会话留下的进程。这里有三点不同：
+    ///   ① 进程**不是本次起的**，APP 手里只有一个 `model_id` 字符串，
+    ///      所以**必须**额外问一次 `/v1/models`：端口在听 ≠ 跑的是我要的模型；
+    ///   ② 期望值是用**当前**配置重新推导的，而进程用的是**上次启动时**的配置
+    ///      ⇒ 对不上更可能是「配置改过、进程还是旧的」，处置是重启服务；
+    ///   ③ 这是**日常最常见**的路径（每次重启 APP 都走它），却最容易漏。
+    接管旧进程,
+}
+
+/// 要不要额外问一次模型身份（`GET /v1/models`）？
+///
+/// * **接管场景**：要 —— 那个进程不是本次起的，APP 手里只有一个 `model_id`
+///   字符串，「端口在听」证明不了它跑的是我要的模型。
+/// * **本次启动**：不要 —— 进程是调用方按 `model_path` 亲手起的，启动日志里
+///   已经有 `starting llama-server model_id=…`；日常每次都多打一行是白噪声。
+///
+/// 抽成纯函数是为了让「接管必须问身份」这条属性**可被单测钉住** ——
+/// reattach 分支在单测里跑不到（本项目铁律：不可达分支必须由单测兜底）。
+fn 应当核对模型身份(场景: 回执场景, 有模型路径: bool) -> bool {
+    matches!(场景, 回执场景::接管旧进程) && 有模型路径
+}
+
+/// 接管态要不要再问一次引擎「你按什么上下文在跑」？
+///
+/// 🔴 **必须问**（P2-14，2026-10-16 P100 实机抓出）。接管**不重算启动参数**，
+/// 沿用的是上一个会话留下的那个进程；而在此之前，这条路径上**没有任何一行日志**
+/// 记录那个进程的参数。于是：
+///
+/// * 接管到一个 **262144 上下文 / 全量卸载**的服务，日志说「跑的确实是这个模型」；
+/// * 接管到一个 **4096 上下文 / 兜底参数**的服务，日志**也是**这么说的。
+///
+/// 当天那台 P100 正是后者：14:35 接管到的其实是 07:18 用 24 层 / 4096 起的进程，
+/// 用户因此误判成「上一轮的修复没生效」。判据要落到**引擎自报**的值上，
+/// 见 `model_sidecar::解析上下文回执`。
+///
+/// **本次启动不问**：那条路径的参数已经有三重记录（`starting llama-server … ctx_size=`、
+/// 启动成功本身、`checked GPU offload … verified=true`），每次启动再多问一次是白噪声。
+/// （代价是「引擎把请求的 ctx 悄悄夹小」这一层目前只能靠命令行与 `/props` 手工对照。）
+fn 应当报告引擎上下文(场景: 回执场景) -> bool {
+    matches!(场景, 回执场景::接管旧进程)
+}
+
+/// 接管态的**交叉验证**：引擎自报的那个模型，权重真的进显存了吗（P2-15）。
+///
+/// 🔴 **P2-15（2026-10-16，老李拍板要做）**。P2-14 让接管态报出了 `n_ctx`，但引擎的
+/// `/props` **不暴露 `n_gpu_layers`**（API 里没这个字段）—— 于是「**ctx 对、层数错**」
+/// 这个组合仍然**同形**：报出 `262144` 却只卸载了几层，与真·全量卸载在日志上
+/// 长得一模一样。
+///
+/// 引擎不给，就从**它留下的痕迹**反推：`-ngl 999` 的意图是「权重全进显存」，
+/// 而权重**必须**占显存 —— 于是「实测整卡 `used` 连模型文件都装不下」就**确凿**
+/// 说明层数没（全）上去。
+///
+/// 为什么**不**用「权重 + KV@n_ctx」当理论值：KV 的量化档（`kv_quant`）在接管态
+/// **也拿不到**（`/props` 不给），按 fp16 算会**偏大** ⇒ 必然误报。只认**权重下界**，
+/// 是这里唯一**不会误报**的口径。
+///
+/// **余量取 0.9 而不取 1.0**：GGUF 文件体积含**元数据**（键值表 / 词表 / 对话模板），
+/// 比纯权重字节略大；而真出事时缺口远大于 10% —— P100 现场实测「24 层 / 4096」那一次
+/// `used = 6424 MiB` vs 文件 `9787 MB`（≈ 9333 MiB），缺口 **31%**。
+///
+/// **判据单边**（只查偏小）：接管态整卡 `used` 里含**别的进程**（P100 上就常驻一个
+/// ComfyUI），偏大是常态 ⇒ 拿双边阈值必然误报。反过来，这也意味着本判据**几乎不可能
+/// 误报** —— 任何干扰都只会把 `used` 推高，不会压低。
+///
+/// 抽成纯函数是为了让**边界由单测钉住**（`不可达分支必须由单测兜底`）。
+fn 实测显存够装权重(权重_gib: f64, 实测_gib: f64) -> bool {
+    // 用局部 `let` 而非 `const`：常量名会被 `non_upper_case_globals` 判为非全大写
+    // （中文后跟 `GiB` 这种混排必踩），局部变量无此约束。见 `gpu_offload_verified`。
+    let 余量 = 0.9_f64;
+    实测_gib >= 权重_gib * 余量
+}
+
+/// 采样失败的原因。**必须带原因**：两个调用点要打不同的措辞（接管态说「引擎回执」、
+/// 启动态说「显存对账」），而「读不到」与「查了没事」在日志上必须能区分。
+enum 采样缺失 {
+    文件(String),
+    显存 { 权重_gib: f64 },
+}
+
+/// 采样「模型文件体积 + 整卡已用显存」。
+///
+/// 🔴 **为什么抽出来**：接管态（P2-15）与启动态（B-1）的判据用的是**同一把尺子** ——
+/// 同一个 `nvidia_used_vram_gb`、同一种 GiB 换算（GiB 按 1024³，不用十进制 GB）。
+/// 两处各写一遍采样，将来改一处漏一处，就会变成「同一个词两个意思」而**不报错**，
+/// 正是本项目反复踩的那类失效。日志措辞留给调用方，这里只把**采样与缺失原因**做一份。
+async fn 采样权重与显存(模型文件: &Path) -> Result<(f64, f64), 采样缺失> {
+    let 权重_gib = match std::fs::metadata(模型文件) {
+        Ok(元数据) => 元数据.len() as f64 / (1024.0 * 1024.0 * 1024.0),
+        Err(错误) => return Err(采样缺失::文件(错误.to_string())),
+    };
+    match tokio::task::spawn_blocking(crate::hardware::nvidia_used_vram_gb).await {
+        Ok(Some(值)) => Ok((权重_gib, 值)),
+        _ => Err(采样缺失::显存 { 权重_gib }),
+    }
+}
+
+/// 规划器是否**声称**要把权重全部放上卡。
+///
+/// `999` 是 `cuda_launch_params` 里的全量哨兵（`:181`/`:196`）。按层数算出来的档位
+/// （20 / 12 / 8）与保守固定档（24）都是**已经认了**部分卸载 —— 那是合法工作状态，
+/// 不该拿「全量」的尺子去量。拿不到层数（`None`，CPU 模式）同样不算全量。
+fn 计划全量卸载(n_gpu_layers: Option<u32>) -> bool {
+    matches!(n_gpu_layers, Some(层) if 层 >= 999)
+}
+
+/// 判据本体：**声称全量、实际没装下** → 才是故障。
+///
+/// 单独抽出来是为了让单测能钉住「什么时候报、什么时候不许报」——
+/// 尤其是 `部分卸载 + 装不下` 这个反例：16 GB 卡装 27B-Q3 时它**本来就装不下**
+/// （只卸一部分层），报它就是把正常状态说成故障，属于「判据把错钉成期望行为」的反面。
+fn 全量卸载却没上卡(计划层数: Option<u32>, 权重_gib: f64, 实测_gib: f64) -> bool {
+    计划全量卸载(计划层数) && !实测显存够装权重(权重_gib, 实测_gib)
+}
+
+/// 启动路径的档 2：**计划全量 ⇏ 真上去了**。
+///
+/// `--n-gpu-layers 999` 只是**请求**。显存不足时 llama.cpp 会**静默**少卸几层，
+/// 启动照样成功、健康检查照样 200、`/props` 照样报得出 `n_ctx` —— 只有速度掉一半。
+/// 档 1（`gpu_offload_verified`，阈值固定 256 MiB）只能抓「完全没上卡」，
+/// 抓不到「上了几层」。这里补的就是这一段灰色地带。
+///
+/// **只 WARN，不阻断启动**：部分卸载是「能跑但慢」，把它判成失败会让可用变不可用 ——
+/// 而这条判据的价值是**让失败可见**，不是替用户做取舍。
+///
+/// 明说的漏报：缺口 < 10% 不报（与 P2-15 同一条单边口径）；小模型（8G 卡装 4.68 GiB）
+/// 的部分卸载基本抓不到。**报不出的护栏好过乱报的护栏。**
+async fn 核对计划全量卸载(模型文件: &Path, 计划层数: Option<u32>, 后端: EngineBackend) {
+    // 不是全量计划 → 本判据**不适用**，但要说出来，否则「没查」与「查了没事」同形。
+    if !计划全量卸载(计划层数) {
+        tracing::debug!(
+            backend = backend_label(后端),
+            gpu_layers = ?计划层数,
+            "显存对账：本次计划**不是**全量卸载（规划器已按余量分档），全量判据**不适用**"
+        );
+        return;
+    }
+    let (权重_gib, 实测_gib) = match 采样权重与显存(模型文件).await {
+        Ok(对) => 对,
+        Err(采样缺失::文件(错误)) => {
+            tracing::info!(
+                路径 = %模型文件.display(),
+                错误 = %错误,
+                "显存对账：读不到模型文件的体积，本次**未做**全量卸载判据"
+            );
+            return;
+        }
+        Err(采样缺失::显存 { 权重_gib }) => {
+            tracing::info!(
+                权重_gib = 权重_gib,
+                "显存对账：读不到显存占用（非 N 卡或 nvidia-smi 不可用），本次**未做**全量卸载判据"
+            );
+            return;
+        }
+    };
+    if !全量卸载却没上卡(计划层数, 权重_gib, 实测_gib) {
+        tracing::info!(
+            backend = backend_label(后端),
+            权重_gib = 权重_gib,
+            实测_gib = 实测_gib,
+            "显存对账：计划全量卸载，实测显存也装得下权重 —— 权重确实都在卡上"
+        );
+        return;
+    }
+    tracing::warn!(
+        backend = backend_label(后端),
+        计划层数 = 计划层数.unwrap_or(0),
+        权重_gib = 权重_gib,
+        实测_gib = 实测_gib,
+        "显存对账：**计划全量卸载，但实测显存装不下这个模型的权重** —— \
+         引擎静默少卸了几层（`/props` 报得出 n_ctx、报不出层数，外面看不出来）。\
+         启动**未受影响**，但生成会明显偏慢；点「停止」再「启动」会按当前显存重算，\
+         若仍如此说明这张卡装不下这个量化档"
+    );
+}
+
+/// 读一次模型文件体积与整卡已用显存，把「装得下吗」的**三态**分别打出来。
+///
+/// 三态必须可区分（项目铁律「降级 / 跳过 / 未跑完必须与『通过』可区分」）：
+///
+/// * 装得下   → `INFO`（常态：接管到参数正确的服务）
+/// * 装不下   → **`WARN`** + 可行动的建议
+/// * **读不到**（文件 stat 失败 / 非 N 卡 / `nvidia-smi` 不可用）→ `INFO`，措辞
+///   必须写明「**本次未做**」—— 静默吞掉的话，「没查」与「查了没事」在日志上同形，
+///   正是本项目翻过五次车的那类错误。
+///
+/// ⚠️ 本判据**只覆盖「连权重都没装下」**这一种。**部分卸载**（16 GB 卡装 27B-Q3）
+/// 是合法工作状态，缺口不到 10% 时判据**有意**放过 —— 那属于性能取舍，不是故障。
+async fn 核对接管态显存(模型文件: &Path) {
+    // 采样与启动态（B-1）共用一份 —— 两处判据必须同一把尺子，见 `采样权重与显存`。
+    let (权重_gib, 实测_gib) = match 采样权重与显存(模型文件).await {
+        Ok(对) => 对,
+        Err(采样缺失::文件(错误)) => {
+            tracing::info!(
+                路径 = %模型文件.display(),
+                错误 = %错误,
+                "引擎回执：读不到模型文件的体积，本次**未做**显存交叉验证"
+            );
+            return;
+        }
+        Err(采样缺失::显存 { 权重_gib }) => {
+            tracing::info!(
+                权重_gib = 权重_gib,
+                "引擎回执：读不到显存占用（非 N 卡或 nvidia-smi 不可用），本次**未做**显存交叉验证"
+            );
+            return;
+        }
+    };
+    if 实测显存够装权重(权重_gib, 实测_gib) {
+        tracing::info!(
+            权重_gib = 权重_gib,
+            实测_gib = 实测_gib,
+            "引擎回执：实测显存装得下这个模型的权重 —— 接管到的服务确实把权重放上了卡"
+        );
+    } else {
+        tracing::warn!(
+            权重_gib = 权重_gib,
+            实测_gib = 实测_gib,
+            "引擎回执：**实测显存明显装不下这个模型的权重** —— 层数没（全）上去。\
+             显存不足时引擎会**静默**少卸几层，而 `/props` 报得出 `n_ctx`、报不出层数；\
+             点「停止」再「启动」会按当前显存重算；若仍如此，说明这张卡装不下这个量化档"
+        );
+    }
+}
+
+/// 把 llama-server 的**监听地址**换算成**可连接的探测地址**。
+///
+/// 🔴 **为什么必须换算**（P2-12，2026-10-16 实机抓出）：服务可以监听 `0.0.0.0`
+/// （设置里开了「局域网可访问」），而 `0.0.0.0` 是「本机所有网卡」的**通配**
+/// 写法，**不是可连接地址** —— 直接连它当场失败：
+/// `error sending request for url (http://0.0.0.0:8000/v1/models)`。
+/// 本机一直是默认的 `127.0.0.1`，所以这个坑直到 P100 开了局域网才暴露：
+/// 那台机器上「接管到的到底是不是这个模型」**永远核对不成**。
+///
+/// ⚠️ 现象很容易读反：**健康探测走的是 `127.0.0.1`**（日志里那串
+/// `connecting to 127.0.0.1:8000` 就是），所以现场看起来是
+/// 「端口明明健康，回执却说取不到」—— 别把它读成「引擎没起来」。
+///
+/// 非通配地址（`127.0.0.1`、具体网卡 IP、主机名）**原样返回**：
+/// 一律改成 `127.0.0.1` 会在服务只监听某块网卡时反而连不上。
+fn 探测主机(监听地址: &str) -> String {
+    match 监听地址.trim() {
+        "" | "0.0.0.0" | "::" | "[::]" | "*" => "127.0.0.1".to_string(),
+        其他 => 其他.to_string(),
+    }
+}
+
+/// 服务就绪后**问引擎**要回执：命令行里的参数到底「传过去了」还是「生效了」。
+///
+/// 三态必须可区分（本项目铁律「降级 / 跳过 / 未跑完必须与『通过』可区分」）：
+///
+/// * 一致   → `INFO`
+/// * 不一致 → **`WARN`**，附问题清单
+/// * 取不到 → **`WARN`**，措辞必须写明「**取不到 ≠ 没生效**」——
+///   否则「端点还没就绪」会被读成「适配器白挂」，把结论带反。
+///
+/// 期望值**只从最终附加参数里解析**，不从旁车配置读 ——
+/// 那是唯一的事实来源（用户可以在设置里手写同名标志盖过旁车配置）。
+async fn 核对引擎回执(
+    host: &str,
+    port: u16,
+    模型路径: Option<&Path>,
+    附加参数: &[String],
+    场景: 回执场景,
+) {
+    let 期望适配器 = crate::model_sidecar::期望的适配器(附加参数);
+    let 期望模板文件 = crate::model_sidecar::期望的对话模板(附加参数);
+
+    // 🔴 接管场景下**总是**问一次模型身份，即使没有任何微调产物：
+    //    那是最基本、也最容易漏掉的一层 —— 2026-10-16 老李重启 APP 时就走的这条路
+    //    （`reattached to previous llama-server`），而当时这一层还没接上。
+    let 查身份 = 应当核对模型身份(场景, 模型路径.is_some());
+    // 🔴 接管态**无条件**报一次引擎自报的上下文（P2-14）—— 即使没配旁车、
+    //    即使模型路径没能解析出来。理由见 `应当报告引擎上下文`。
+    let 报上下文 = 应当报告引擎上下文(场景);
+    if 期望适配器.is_empty() && 期望模板文件.is_none() && !查身份 && !报上下文 {
+        return;
+    }
+
+    // 探测地址 ≠ 监听地址：`0.0.0.0` 是通配写法、不可连接（见 `探测主机`）。
+    let 基址 = format!("http://{}:{port}", 探测主机(host));
+    let 客户端 = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(客户端) => 客户端,
+        Err(错误) => {
+            tracing::warn!(错误 = %错误, "引擎回执：HTTP 客户端建不起来，本次不核对（**这不代表没生效**）");
+            return;
+        }
+    };
+
+    // ── 第 ① 层：端口上跑的是不是我要的那个模型 ─────────────────────────────
+    //
+    // 引擎自报的那个路径**还要留给第 ②b 层**当「权重体积」的来源（P2-15），
+    // 所以在这里带出来 —— 见 `核对接管态显存`。
+    let mut 引擎自报模型: Option<String> = None;
+    if 查身份 {
+        if let Some(期望模型) = 模型路径 {
+            let 期望模型 = 期望模型.display().to_string();
+            match 取回执(&客户端, &format!("{基址}/v1/models")).await {
+                None => tracing::warn!(
+                    期望 = %期望模型,
+                    "引擎回执：/v1/models 取不到 —— **这不代表跑错了模型**，只代表这次没核对成"
+                ),
+                Some(正文) => match crate::model_sidecar::解析模型回执(&正文) {
+                    Err(错误) => tracing::warn!(
+                        错误 = %错误,
+                        正文 = %正文.chars().take(200).collect::<String>(),
+                        "引擎回执：模型列表回执看不懂，本次不核对"
+                    ),
+                    Ok(自报) => {
+                        let 问题 = crate::model_sidecar::核对模型(&期望模型, &自报);
+                        if 问题.is_empty() {
+                            tracing::info!(
+                                模型 = %自报,
+                                "引擎回执：接管到的服务跑的确实是这个模型"
+                            );
+                        } else {
+                            tracing::warn!(
+                                期望 = %期望模型,
+                                引擎自报 = %自报,
+                                问题 = ?问题,
+                                "引擎回执：**接管到的服务可能不是这个模型** —— 建议停掉后重新启动服务"
+                            );
+                        }
+                        // 对不上**也照样留着**：第 ②b 层要验的是「显存里装的是不是
+                        // 这个文件」，与「是不是我们期望的那个」是两回事。
+                        引擎自报模型 = Some(自报);
+                    }
+                },
+            }
+        }
+    }
+
+    // ── 第 ② 层：接管到的服务**按什么规格在跑** ───────────────────────────────
+    //
+    // 模板核对（第 ③ 层）也要 `/props`，所以**只取一次**、两个消费者共用。
+    let 需要属性 = 期望模板文件.is_some() || 报上下文;
+    let 属性正文 = if 需要属性 {
+        取回执(&客户端, &format!("{基址}/props")).await
+    } else {
+        None
+    };
+    if 报上下文 {
+        match &属性正文 {
+            None => tracing::warn!(
+                "引擎回执：/props 取不到 —— **这不代表上下文不对**，只代表这次没核对成"
+            ),
+            Some(正文) => match crate::model_sidecar::解析上下文回执(正文) {
+                Err(错误) => tracing::warn!(
+                    错误 = %错误,
+                    "引擎回执：属性回执里读不到 n_ctx，接管到的服务按什么上下文在跑**未核对**"
+                ),
+                Ok(上下文) => tracing::info!(
+                    n_ctx = 上下文,
+                    "引擎回执：接管到的服务自报的上下文长度 —— 接管**不重算**启动参数；\
+                     这个值若明显偏小（4096 / 2048 = 兜底或保守参数），点「停止」再「启动」按当前显存重算"
+                ),
+            },
+        }
+    }
+
+    // ── 第 ②b 层：接管到的服务，**权重真的进显存了吗**（P2-15）──────────────
+    //
+    // 第 ② 层报了「按什么上下文在跑」，但引擎**报不出 `n_gpu_layers`**
+    // （`/props` 没有这个字段）⇒「ctx 对、层数错」在这一层仍然**同形**。
+    // 补法不是再问引擎，而是从**它留下的痕迹**反推：见 `实测显存够装权重`。
+    //
+    // 只在接管态做（与第 ② 层同一个门）：
+    // * 本次启动那条路径手里没有模型路径（调用点传 `None`，进程是我们亲手起的），
+    //   拿不到「权重体积」这个比对基准；
+    // * 而且那条路径已经有 `checked GPU offload … verified=true` 兜着（阈值 256 MiB
+    //   —— 能抓「整卡没上」，但抓不到「只卸了几层」，那是另一条待办）。
+    if 报上下文 {
+        match 引擎自报模型.as_deref() {
+            Some(自报路径) => 核对接管态显存(Path::new(自报路径)).await,
+            None => tracing::info!(
+                "引擎回执：没能从引擎自报里拿到模型文件路径，本次**未做**显存交叉验证"
+            ),
+        }
+    }
+
+    // 「对不上」的建议按场景区分。措辞必须准确：把「配置改过、进程还是旧的」
+    // 说成「适配器没生效」，会把排查引到错的方向去。
+    let 对不上的建议 = match 场景 {
+        回执场景::本次启动 => "适配器可能没生效",
+        回执场景::接管旧进程 => {
+            "若刚改过启动配置，这是意料之中（进程还是旧的）—— 重启服务即可生效；否则适配器可能没生效"
+        }
+    };
+
+    if !期望适配器.is_empty() {
+        match 取回执(&客户端, &format!("{基址}/lora-adapters")).await {
+            None => tracing::warn!(
+                期望 = %crate::model_sidecar::描述适配器(&期望适配器),
+                "引擎回执：/lora-adapters 取不到（端点未就绪或版本不支持）—— \
+                 **这不代表适配器没挂上**，只代表这次没核对成"
+            ),
+            Some(正文) => match crate::model_sidecar::解析适配器回执(&正文) {
+                Err(错误) => tracing::warn!(
+                    错误 = %错误,
+                    正文 = %正文.chars().take(200).collect::<String>(),
+                    "引擎回执：适配器回执看不懂，本次不核对"
+                ),
+                Ok(实际) => {
+                    let 问题 = crate::model_sidecar::核对适配器(&期望适配器, &实际);
+                    if 问题.is_empty() {
+                        tracing::info!(
+                            适配器 = %crate::model_sidecar::描述适配器(&实际),
+                            "引擎回执：适配器已确认加载（命令行与引擎自报一致）"
+                        );
+                    } else {
+                        tracing::warn!(
+                            期望 = %crate::model_sidecar::描述适配器(&期望适配器),
+                            引擎自报 = %crate::model_sidecar::描述适配器(&实际),
+                            问题 = ?问题,
+                            建议 = %对不上的建议,
+                            "引擎回执：**命令行传了，但引擎侧对不上**"
+                        );
+                    }
+                }
+            },
+        }
+    }
+
+    if let Some(模板路径) = 期望模板文件 {
+        let 期望内容 = match std::fs::read_to_string(&模板路径) {
+            Ok(内容) => 内容,
+            Err(错误) => {
+                // 启动前 `读取旁车参数` 已经确认过文件存在，走到这里读不到属异常情况，
+                // 但**不许静默** —— 否则「模板没换」会以「核对通过」的名义蒙混过去。
+                tracing::warn!(模板 = %模板路径, 错误 = %错误, "引擎回执：模板文件读不出来，本次不核对");
+                return;
+            }
+        };
+        // 复用第 ② 层取回的属性回执，不重复请求（`期望模板文件.is_some()` ⇒ `需要属性` 必为真）。
+        match &属性正文 {
+            None => tracing::warn!(
+                模板 = %模板路径,
+                "引擎回执：/props 取不到 —— **这不代表模板没生效**，只代表这次没核对成"
+            ),
+            Some(正文) => match crate::model_sidecar::解析模板回执(正文) {
+                Err(错误) => {
+                    tracing::warn!(错误 = %错误, "引擎回执：属性回执里没有模板，本次不核对");
+                }
+                Ok(引擎模板) => {
+                    let 问题 = crate::model_sidecar::核对对话模板(&期望内容, &引擎模板);
+                    if 问题.is_empty() {
+                        tracing::info!(
+                            模板 = %模板路径,
+                            字符数 = 引擎模板.chars().count(),
+                            "引擎回执：对话模板已确认生效（与文件一致）"
+                        );
+                    } else {
+                        // 🔴 这一条是「部署模板与训练契约不一致」的直接判据，
+                        //    实测同一份适配器的增益会从 +39.1 pp 塌到 +4.3 pp。
+                        tracing::warn!(
+                            模板 = %模板路径,
+                            问题 = ?问题,
+                            建议 = %对不上的建议,
+                            "引擎回执：**模板与文件对不上** —— 微调增益可能大幅缩水"
+                        );
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// 取一个只读端点，失败时**有限重试**。
+///
+/// 为什么必须重试：服务刚过健康检查时，这两个端点**未必已经就绪**，
+/// 一次失败就下结论会把「还没准备好」误报成「引擎没接」。
+/// 重试用尽仍失败 ⇒ 由调用方记成「取不到」，**不许**写成「没生效」。
+async fn 取回执(客户端: &reqwest::Client, 地址: &str) -> Option<String> {
+    for 第几次 in 0..3u32 {
+        if 第几次 > 0 {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        match 客户端.get(地址).send().await {
+            Ok(响应) if 响应.status().is_success() => match 响应.text().await {
+                Ok(正文) => return Some(正文),
+                Err(错误) => {
+                    tracing::debug!(错误 = %错误, "引擎回执：读正文失败，重试");
+                }
+            },
+            Ok(响应) => {
+                tracing::debug!(状态 = %响应.status(), "引擎回执：状态码不是 2xx，重试");
+            }
+            Err(错误) => {
+                tracing::debug!(错误 = %错误, "引擎回执：请求失败，重试");
+            }
+        }
+    }
+    None
 }
 
 async fn wait_for_health(
@@ -2700,6 +3603,738 @@ mod tests {
             期望.ends_with("qwen3_1_7b_light/Qwen3-1.7B-Q8_0.gguf"),
             "落点不对：{}",
             期望.display()
+        );
+    }
+
+    // ── 引擎回执：取回执的三态 ────────────────────────────────────────────
+    //
+    // 🔴 这里钉的是**整套三态设计所依赖的那一个属性**：失败必须返回 `None`，
+    //    **绝不允许**返回空正文或 `"[]"` —— 后者会被解析成「引擎报 0 个适配器」，
+    //    于是「端点还没就绪」被读成「适配器白挂」，**把结论带反**。
+
+    /// 起一个只按固定响应作答的极简 HTTP 服务，返回端口。
+    ///
+    /// 用 `std::net` 而不是 `tokio::net`：本仓库的 `tokio` 没开 `net` 特性，
+    /// 为测试去改生产依赖的特性表不划算。绑 `:0` 由系统分配空闲端口 ——
+    /// 这是本项目「自起服务必须挑空闲端口，被占当场失败」那条铁律的应用。
+    fn 起假引擎(响应: String) -> u16 {
+        use std::io::{Read, Write};
+        let 监听 = std::net::TcpListener::bind("127.0.0.1:0").expect("空闲端口应能绑定");
+        let 端口 = 监听.local_addr().expect("拿到本地地址").port();
+        std::thread::spawn(move || {
+            for 连接 in 监听.incoming() {
+                let Ok(mut 套) = 连接 else { break };
+                // 必须**先把请求读掉再回**：不读就写，客户端可能收不到（连接被 RST）。
+                let mut 缓冲 = [0u8; 4096];
+                let _ = 套.read(&mut 缓冲);
+                let _ = 套.write_all(响应.as_bytes());
+                let _ = 套.flush();
+                // 连接在本次迭代结束时关闭。响应里也写了 `Connection: close`，
+                // 免得 reqwest 复用连接、把「3 次重试」变成「1 次请求」。
+            }
+        });
+        端口
+    }
+
+    fn 回执响应(正文: &str) -> String {
+        // `Content-Length` 用**真实字节数**算，不手写 —— 写错会让客户端挂住或截断，
+        // 而那种失败看起来像「引擎不答」，与要测的东西完全是两回事。
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Connection: close\r\nContent-Length: {}\r\n\r\n{}",
+            正文.len(),
+            正文
+        )
+    }
+
+    #[tokio::test]
+    async fn 取回执在成功时返回正文() {
+        let 端口 = 起假引擎(回执响应(r#"[{"id":0,"path":"/m/lora.gguf","scale":1.0}]"#));
+        let 客户端 = reqwest::Client::new();
+        let 正文 = 取回执(&客户端, &format!("http://127.0.0.1:{端口}/lora-adapters"))
+            .await
+            .expect("200 应当拿到正文");
+        let 回执 = crate::model_sidecar::解析适配器回执(&正文).expect("正文应能解析");
+        assert_eq!(回执.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn 取回执在非2xx时返回None而不是空列表() {
+        // 500 × 3 次重试用尽 ⇒ 必须是 `None`。若这里返回 `Some("[]")`，
+        // 调用方会走「条数不符」分支报出**假警报**（明明是端点没就绪）。
+        let 端口 = 起假引擎(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+                .to_string(),
+        );
+        let 客户端 = reqwest::Client::new();
+        let 结果 = 取回执(&客户端, &format!("http://127.0.0.1:{端口}/lora-adapters")).await;
+        assert!(结果.is_none(), "取不到必须是 None，实际：{结果:?}");
+    }
+
+    #[tokio::test]
+    async fn 取回执在端口不通时返回None() {
+        // 挑一个几乎不可能有人在听的端口；连不上必须立刻是 None，而不是 panic。
+        let 客户端 = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .expect("客户端应能建立");
+        let 结果 = 取回执(&客户端, "http://127.0.0.1:1/lora-adapters").await;
+        assert!(结果.is_none());
+    }
+
+    // ── 接管路径：模型身份那一层 ──────────────────────────────────────────
+    //
+    // 2026-10-16 老李重启 APP，日志里是 `reattached to previous llama-server` ——
+    // 那条路径**不进 `set_running`**，上一版加的回执核对一次都没跑。
+    // 这里钉住修好后的行为：接管必须问身份；本次启动不必问（省去日常噪声）。
+
+    #[test]
+    fn 接管且知道模型路径时要核对模型身份() {
+        assert!(应当核对模型身份(回执场景::接管旧进程, true));
+    }
+
+    #[test]
+    fn 本次启动时不核对模型身份() {
+        // 进程是我们按 `model_path` 亲手起的，启动日志已经打了 model_id ⇒
+        // 每次启动都多问一次是白噪声。
+        assert!(!应当核对模型身份(回执场景::本次启动, true));
+    }
+
+    #[test]
+    fn 接管但不知道模型路径时不核对() {
+        // 没有期望值就无从核对 —— 但**不许**编一个（那会报出假警报）。
+        assert!(!应当核对模型身份(回执场景::接管旧进程, false));
+    }
+
+    // ── P2-14：接管态必须报「引擎自报的上下文」──────────────────────────
+    //
+    // 2026-10-16 P100：14:35 那次接管到的其实是 07:18 用 24 层 / 4096 起的进程，
+    // 而回执只说了「跑的确实是这个模型」⇒ 用户误判成「上一轮的修复没生效」。
+    // 这里钉住修好后的行为：接管必报；本次启动不报（有三重记录，再报是白噪声）。
+
+    #[test]
+    fn 接管态要报引擎自报的上下文() {
+        assert!(应当报告引擎上下文(回执场景::接管旧进程));
+    }
+
+    #[test]
+    fn 本次启动不报引擎上下文() {
+        assert!(!应当报告引擎上下文(回执场景::本次启动));
+    }
+
+    #[tokio::test]
+    async fn 模型身份三层能从假引擎端到端走通() {
+        // 取回执 → 解析模型回执 → 核对模型，三层缝合一次走完。
+        let 端口 = 起假引擎(回执响应(
+            r#"{"object":"list","data":[{"id":"D:\\m\\base-Q4_K_M.gguf"}]}"#,
+        ));
+        let 客户端 = reqwest::Client::new();
+        let 正文 = 取回执(&客户端, &format!("http://127.0.0.1:{端口}/v1/models"))
+            .await
+            .expect("200 应当拿到正文");
+        let 自报 = crate::model_sidecar::解析模型回执(&正文).expect("正文应能解析");
+        assert_eq!(自报, r"D:\m\base-Q4_K_M.gguf");
+        // 与期望一致 ⇒ 没有问题；分隔符/大小写不同也算一致。
+        assert!(crate::model_sidecar::核对模型(r"D:\m\base-Q4_K_M.gguf", &自报).is_empty());
+        assert!(crate::model_sidecar::核对模型(r"d:/m/base-q4_k_m.gguf", &自报).is_empty());
+    }
+
+    #[tokio::test]
+    async fn 模型身份在接管到别的模型时会报出两边名字() {
+        let 端口 = 起假引擎(回执响应(
+            r#"{"object":"list","data":[{"id":"D:\\m\\Spark-X2.5-4B-Q6_K.gguf"}]}"#,
+        ));
+        let 客户端 = reqwest::Client::new();
+        let 正文 = 取回执(&客户端, &format!("http://127.0.0.1:{端口}/v1/models"))
+            .await
+            .expect("200 应当拿到正文");
+        let 自报 = crate::model_sidecar::解析模型回执(&正文).expect("正文应能解析");
+        let 问题 = crate::model_sidecar::核对模型(r"D:\m\base-Q4_K_M.gguf", &自报);
+        assert_eq!(问题.len(), 1, "接管到别的模型必须报出来");
+        assert!(问题[0].contains("base-Q4_K_M.gguf"), "{问题:?}");
+        assert!(问题[0].contains("Spark-X2.5-4B-Q6_K.gguf"), "{问题:?}");
+    }
+
+    #[tokio::test]
+    async fn 接管态的上下文两层能从假引擎端到端取到() {
+        // 取回执 → 解析上下文回执，两层缝合一次走完。
+        // 测这条是因为**取那个函数与解析那个函数各自绿过、接起来错**是本项目踩过的坑
+        // （同一格式三份实现的老问题），而且这条链路只在接管态跑，单测是唯一兜底。
+        let 端口 = 起假引擎(回执响应(
+            r#"{"default_generation_settings":{"n_ctx":4096},"total_slots":1}"#,
+        ));
+        let 客户端 = reqwest::Client::new();
+        let 正文 = 取回执(&客户端, &format!("http://127.0.0.1:{端口}/props"))
+            .await
+            .expect("200 应当拿到正文");
+        assert_eq!(
+            crate::model_sidecar::解析上下文回执(&正文).expect("正文应能解析"),
+            4096,
+            "事故现场那个值：引擎自报 4096，而它其实能开 262144"
+        );
+    }
+
+    // ── P2-15：接管态的**显存交叉验证** ────────────────────────────────
+    //
+    // 引擎不报 `n_gpu_layers`（`/props` 没有这个字段）⇒「ctx 对、层数错」在回执
+    // 层面**同形**。判据改用一条**单边**下界：实测整卡 used 必须装得下模型文件。
+    // 下面钉住它的三条性质 —— 能分辨（不放过坏态）、不误报（单边）、边界可解释。
+
+    #[test]
+    fn 实测显存装不下权重时要报出来() {
+        // P100 现场原值（§零·5 的 `07:35` 那段）：接管到「24 层 / 4096」的旧进程，
+        // 整卡 used 6424 MiB；而 Ornith-1.5-9B-Q8_0 的文件 9787 MB ≈ 9334 MiB。缺口 31%。
+        let 权重_gib = 9787.0_f64 * 1e6 / (1024.0 * 1024.0 * 1024.0); // ≈ 9.115
+        let 实测_gib = 6424.0 / 1024.0; // ≈ 6.273
+        assert!(
+            !实测显存够装权重(权重_gib, 实测_gib),
+            "权重 {权重_gib:.2} GiB 而整卡只有 {实测_gib:.2} GiB ⇒ 层数铁定没上去"
+        );
+    }
+
+    #[test]
+    fn 实测显存装得下权重时判通过() {
+        // 同一台机器、同一个模型，重算参数后（999 层 / 262144）：整卡 14095 MiB。
+        let 权重_gib = 9787.0_f64 * 1e6 / (1024.0 * 1024.0 * 1024.0);
+        let 实测_gib = 14095.0 / 1024.0; // ≈ 13.765
+        assert!(实测显存够装权重(权重_gib, 实测_gib));
+    }
+
+    #[test]
+    fn 别的进程占着显存也不会被误报() {
+        // 单边性的直接证明：接管态整卡 used 里含**别的进程**（P100 上常驻 ComfyUI），
+        // 而它们只会把 used **推高** ⇒ 这条判据**不可能**因此误报（只会漏报）。
+        let 权重_gib = 1.708; // Qwen3-1.7B-Q8_0
+        assert!(实测显存够装权重(权重_gib, 30.0), "占得越多越该通过");
+    }
+
+    #[test]
+    fn 余量边界压在九成上() {
+        // 口径必须可解释：GGUF 文件体积含元数据（比纯权重略大），故留 10% 余量；
+        // 而真出事时缺口远大于 10%（现场 31%）⇒ 不会因此漏掉。
+        let 权重_gib = 10.0_f64;
+        assert!(实测显存够装权重(权重_gib, 9.0), "恰好九成：通过");
+        assert!(!实测显存够装权重(权重_gib, 8.99), "差一点点：不通过");
+    }
+
+    #[tokio::test]
+    async fn 接管态能从引擎自报的路径算出权重体积并判定() {
+        // 缝一次「引擎自报路径 → stat → 权重 GiB → 判据」：这条路只在接管态跑，
+        // 单测是唯一兜底（本项目踩过「取的那一半与解析的那一半各自绿、接起来错」）。
+        let 目录 = std::env::temp_dir().join("本地AI-P2-15-单测");
+        std::fs::create_dir_all(&目录).expect("建临时目录");
+        let 文件 = 目录.join("假模型-Q8_0.gguf");
+        // 稀疏文件：只设长度，不真写 1 GiB 数据。
+        std::fs::File::create(&文件)
+            .expect("建文件")
+            .set_len(1024 * 1024 * 1024)
+            .expect("设长度");
+
+        let 端口 = 起假引擎(回执响应(&format!(
+            r#"{{"object":"list","data":[{{"id":"{}"}}]}}"#,
+            // Windows 路径含反斜杠，进 JSON 前必须转义。
+            文件.display().to_string().replace('\\', "\\\\")
+        )));
+        let 客户端 = reqwest::Client::new();
+        let 正文 = 取回执(&客户端, &format!("http://127.0.0.1:{端口}/v1/models"))
+            .await
+            .expect("200 应当拿到正文");
+        let 自报 = crate::model_sidecar::解析模型回执(&正文).expect("正文应能解析");
+        let 权重_gib =
+            std::fs::metadata(&自报).expect("自报路径应能 stat 到").len() as f64
+                / (1024.0 * 1024.0 * 1024.0);
+        assert!((权重_gib - 1.0).abs() < 0.01, "权重体积应约 1 GiB，实际 {权重_gib}");
+        // 整卡 used 给一个不合理的低值 ⇒ 应当判「装不下」。
+        assert!(!实测显存够装权重(权重_gib, 0.25));
+        let _ = std::fs::remove_file(&文件);
+    }
+
+    #[tokio::test]
+    async fn 模型文件读不到时安静返回而不是算通过() {
+        // 「读不到」必须与「通过」「不通过」都不同。这里断言它**安静返回**、
+        // 不 panic、也不误判 —— 日志里那条 INFO 会写明「本次**未做**」。
+        let 不存在 = std::env::temp_dir().join("本地AI-绝不存在的模型-单测用.gguf");
+        let _ = std::fs::remove_file(&不存在);
+        核对接管态显存(&不存在).await;
+    }
+
+    // ── B-1：**计划全量 ⇏ 真上去了**（启动路径的档 2）────────────────────
+    //
+    // 档 1（`gpu_offload_verified`）阈值固定 256 MiB，只抓「完全没上卡」。
+    // 显存不足时 llama.cpp 会静默少卸几层：启动成功、健康检查 200、`/props` 有 n_ctx，
+    // 只有速度掉一半。下面钉住四件事 —— 只对全量计划生效、装不下才报、
+    // **部分卸载装不下也不许报**（那是合法状态）、拿不到层数不猜。
+
+    #[test]
+    fn 计划全量只认规划器的哨兵值() {
+        // 999 是 `cuda_launch_params` 写的「全量」哨兵（`--n-gpu-layers 999`）。
+        assert!(计划全量卸载(Some(999)));
+        assert!(计划全量卸载(Some(u32::MAX)), "比哨兵更大也只能是全量");
+        // 按层数算出来的档位与保守固定档，都是**已经认了**部分卸载。
+        for 层 in [24, 20, 12, 8] {
+            assert!(!计划全量卸载(Some(层)), "{层} 层不是全量计划");
+        }
+        // CPU 模式（`None`）没有「上卡」可言。
+        assert!(!计划全量卸载(None));
+    }
+
+    #[test]
+    fn 计划全量却装不下时要报出来() {
+        // P100 现场原值（§零·5）：Ornith-9B 文件 9787 MB ≈ 9.115 GiB，
+        // 计划 999 层而整卡只有 6424 MiB ≈ 6.273 GiB —— 缺口 31%。
+        let 权重_gib = 9787.0_f64 * 1e6 / (1024.0 * 1024.0 * 1024.0);
+        let 实测_gib = 6424.0 / 1024.0;
+        assert!(
+            全量卸载却没上卡(Some(999), 权重_gib, 实测_gib),
+            "声称全量、实测装不下 ⇒ 必须报（这是本条判据存在的理由）"
+        );
+    }
+
+    #[test]
+    fn 计划全量且装得下时不报() {
+        // 同一台机器重算参数后（999 层 / 262144）：整卡 14095 MiB ≈ 13.765 GiB。
+        let 权重_gib = 9787.0_f64 * 1e6 / (1024.0 * 1024.0 * 1024.0);
+        assert!(!全量卸载却没上卡(Some(999), 权重_gib, 14095.0 / 1024.0));
+        // 边界沿 P2-15：恰好九成通过，差一点点不通过。
+        assert!(!全量卸载却没上卡(Some(999), 10.0, 9.0));
+        assert!(全量卸载却没上卡(Some(999), 10.0, 8.99));
+    }
+
+    #[test]
+    fn 部分卸载装不下属于合法状态不许报() {
+        // 🔴 关键反例：16 GB 卡装 27B-Q3（12.244 GiB）本来就装不满，
+        // 规划器已按余量给出 20/12/8 层 —— 那是「能用但慢」的**正常工作状态**。
+        // 拿全量的尺子量它，会把每一次正常的部分卸载都报成故障（必然误报）。
+        assert!(!全量卸载却没上卡(Some(20), 12.244, 8.0));
+        assert!(!全量卸载却没上卡(None, 12.244, 0.2), "CPU 模式也不许报");
+    }
+
+    #[tokio::test]
+    async fn 采样用同一把尺子() {
+        // 接管态与启动态共用 `采样权重与显存`。钉住 GiB 换算（1024³，不是十进制 GB）：
+        // 稀疏文件 1 GiB，采样必须在 1.00 附近；差 7.4% 就说明混进了 10⁹ 口径。
+        let 目录 = std::env::temp_dir().join("本地AI-B1-采样单测");
+        std::fs::create_dir_all(&目录).expect("建临时目录");
+        let 文件 = 目录.join("假模型-1GiB.gguf");
+        std::fs::File::create(&文件)
+            .expect("建文件")
+            .set_len(1024 * 1024 * 1024)
+            .expect("设长度");
+        match 采样权重与显存(&文件).await {
+            Ok((权重_gib, _实测)) => {
+                assert!((权重_gib - 1.0).abs() < 0.01, "应约 1 GiB，实际 {权重_gib}")
+            }
+            // 非 N 卡 / 无 nvidia-smi 的机器上会走这一支 —— 但**必须带出已读到的权重**，
+            // 否则调用方连「文件是好的、只是读不到显存」都说不出来。
+            Err(采样缺失::显存 { 权重_gib }) => {
+                assert!((权重_gib - 1.0).abs() < 0.01, "显存缺失时权重仍须有效")
+            }
+            Err(采样缺失::文件(错误)) => panic!("文件明明在，不该读不到：{错误}"),
+        }
+        let _ = std::fs::remove_file(&文件);
+    }
+
+    #[tokio::test]
+    async fn 全量判据文件读不到时不判定() {
+        // 与接管态同一条纪律：读不到 → INFO「本次未做」，不是「通过」也不是「失败」。
+        let 不存在 = std::env::temp_dir().join("本地AI-B1-绝不存在的模型.gguf");
+        let _ = std::fs::remove_file(&不存在);
+        核对计划全量卸载(&不存在, Some(999), EngineBackend::Cuda).await;
+        // 非全量计划直接跳过，连文件都不用碰 —— 这条在真实机型上不产生任何 WARN。
+        核对计划全量卸载(&不存在, Some(20), EngineBackend::Cuda).await;
+    }
+
+    #[test]
+    fn 启动路径真的调用了全量判据() {
+        // 🔴 上面五条只证明「判据算得对」，**不证明有人在调用它** ——
+        // 本项目踩过「钩子永不触发」（配置写好了、代码路径走不到，全绿但现场照旧）。
+        // 这里用源码断言兜住「调用点被删 / 被挪进死分支」。needle 用 concat 拼，
+        // 避免把测试自身这段字面量也数进去。
+        let 源码 = include_str!("service.rs");
+        let 调用 = concat!("核对计划全量", "卸载(&model_path");
+        assert_eq!(
+            源码.matches(调用).count(),
+            2,
+            "启动路径有两条分支（激进一次成功 / 保守参数重试）都要核对；少一条就有一半启动路径不受保护"
+        );
+        // ⚠️ 这条**不**证明运行时真的走到了那两条分支 —— 那只能靠实机日志（判据 G-5）。
+    }
+
+    // ── 旁车项并入：它决定「已并入本次启动命令行」那句日志的**真值** ──────────
+    //
+    // 2026-10-16 实机踩到「日志宣称了没发生的动作」，修法之一就是把日志挪到
+    // 真正动手的地方；这几条测试钉的就是**挪过去之后那句话是否还有依据**。
+
+    #[test]
+    fn 没有同名参数时旁车项全部并入并报出生效() {
+        let mut 参数 = vec!["--threads".to_string(), "8".to_string()];
+        let 旁车 = vec![
+            ("--chat-template-file".to_string(), "tpl.jinja".to_string()),
+            ("--lora".to_string(), "lora.gguf".to_string()),
+        ];
+        let 生效 = 并入旁车项(&mut 参数, 旁车);
+        assert_eq!(生效.len(), 2, "两项都该生效：{生效:?}");
+        // 原参数在前、旁车按书写顺序追加 —— 日志按生效项打印，顺序须与命令行一致。
+        assert_eq!(
+            参数.join(" "),
+            "--threads 8 --chat-template-file tpl.jinja --lora lora.gguf"
+        );
+    }
+
+    #[test]
+    fn 用户手写的同名标志会把旁车那一项挡在命令行外() {
+        // 这套「用户优先」规则的地基：被挡掉的**不许**算「已并入」，
+        // 否则那句日志又会变成假情报（工具修了半天，换了个地方接着说假话）。
+        let mut 参数 = vec!["--lora".to_string(), "手写.gguf".to_string()];
+        let 旁车 = vec![
+            ("--chat-template-file".to_string(), "tpl.jinja".to_string()),
+            ("--lora".to_string(), "旁车.gguf".to_string()),
+        ];
+        let 生效 = 并入旁车项(&mut 参数, 旁车);
+        assert_eq!(生效.len(), 1, "只有模板该生效：{生效:?}");
+        assert_eq!(生效[0].0, "--chat-template-file");
+        assert_eq!(参数.iter().filter(|词| *词 == "--lora").count(), 1);
+        assert!(参数.contains(&"手写.gguf".to_string()));
+        assert!(!参数.contains(&"旁车.gguf".to_string()));
+    }
+
+    #[test]
+    fn 等号写法的同名标志也算用户手写() {
+        let mut 参数 = vec!["--lora=D:/手写.gguf".to_string()];
+        let 旁车 = vec![("--lora".to_string(), "D:/旁车.gguf".to_string())];
+        let 生效 = 并入旁车项(&mut 参数, 旁车);
+        assert!(生效.is_empty(), "等号写法同样该挡住旁车项：{生效:?}");
+        assert_eq!(参数.len(), 1);
+    }
+
+    #[test]
+    fn 前缀相同的另一个标志不挡旁车项() {
+        // `--lora-scaled` 不以 `--lora=` 开头 ⇒ 按当前口径**不算**「用户已指定」。
+        // 这条钉的是**现状**（已知边界）：两族并存时引擎会挂两次适配器；
+        // 要改得先立「适配器参数族」的口径，不许在「修日志措辞」里顺手改语义。
+        let mut 参数 = vec!["--lora-scaled".to_string(), "D:/x.gguf:0".to_string()];
+        let 旁车 = vec![("--lora".to_string(), "D:/旁车.gguf".to_string())];
+        let 生效 = 并入旁车项(&mut 参数, 旁车);
+        assert_eq!(生效.len(), 1, "按当前口径应当仍并入：{生效:?}");
+        assert!(参数.contains(&"D:/旁车.gguf".to_string()));
+    }
+
+    #[test]
+    fn 旁车项为空时什么也不做() {
+        let mut 参数 = vec!["--threads".to_string(), "8".to_string()];
+        let 生效 = 并入旁车项(&mut 参数, Vec::new());
+        assert!(生效.is_empty());
+        assert_eq!(参数.join(" "), "--threads 8");
+    }
+
+    // ── P2-11：启动时的模型元数据来源（清单 → 数据库两级查找）──────────────
+    //
+    // 🔴 判据两条，缺一不可：
+    //    ① 导入模型（id 形如 `local-…`，清单里**天生没有**）必须能从数据库
+    //       **回落**取到完整元数据；
+    //    ② 内置模型（清单里查得到）的结果必须**一字不变** —— 回落是兜底，
+    //       不是改口径；改错了会让本来调好的内置模型参数一起跑偏。
+    //    再加一条「改前会怎样」的反推（第四条），否则修的到底是什么说不清。
+
+    fn 建临时数据目录() -> (PathBuf, PathBuf) {
+        // 目录名带 uuid：验证环境必须是自己造的（本项目铁律）。复用固定路径
+        // 会把上一次跑剩的库读进来，而那种「串味」在断言失败时极难分辨。
+        let 目录 = std::env::temp_dir().join(format!("localai-p211-{}", uuid::Uuid::new_v4()));
+        let 库 = crate::database::init_database(&目录).expect("建临时库");
+        (目录, 库)
+    }
+
+    #[test]
+    fn 导入模型查不到清单时从数据库回落() {
+        // 🔴 复刻**老库的真实样子**，别自己造一个干净前提（2026-10-16 实测教训）：
+        //    行是旧版导入流程写的 `imported-…`，而调用方（UI / 文件扫描侧）手里
+        //    是 `local-…`（P100 日志：`switched current model
+        //    model_id=local-Ornith-1.5-9B-Q8_0 source=imported`）。
+        //    上一轮这条测试自己造了一个 `local-…` 的行 —— 真实代码从不会写出那种
+        //    行，于是三条测试全绿、两台实机照旧（测试通过只证明「实现与判据一致」，
+        //    不证明判据是对的）。
+        const 主名: &str = "Ornith-1.5-9B-Q8_0";
+        let 扫描侧id = crate::models::导入模型标识(主名);
+        assert_eq!(
+            扫描侧id, "local-Ornith-1.5-9B-Q8_0",
+            "扫描侧的 id 规则改了，本测试的判据要跟着改"
+        );
+        assert_ne!(
+            扫描侧id,
+            format!("imported-{主名}"),
+            "两种写法必须真的不同，否则这条测的是空气"
+        );
+
+        let (数据目录, 库) = 建临时数据目录();
+        crate::model_repo::upsert_imported_model(
+            &库,
+            &format!("imported-{主名}"),
+            "Ornith-1.5-9B-Q8_0",
+            &数据目录.join("Ornith-1.5-9B-Q8_0.gguf"),
+            9785,
+            11.0,
+            None,
+        )
+        .expect("写入导入模型");
+
+        // 先把「前提」验掉：验证一条被测性质之前，先说清它成立的前提。
+        // 若哪天清单开始包含导入模型，这条会先红，提示本测试已失去意义。
+        assert!(
+            crate::catalog::effective_models(&数据目录)
+                .iter()
+                .all(|m| m.id != 扫描侧id),
+            "前提不成立：导入模型居然出现在清单里，本测试证明不了任何事"
+        );
+
+        let 命中 = 查找启动模型(&数据目录, &库, &数据目录, None, &扫描侧id)
+            .expect("应能从数据库回落取到");
+        assert_eq!(命中.file_size_mb, 9785);
+        assert_eq!(
+            命中.id, 扫描侧id,
+            "命中历史写法后 id 要归成调用方给的那个 —— 否则日志里会突然换名字"
+        );
+        assert!(
+            命中.local_path.is_some(),
+            "回落取到的行必须带真实文件路径，否则 KV 层结构照样读不到"
+        );
+
+        let _ = std::fs::remove_dir_all(&数据目录);
+    }
+
+    #[test]
+    fn 内置模型仍只走清单且结果一字不变() {
+        let (数据目录, 库) = 建临时数据目录();
+        let 期望 = crate::models::builtin_models()
+            .into_iter()
+            .find(|m| m.id == "qwen3_1_7b_light")
+            .expect("内置清单里有 Qwen3-1.7B");
+        let 实际 = 查找启动模型(&数据目录, &库, &数据目录, None, "qwen3_1_7b_light")
+            .expect("内置模型必命中");
+
+        // 逐字段比，不图省事 —— 回落逻辑一动就可能顺手改了内置路径的取值，
+        // 而那种偏差在日志里只表现为「-ngl 跟以前不一样」，看不出来是回归。
+        assert_eq!(实际.id, 期望.id);
+        assert_eq!(实际.name, 期望.name);
+        assert_eq!(实际.file_size_mb, 期望.file_size_mb);
+        assert_eq!(实际.parameters_raw, 期望.parameters_raw);
+        assert_eq!(实际.active_parameters, 期望.active_parameters);
+        assert_eq!(实际.context_length, 期望.context_length);
+        assert_eq!(实际.quant_bpp, 期望.quant_bpp);
+        assert_eq!(实际.architecture, 期望.architecture);
+        assert_eq!(实际.local_path, 期望.local_path);
+
+        let _ = std::fs::remove_dir_all(&数据目录);
+    }
+
+    #[test]
+    fn 库里也没有的模型返回未知而不是报错() {
+        let (数据目录, 库) = 建临时数据目录();
+        assert!(
+            查找启动模型(&数据目录, &库, &数据目录, None, "压根不存在的模型").is_none(),
+            "清单、库、磁盘三处都没有时不许乱猜，必须老实返回 None"
+        );
+        let _ = std::fs::remove_dir_all(&数据目录);
+    }
+
+    #[test]
+    fn 库里没有行时改从磁盘兜底() {
+        // 🔴 P2-11 续二的**判据本体**（2026-10-16 P100 实机抓出）：
+        //    模型压根没进过库 —— 真实用法是把 gguf 拷进 `models/<目录>/`
+        //    让界面扫描发现它（`switch_installed_model` 只设路径、不落库）。
+        //    上一版只查到第二级为止，此处会**静默**返回 None，实机表现为
+        //    「日志里一句话都不说，参数还是 24 层 / 4096」。
+        const 主名: &str = "兜底模型";
+        let (数据目录, 库) = 建临时数据目录();
+        // 故意**不**调 `upsert_imported_model`：库里就是没有这一行。
+        let 模型目录 = 数据目录.join("models").join(主名);
+        std::fs::create_dir_all(&模型目录).expect("建模型目录");
+        let 文件 = 模型目录.join(format!("{主名}.gguf"));
+        // 写占位内容即可：本测试只验「取到了、取的哪一份」，
+        // GGUF 头解析失败时 `imported_metadata` 会给出兜底的上下文档，
+        // 那不是这条判据要管的事（真机上的解析结果由 §九 的实机清单覆盖）。
+        std::fs::write(&文件, vec![0u8; 3_000_000]).expect("写占位模型文件");
+
+        let 期望id = crate::models::导入模型标识(主名);
+        let 命中 = 查找启动模型(&数据目录, &库, &数据目录, None, &期望id)
+            .expect("文件就在磁盘上，库有没有行不该决定这件事");
+
+        assert_eq!(命中.id, 期望id, "id 要用调用方给的那个，不能自己改名");
+        assert_eq!(
+            命中.file_size_mb, 3,
+            "文件大小按十进制向上取整（3,000,000 B ⇒ 3 MB），口径要与扫描侧一致"
+        );
+        assert!(
+            命中.local_path
+                .as_deref()
+                .is_some_and(|路径| 路径.ends_with("兜底模型.gguf")),
+            "必须把真正用到的那个文件路径带回来 —— 它是 KV 层结构解析的入口"
+        );
+
+        let _ = std::fs::remove_dir_all(&数据目录);
+    }
+
+    #[test]
+    fn 磁盘兜底只认主名相同的文件() {
+        // 防止「修过头」：第三级若见 gguf 就用，同一个目录里放着别的模型时
+        // 会张冠李戴，把别人的层结构算进本次启动 —— 比原来的兜底值更坏，
+        // 因为它**看起来是对的**。
+        const 主名: &str = "要的模型";
+        let (数据目录, 库) = 建临时数据目录();
+        let 目录 = 数据目录.join("models").join("某个目录");
+        std::fs::create_dir_all(&目录).unwrap();
+        std::fs::write(目录.join("别的模型.gguf"), b"GGUF").unwrap();
+
+        assert!(
+            查找启动模型(
+                &数据目录,
+                &库,
+                &数据目录,
+                None,
+                &crate::models::导入模型标识(主名)
+            )
+            .is_none(),
+            "目录里只有别的模型时，不许被兜底捡走"
+        );
+
+        let _ = std::fs::remove_dir_all(&数据目录);
+    }
+
+    #[test]
+    fn 磁盘兜底优先用当前正在用的那个文件() {
+        // 同一个模型名可能在两处各有一份（不同量化档）。用户界面上选的是
+        // `local_model_path` 指向的那一份，参数就该按那一份算 —— 兜底路径
+        // 里的排序不能把它的优先级冲掉。
+        const 主名: &str = "双份模型";
+        let (数据目录, 库) = 建临时数据目录();
+        let id = crate::models::导入模型标识(主名);
+
+        // 托管目录里一份（1 MB）
+        let 托管目录 = 数据目录.join("models").join(主名);
+        std::fs::create_dir_all(&托管目录).unwrap();
+        std::fs::write(托管目录.join(format!("{主名}.gguf")), vec![0u8; 1_000_000]).unwrap();
+
+        // 「当前正在用」的那一份在别处（5 MB），靠大小区分是哪一份被采纳了。
+        // 路径里带中文，顺带钉住「排序不会因为编码顺序把它挤到后面」。
+        let 当前文件 = 数据目录.join("别处").join(format!("{主名}.gguf"));
+        std::fs::create_dir_all(当前文件.parent().unwrap()).unwrap();
+        std::fs::write(&当前文件, vec![0u8; 5_000_000]).unwrap();
+
+        let 命中 = 查找启动模型(&数据目录, &库, &数据目录, Some(&当前文件), &id)
+            .expect("应能从磁盘兜底取到");
+        assert_eq!(
+            命中.file_size_mb, 5,
+            "应当优先采信「当前正在用」的那份（5 MB），而不是目录里扫到的（1 MB）"
+        );
+
+        let _ = std::fs::remove_dir_all(&数据目录);
+    }
+
+    #[test]
+    fn 回落之后启动参数不再落到兜底默认值() {
+        // 用 P100 上的**真实数字**反推：Ornith-1.5-9B Q8_0（9.114 GiB ⇒ 十进制
+        // 9785 MB）、可用显存 15.898 GiB。
+        //
+        // 修复前：模型元数据恒为 None ⇒ `cuda_launch_params` 根本没被调用，
+        // 参数恒为 DEFAULT_CUDA_PARAMS（24 层 / 4096），**与显存多少无关**
+        // （本机 8G 与虚机 16G 算出同一组，正是这一点暴露的 P2-11）。
+        // 修复后：权重与原生上下文都拿得到 ⇒ 必须走反解。
+        //
+        // ⚠️ KV 那一项这里故意用**旧的参数量经验系数**（最保守的输入），
+        // 不是真实 GGUF 层结构 —— 所以下面算出的上下文是**下限**，真机只会更长。
+        // 行按**老库的真实写法**写（`imported-…`），查询用**UI 手里的那个 id**
+        // （`local-…`）；两个字符串都由 `导入模型标识` 派生，不手抄字面量。
+        const 主名: &str = "Ornith-1.5-9B-Q8_0";
+        let (数据目录, 库) = 建临时数据目录();
+        crate::model_repo::upsert_imported_model(
+            &库,
+            &format!("imported-{主名}"),
+            "Ornith-1.5-9B-Q8_0",
+            &数据目录.join("Ornith-1.5-9B-Q8_0.gguf"),
+            9785,
+            11.0,
+            Some(&crate::gguf::GgufMetadata {
+                parameter_count: 9_197_000_000,
+                context_length: Some(262_144),
+                ..Default::default()
+            }),
+        )
+        .expect("写入导入模型");
+
+        let 模型 = 查找启动模型(
+            &数据目录,
+            &库,
+            &数据目录,
+            None,
+            &crate::models::导入模型标识(主名),
+        )
+        .expect("应能回落取到");
+        assert_eq!(
+            模型.context_length, 262_144,
+            "原生上下文必须带回来 —— 否则就算权重读到了，上下文仍被钉在 4096"
+        );
+
+        let 参数 = cuda_launch_params(
+            15.8984375,
+            resolve_weight_gb(&模型),
+            LEGACY_KV_GIB_PER_TOKEN_PER_BILLION * 9.197,
+            0.0,
+            模型.context_length as u32,
+        );
+
+        assert_ne!(参数, DEFAULT_CUDA_PARAMS, "回落生效后不该再是兜底默认值");
+        assert_eq!(
+            参数.n_gpu_layers,
+            Some(999),
+            "16 GB 卡放得下 9.1 GiB 权重，应当全量卸载（实际：{参数:?}）"
+        );
+        assert!(
+            参数.ctx_size > DEFAULT_CUDA_PARAMS.ctx_size,
+            "上下文应当明显大于 4096（实际：{}）",
+            参数.ctx_size
+        );
+
+        let _ = std::fs::remove_dir_all(&数据目录);
+    }
+
+    // ── P2-12：回执探测用的地址（监听地址 ≠ 可连接地址）────────────────────
+    //
+    // 这条在 P100 上暴露：那台机开了「局域网可访问」⇒ 监听 `0.0.0.0`，
+    // 而回执探测照着监听地址拼 URL，于是 `/v1/models` 永远连接失败
+    // （日志原文：`error sending request for url (http://0.0.0.0:8000/v1/models)`），
+    // 「接管到的服务跑的是不是这个模型」在这台机上**从来没核对成过**。
+    // 本机的默认值是 `127.0.0.1`，所以只看本机永远看不到。
+    #[test]
+    fn 探测主机_只把通配监听地址换成本机回环() {
+        assert_eq!(探测主机("0.0.0.0"), "127.0.0.1", "通配地址不可连接");
+        assert_eq!(探测主机("::"), "127.0.0.1", "IPv6 通配同样不可连接");
+        assert_eq!(探测主机(" 0.0.0.0 "), "127.0.0.1", "带空白的也要认出来");
+        assert_eq!(探测主机(""), "127.0.0.1", "没配就按本机回环探");
+        // 非通配**必须原样**：一律改回环会在「只监听某块网卡」时反而连不上。
+        assert_eq!(探测主机("192.168.1.5"), "192.168.1.5");
+        assert_eq!(探测主机("127.0.0.1"), "127.0.0.1");
+    }
+
+    // ── P2-13：接管与「正在启动」的竞态 ────────────────────────────────────
+    //
+    // P100 日志里那次 `reattached` 出现在本会话**正在起服务**的当口：
+    // 它把一个刚起的进程认成「上次留下的旧进程」，把状态里的 model_id 写回旧的，
+    // 并把 `process` 置回 None（子进程句柄还在启动任务手里）。
+    // 这条判据（可不可达分支由单测兜底）：只有本会话手里没有服务时，才去读旧记录。
+    #[test]
+    fn 应当尝试接管_本会话正在管服务时不接管() {
+        assert!(应当尝试接管(&ServiceStatus::Stopped));
+        assert!(
+            应当尝试接管(&ServiceStatus::Failed),
+            "起步失败 ⇒ 本会话手里没有服务，接管真正的残留进程仍是原语义"
+        );
+        assert!(
+            !应当尝试接管(&ServiceStatus::Starting),
+            "正在起服务时接管 = 把新起的进程认成旧进程（P2-13）"
+        );
+        assert!(
+            !应当尝试接管(&ServiceStatus::Running),
+            "本会话已有服务，不必再读上个会话的记录"
         );
     }
 }

@@ -47,7 +47,7 @@ const canRun = computed(() => Boolean(props.availability?.available) && !props.r
 
     <p class="muted hint">
       用同一段提示词在当前后端与另一个后端各生成一次，逐字比对输出。
-      <strong>校验期间服务会重启两次，聊天暂时不可用（约 1–2 分钟）</strong>，
+      <strong>校验期间服务会重启三次，聊天暂时不可用（约 1–2 分钟）</strong>，
       结束后自动切回你原来的后端。
     </p>
 
@@ -77,15 +77,15 @@ const canRun = computed(() => Boolean(props.availability?.available) && !props.r
           <tr v-for="run in speedRows" :key="run.backend">
             <td>{{ run.backend }}</td>
             <td>{{ run.effective_backend || '—' }}</td>
-            <td>{{ run.tokens_per_sec.toFixed(2) }} 字/秒</td>
-            <td>{{ run.token_count }} 字</td>
+            <td>{{ run.tokens_per_sec.toFixed(2) }} token/秒</td>
+            <td>{{ run.token_count }} token</td>
             <td>{{ run.stop_type === 'limit' ? '跑满长度' : '自然结束' }}</td>
           </tr>
         </tbody>
       </table>
 
       <p class="muted footnote">
-        「实际后端」是引擎真正加载的那个（扫描引擎目录得出）。两轮这一列必须**不同**，
+        「实际后端」是引擎真正加载的那个（扫描引擎目录得出）。两轮这一列必须<strong>不同</strong>，
         校验才成立；若相同，本次校验会被直接判为无效。
       </p>
 
@@ -93,7 +93,8 @@ const canRun = computed(() => Boolean(props.availability?.available) && !props.r
         已恢复到你原来的后端：{{ result.restored_to }}
       </p>
       <p class="muted footnote">
-        提示：两个后端的速度通常只差个位数百分比，瓶颈多在显存带宽。校验的意义是
+        提示：两个后端的速度通常接近，瓶颈多在显存带宽；但少数组合（例如新架构配
+        Vulkan）可能相差数倍，那是后端实现效率的差异，不代表算错了。校验的意义是
         确认输出可靠，而不是挑选更快的后端。
       </p>
     </template>

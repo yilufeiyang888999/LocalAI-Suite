@@ -15,6 +15,7 @@ mod hash;
 mod logging;
 pub mod manifest;
 mod model_repo;
+mod model_sidecar;
 mod models;
 mod proc;
 mod recommend;

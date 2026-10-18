@@ -32,6 +32,12 @@ pub struct InstalledModelInfo {
     /// True only for a builtin model whose recorded version marker differs from
     /// the current catalog `sha256`. Unknown (no marker) counts as up to date.
     pub update_available: bool,
+    /// 该模型是否自带**微调包**（旁车配置 `<主名>.launch.json`，见
+    /// `model_sidecar.rs`）。为真表示启动时会自动挂上 LoRA 适配器并套用
+    /// 与训练一致的对话模板 —— 界面据此打「微调包」角标，让「能力存在」
+    /// 同时也是「看得见」。只判断文件在不在，不解析内容（写坏了由启动时报错）。
+    #[serde(rename = "has_finetune_bundle")]
+    pub has_finetune_bundle: bool,
 }
 
 /// Sidecar written next to a downloaded model recording which catalog version is
@@ -142,6 +148,7 @@ pub fn list_installed_models(
             .as_ref()
             .map(|current| path_key(current) == path_key(&path))
             .unwrap_or(false);
+        let has_finetune_bundle = crate::model_sidecar::有旁车配置(&path);
         models.push(InstalledModelInfo {
             model_id: row.id,
             name: row.name,
@@ -150,6 +157,7 @@ pub fn list_installed_models(
             source: "imported".to_string(),
             is_current,
             update_available: false,
+            has_finetune_bundle,
         });
     }
 
@@ -226,6 +234,26 @@ fn push_installed_model(
     Ok(())
 }
 
+/// **导入模型的唯一 id 规则**（本项目「唯一事实来源」在命名上的落点）。
+///
+/// 🔴 **为什么必须只剩这一份**（P2-11 续，2026-10-16 实机抓出）：这条规则此前
+/// **有两份** —— 文件扫描侧（`installed_model_info`，也是 UI 真正拿到的那个 id）
+/// 写 `local-<主名>`，导入写库侧（`import_model_file`）写 `imported-<主名>`。
+/// 两边看着都对，合起来就是：**UI 说 `local-Ornith-1.5-9B-Q8_0`，库里存
+/// `imported-Ornith-1.5-9B-Q8_0`** ⇒ 「按 UI 给的 id 回库查元数据」必然落空
+/// （P100 日志铁证：`switched current model model_id=local-Ornith-1.5-9B-Q8_0
+/// source=imported`，而 `model_metadata` 里那一行是 `imported-…`）。
+///
+/// 代价不是「报个错」，而是**静默失效**：模型元数据恒为 `None` ⇒ 显存反解与
+/// KV 精度在导入模型上一次都不生效 ⇒ 启动参数永远是兜底的 `24 层 / 4096`，
+/// 与显存多少无关。P100 的 16 GB 上只用到 6424 MiB 就是这么来的。
+///
+/// 两份规则的典型后果就是「改一处、另一处不报错、只给错值」—— 所以两侧都改成
+/// 调本函数，谁再想内联一个 `format!` 时先看一眼这里。
+pub fn 导入模型标识(文件主名: &str) -> String {
+    format!("local-{}", 文件主名.replace(' ', "-"))
+}
+
 fn installed_model_info(
     install_dir: &Path,
     path: &Path,
@@ -243,7 +271,7 @@ fn installed_model_info(
     let model_id = matched
         .as_ref()
         .map(|model| model.id.clone())
-        .unwrap_or_else(|| format!("local-{}", fallback_name.replace(' ', "-")));
+        .unwrap_or_else(|| 导入模型标识(&fallback_name));
     let name = matched
         .as_ref()
         .map(|model| model.name.clone())
@@ -270,6 +298,7 @@ fn installed_model_info(
             .map(|current| path_key(current) == path_key(path))
             .unwrap_or(false),
         update_available,
+        has_finetune_bundle: crate::model_sidecar::有旁车配置(path),
     })
 }
 
@@ -370,7 +399,10 @@ pub fn import_local_model(
     inner.settings.local_model_path = Some(model_path.clone());
     save_settings(&inner.data_dir, &inner.settings)?;
 
-    let model_id = format!("imported-{}", name.replace(' ', "-"));
+    // 与文件扫描侧共用同一条规则（`导入模型标识`）：以前这里写 `imported-…`，
+    // 而 UI 侧算出来的是 `local-…` ⇒ 按 UI 的 id 回库查不到这一行，
+    // 启动参数就退回兜底的 24 层 / 4096（P2-11 续，2026-10-16 实机抓出）。
+    let model_id = 导入模型标识(&name);
     let _ = crate::model_repo::upsert_imported_model(
         &inner.db_path,
         &model_id,
@@ -676,6 +708,31 @@ mod tests {
         assert!(builtin_models().iter().all(|model| !model.is_installed));
     }
 
+    /// **跨语言边界护栏**：`InstalledModelInfo` 的字段名就是前端读的键名。
+    /// 这条断言把「模型是否自带微调包」这个新字段的**线上名字**钉死 ——
+    /// 本项目踩过「改了字段名、前端一个分支都进不去却完全不报错」，所以
+    /// 跨边界的键名必须有字面量断言兜着。
+    #[test]
+    fn installed_model_info_wire_keys_are_pinned() {
+        let 信息 = InstalledModelInfo {
+            model_id: "m".to_string(),
+            name: "名字".to_string(),
+            local_path: "C:/x.gguf".to_string(),
+            file_size_mb: 1,
+            source: "imported".to_string(),
+            is_current: false,
+            update_available: false,
+            has_finetune_bundle: true,
+        };
+        let 文本 = serde_json::to_string(&信息).expect("结构体应能序列化");
+        assert!(
+            文本.contains("\"has_finetune_bundle\":true"),
+            "「微调包」角标靠这个键名，改了就静默失效。实际：{文本}"
+        );
+        assert!(文本.contains("\"is_current\":false"), "实际：{文本}");
+        assert!(文本.contains("\"update_available\":false"), "实际：{文本}");
+    }
+
     #[test]
     fn url_file_name_extracts_basename() {
         assert_eq!(
@@ -735,6 +792,38 @@ mod tests {
         newer.sha256 =
             "0000000000000000000000000000000000000000000000000000000000000000".to_string();
         assert!(is_update_available(&install_dir, &newer));
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+    }
+
+    /// **id 规则唯一性护栏**（P2-11 续，2026-10-16）。
+    ///
+    /// 文件扫描侧算出来的 id（也就是 UI 真正拿到的那个）必须**等于**
+    /// `导入模型标识` 的输出 —— 导入写库侧走的是同一个函数，两侧一致，
+    /// 「按 UI 的 id 回库查元数据」才可能命中。
+    ///
+    /// 这条测试存在的唯一理由：上一轮两侧各写各的（`local-…` vs `imported-…`），
+    /// 所有单测全绿、两台实机上却静默失效（启动参数永远是 24 层 / 4096）。
+    #[test]
+    fn 扫描侧与导入侧共用同一条id规则() {
+        // ① 规则本身：真实机器上的名字（P100 的 Ornith-1.5-9B-Q8_0）与含空格的写法
+        assert_eq!(
+            导入模型标识("Ornith-1.5-9B-Q8_0"),
+            "local-Ornith-1.5-9B-Q8_0"
+        );
+        assert_eq!(导入模型标识("我的 模型"), "local-我的-模型");
+
+        // ② 扫描侧真的调了它（不只是一个漂亮函数的单元测试）
+        let install_dir = std::env::temp_dir().join(format!("localai-idrule-{}", uuid_like()));
+        let model_dir = install_dir.join("models").join("我的自定义目录");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let path = model_dir.join("我的 模型.gguf");
+        std::fs::write(&path, b"GGUF").unwrap();
+
+        let 信息 = installed_model_info(&install_dir, &path, &None).unwrap();
+        assert_eq!(信息.model_id, 导入模型标识("我的 模型"), "扫描侧没走唯一规则");
+        assert_eq!(信息.model_id, "local-我的-模型");
+        assert_eq!(信息.source, "imported");
 
         let _ = std::fs::remove_dir_all(&install_dir);
     }

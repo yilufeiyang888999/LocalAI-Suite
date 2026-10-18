@@ -86,6 +86,10 @@ async function requestUninstall(model: InstalledModelInfo) {
             <h3>{{ model.name }}</h3>
             <span v-if="model.is_current" class="current-badge">当前使用中</span>
             <span v-if="model.update_available" class="update-badge">有新版本</span>
+            <!-- 微调包角标：模型旁有 `<主名>.launch.json` 时会自动挂 LoRA +
+                 套用与训练一致的对话模板。打出来是为了让「部署了微调」这件事
+                 在界面上看得见 —— 能力看不见，就等于没有。 -->
+            <span v-if="model.has_finetune_bundle" class="finetune-badge" title="启动时会自动挂上 LoRA 适配器并套用模型自带的对话模板">微调包</span>
           </div>
           <p class="muted">{{ sourceLabel(model.source) }} · {{ sizeLabel(model.file_size_mb) }}</p>
           <p class="model-path">{{ model.local_path }}</p>
