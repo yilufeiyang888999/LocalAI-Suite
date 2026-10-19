@@ -443,8 +443,10 @@ fn estimate_vram_gb(file_bytes: u64, gguf: Option<&crate::gguf::GgufMetadata>) -
     // 显存一律按 GiB（1024³）计，与 `nvidia-smi` 的口径一致；用 10⁹ 会与
     // 可用显存相减时引入约 7% 的系统偏差。
     let weight_gb = file_bytes as f64 / crate::gguf::每GiB字节;
-    // 计算缓冲 + 驱动与运行库占用；llama.cpp 在 8G 卡上实测约 1.3 GiB。
-    let overhead_gb = 1.3;
+    // 计算缓冲 + 驱动与运行库占用。与启动规划共用同一个常量 —— 这里曾经
+    // 也硬编码了一份 1.3，两处会各自漂移（实测需 1.84，反推过程见
+    // `service.rs` 的 `GPU_OVERHEAD_GB` 注释）。
+    let overhead_gb = crate::service::GPU_OVERHEAD_GB;
     // 以 8K 上下文作为「能不能跑」的门槛；启动时再按可用显存求最大上下文。
     let kv_gb = gguf.map(|meta| meta.kv_gb(8192, 2.0)).unwrap_or(0.5);
     let total = weight_gb + overhead_gb + kv_gb;

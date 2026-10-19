@@ -79,11 +79,23 @@ const GPU_STARTUP_TIMEOUT_SECS: u64 = 120;
 /// JIT step, so the original tighter budget is fine.
 const CPU_STARTUP_TIMEOUT_SECS: u64 = 90;
 
-/// Runtime reserve on top of model weights + KV cache, in GB. Matches the
-/// `0.5GB` run reserve in the VRAM formula, plus an extra `0.8GB` safety pad for
-/// GPU compute buffers / driver overhead so we don't launch right at the edge
-/// and spill into shared system memory (which tanks throughput).
-const GPU_OVERHEAD_GB: f64 = 0.5 + 0.8;
+/// 模型权重与 KV 之外的运行期 GPU 占用（GiB）—— **全项目唯一来源**。
+///
+/// 含 CUDA context、compute buffer、驱动与运行库，外加「别贴着边启动」的余量。
+///
+/// 旧值 `0.5 + 0.8 = 1.3` 偏乐观。2026-10-18 在本机 8G 卡（RTX 5060 Laptop）
+/// 对 Qwen3-1.7B Q8_0、ctx=40960、KV q8 做了三次实测，用
+/// `nvidia-smi used − 权重 1.7084 − KV 2.1876` 反推开销：
+/// **1.8394 / 1.8384 / 1.8237 GiB**（三次独立吻合，取最坏值 1.84）。
+///
+/// 低估的代价不是「少开点上下文」这么温和：规划器会以为还够放 fp16 KV，
+/// 实际开出来溢出到共享内存 —— llama.cpp 不报错，只是慢得莫名其妙，
+/// 排错时极难定位到「预留少算了 0.5 GiB」。
+///
+/// ⚠️ 改这个数必须同步改 `cuda_launch_params` 的单测期望值 —— 它们全是按
+/// 这个常量算出来的预算。`models::estimate_vram_gb` 也直接引用本常量
+/// （那里曾另有一份硬编码 1.3，两处各自漂移）。
+pub(crate) const GPU_OVERHEAD_GB: f64 = 1.84;
 
 /// fp16 与目标上下文的差距在这个比例以内时，不再为那点长度降精度。
 ///
@@ -3055,8 +3067,8 @@ mod tests {
 
     #[test]
     fn small_model_fits_fp16_at_default_context() {
-        // 8G 卡跑 Qwen3-1.7B：权重 1.71 + 保留 1.3 = 3.01，余 4.99 GiB。
-        // fp16 KV（112 KB/token）够约 46K，16K 目标档轻松放下 → 走 fp16 最快。
+        // 8G 卡跑 Qwen3-1.7B：权重 1.71 + 保留 1.84 = 3.55，余 4.45 GiB。
+        // fp16 KV（112 KB/token）够约 41.6K，16K 目标档轻松放下 → 走 fp16 最快。
         let p = cuda_launch_params(8.0, W1_7B, KV1_7B, NO_KV_FIXED, 16384);
         assert_eq!(p.n_gpu_layers, Some(999));
         assert_eq!(p.ctx_size, 16384);
@@ -3066,8 +3078,8 @@ mod tests {
 
     #[test]
     fn qwen3_8b_needs_q8_to_reach_default_context() {
-        // 8G 卡跑 Qwen3-8B Q4_K_M 的真实情形：权重 4.68 + 保留 1.3 = 5.98，
-        // 只剩约 2.0 GiB。fp16 KV（144 KB/token）只够约 15K，差一点点不到
+        // 8G 卡跑 Qwen3-8B Q4_K_M 的真实情形：权重 4.68 + 保留 1.84 = 6.52，
+        // 只剩约 1.48 GiB。fp16 KV（144 KB/token）只够约 10.8K，差一点点不到
         // 16K 目标档，于是退一档用 q8 半量 + flash attention 补上。
         // 这正是「按参数量估算 KV」看不到的差别。
         let p = cuda_launch_params(8.0, W8B, KV8B, NO_KV_FIXED, 16384);
@@ -3102,7 +3114,7 @@ mod tests {
 
     #[test]
     fn very_low_vram_falls_back_to_partial_offload() {
-        // Qwen3-8B 权重 4.68 + 保留 1.3 = 5.98：8G 以下的卡全量装不进，
+        // Qwen3-8B 权重 4.68 + 保留 1.84 = 6.52：可用显存低于 6.52 的卡全量装不进，
         // 按层数分档部分卸载，至少还能起来。
         let tight = cuda_launch_params(4.0, W8B, KV8B, NO_KV_FIXED, 32768);
         assert_eq!(tight.n_gpu_layers, Some(20));
@@ -3162,8 +3174,8 @@ mod tests {
     #[test]
     fn model_native_context_replaces_the_16k_hard_cap() {
         // 盯防「16384 上限被重新写死」。Qwen3-1.7B 原生 40960，8G 卡上
-        //   budget = 8.0 − 1.71 − 1.3 = 4.99 GiB，fp16 每 token 112 KB
-        //   → 够约 46K，足以放满原生上下文。
+        //   budget = 8.0 − 1.71 − 1.84 = 4.45 GiB，fp16 每 token 112 KB
+        //   → 够约 41.6K，足以放满原生上下文。
         // 放在旧代码里这里只会得到 16384（`min(context_length, 16384)`）。
         let p = cuda_launch_params(8.0, W1_7B, KV1_7B, NO_KV_FIXED, 40_960);
         assert!(
@@ -3176,26 +3188,57 @@ mod tests {
 
     #[test]
     fn tiny_shortfall_keeps_fp16_instead_of_dropping_to_q8() {
-        // Qwen3-1.7B 在 8G 卡实测空闲量 7.2 GiB 下：
-        //   budget = 7.2 − 1.71 − 1.3 = 4.19 GiB → fp16 约 39.2K，
-        //   离原生 40960 只差 5% 出头，正落在容忍带内。
-        // 为这点长度把整段 KV 降成 q8 并不划算，应留在 fp16。
-        let p = cuda_launch_params(7.2, W1_7B, KV1_7B, NO_KV_FIXED, 40_960);
+        // 容忍带机制本身：fp16 的物理上限比目标只差一点点时，不为那点长度
+        // 把整段 KV 降成 q8（q8 每 token 多一次反量化，短对话反而更慢）。
+        //
+        // 🔴 目标上下文 **26,624 是构造值**，不是哪个模型的原生长度 —— 容忍带
+        // 只有 5% 宽，真实组合很难正好落进去：8G 卡 usable 实测 6.33 GiB，
+        // 1.7B 在其上只够 fp16 26.0K，离原生 40,960 差 36%，根本不在带内。
+        // 用构造的 target 只为把这个分支覆盖到；真机口径见下一条
+        // `overhead_matches_measured_footprint`。
+        //   可用 6.33 − 1.71 − 1.84 = 2.78 GiB → fp16 约 26.0K
+        //   26.0K × 1.05 = 27.3K ≥ 26,624 ⇒ 落在容忍带内
+        let p = cuda_launch_params(6.33, W1_7B, KV1_7B, NO_KV_FIXED, 26_624);
         assert!(!p.kv_quant, "差距在容忍带内就该保留 fp16");
         assert!(
-            p.ctx_size < 40_960 && p.ctx_size >= 36_864,
+            p.ctx_size < 26_624 && p.ctx_size >= 24_576,
             "应开 fp16 的物理上限（而非降到 2048 档），实际 {}",
             p.ctx_size
         );
     }
 
     #[test]
+    fn overhead_matches_measured_footprint() {
+        // 把预留量钉在实测上，而不是钉在「上一版写了多少」。
+        //
+        // Qwen3-1.7B Q8_0、ctx=40960、KV q8 —— 2026-10-18 本机三次
+        // `nvidia-smi` 读数（GiB）。规划口径必须能反推出这三次，否则就是又
+        // 滑回「算得比现实乐观」：旧值 1.3 时这里差 −0.54，正是「计划放得下、
+        // 实际 KV 溢出到共享内存」的成因，而 llama.cpp 全程不报错。
+        const 实测_GIB: [f64; 3] = [5.7354, 5.7344, 5.7197];
+        let kv_q8 = KV1_7B * 40_960.0 * 0.5;
+        let 预估 = W1_7B + kv_q8 + GPU_OVERHEAD_GB;
+        for 实测 in 实测_GIB {
+            let 差 = 预估 - 实测;
+            assert!(
+                差.abs() <= 0.05,
+                "规划口径反推实测失败：预估 {预估:.4} vs 实测 {实测:.4}（差 {差:+.4}）"
+            );
+        }
+    }
+
+    #[test]
     fn spark_reaches_far_past_16k_on_an_8g_card() {
         // Spark-X2.5-4B Q6_K 在 8G 卡上的真实情形 —— 放开上限的主要受益者。
-        //   budget = 7.2（实测空闲）− 2.93（权重）− 1.3（保留）− 0.05（滑窗固定）
-        //          = 2.92 GiB
-        //   fp16 每 token 只有 36 KB（9 层全注意力），够约 85K，仍远不到原生 1M，
+        //   budget = 7.2（假设空闲；本机实测空载 6.33，见下）− 2.93（权重）
+        //          − 1.84（预留）− 0.05（滑窗固定） = 2.38 GiB
+        //   fp16 每 token 只有 36 KB（9 层全注意力），够约 69K，仍远不到原生 1M，
         //   于是走 q8 取物理最大。关键是这个结果远大于过去硬编码的 16384。
+        //   ⚠️ 输入 7.2 是本条与
+        //   `sliding_window_fixed_kv_is_deducted_from_the_budget` 共用的**基准值**，
+        //   不是本机实测（本机空载 usable 为 6.33）。若换成 6.33，q8 只到约 85K，
+        //   过不了这里 131,072 的下限 —— 但那不影响本条要证明的事：**4B 模型在
+        //   8G 卡上能开到的上下文远大于旧的硬编码 16384**。
         let p = cuda_launch_params(7.2, W_SPARK_Q6, KV_SPARK, KV_FIXED_SPARK, CTX_SPARK_NATIVE);
         assert_eq!(p.n_gpu_layers, Some(999), "全量卸载应能装下");
         assert_eq!(p.parallel, 1);
@@ -3228,7 +3271,7 @@ mod tests {
             有固定.ctx_size,
             无固定.ctx_size
         );
-        // 54 MiB 只占预算的 1.8%，所以差距应该是几千 token 量级，而不是翻倍。
+        // 54 MiB 只占预算的 2.2%，所以差距应该是几千 token 量级，而不是翻倍。
         let 差 = 无固定.ctx_size - 有固定.ctx_size;
         assert!(
             (2_048..=8_192).contains(&差),
