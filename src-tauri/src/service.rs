@@ -695,12 +695,51 @@ pub async fn start_service_core(
     // made model updates always roll back). A genuinely external holder stays
     // taken past the wait window.
     if configured_port != 0 && !restarting_same_address && !wait_for_port_available(&host, port).await {
-        let info = set_failed(
-            app,
-            state,
-            format!("接口端口 {} 已被占用，请在设置里换一个端口。", port),
-        );
-        return Err(AppError::Message(info.message));
+        // 🔴 端口被占有两种完全不同的情形，此前一律报「请换一个端口」，
+        // 把**最常见的那一种**变成了死路。
+        //
+        // 2026-10-19 P100 实测：关掉 APP（引擎按设计继续跑）再重开，接管没接上
+        // （`recover_service` 那条记录没读到，或健康探测那一次没答），前端随即
+        // 自动启动，于是撞上**自己上一次起的那个引擎** —— 界面弹出「请换一个端口」。
+        // 用户此刻既停不掉它（新会话手里没有它的句柄），也不该换端口（换了就再也
+        // 接不回原来那个，还得手工去杀进程）。
+        //
+        // 所以先问一句「占用者是谁」：能按 llama-server 的协议答出模型列表，
+        // 就是我方引擎 ⇒ 直接接管（幂等）。判据**不能**停在「端口在听」——
+        // 那是本项目「『活着』≠『能干这件事』」那条的直接应用：任何占端口的程序
+        // 都会让端口「在听」，只有引擎能答出 `/v1/models` 的结构化正文。
+        match 识别端口上的引擎(&host, port).await {
+            Some(引擎自报) => {
+                let 期望 = model_path.display().to_string();
+                let 问题 = crate::model_sidecar::核对模型(&期望, &引擎自报);
+                if 问题.is_empty() {
+                    return Ok(接管遗留引擎(app, state, model_id, &host, port, &引擎自报));
+                }
+                // 是我方引擎、但跑的不是要启动的那个模型：**不许**接管（否则界面
+                // 显示 A、实际跑 B），也不许静默杀掉（那会把用户正在用的服务干掉）。
+                // 报出两边名字，让用户能决定是停服务还是换端口。
+                let info = set_failed(
+                    app,
+                    state,
+                    format!(
+                        "接口端口 {} 上正在运行另一个模型（{}），不是这次要启动的「{}」。\
+                         请先在那边停止服务，或到设置里换一个端口。",
+                        port,
+                        引擎自报,
+                        期望
+                    ),
+                );
+                return Err(AppError::Message(info.message));
+            }
+            None => {
+                let info = set_failed(
+                    app,
+                    state,
+                    format!("接口端口 {} 已被占用，请在设置里换一个端口。", port),
+                );
+                return Err(AppError::Message(info.message));
+            }
+        }
     }
 
     let params = if backend.is_gpu() {
@@ -1053,6 +1092,14 @@ pub async fn recover_service(
     };
 
     let Some(persisted) = persisted else {
+        // 🔴 这一步**必须留下痕迹**：2026-10-19 P100 实测「关 APP 再重开没接管」，
+        // 日志里一句话都没有 —— 「没有记录」与「记录在但探测没过」从此**同形**，
+        // 只能靠猜。两种情形的处置完全不同（前者要按端口重新认领，后者要重探），
+        // 判据落在这行与下面那条 WARN 上。
+        tracing::info!(
+            "recover_service：数据库里没有上一会话的服务记录 ⇒ 本次无记录可接管；\
+             端口上是否还有引擎在跑，由启动路径按端口重新认领"
+        );
         return Ok(service_status(&state));
     };
 
@@ -1137,8 +1184,26 @@ pub async fn recover_service(
 
     // The old process is gone or unresponsive. Best-effort kill of any lingering
     // pid (in case it is a zombie holding the port), then clear the record.
-    tracing::warn!(port = persisted.port, pid = persisted.pid, "persisted service not healthy; cleaning up stale record");
-    kill_pid(persisted.pid);
+    //
+    // 🔴 杀之前**先核对 pid 是不是现在占着这个端口的那个**。不核对就等于
+    // 「拿一条可能过期的记录去杀一个可能已被系统复用的 pid」—— 杀错进程，
+    // 而且现场看起来只是「服务没起来」。记录里的 pid 与端口上的 pid 不一致时，
+    // 真正的处置是清掉这条过期记录，不是动手。
+    let 端口上的pid = 端口上正在监听的进程(persisted.port);
+    match 端口上的pid {
+        Some(pid) if pid == persisted.pid => kill_pid(pid),
+        Some(pid) => tracing::warn!(
+            port = persisted.port,
+            记录pid = persisted.pid,
+            端口pid = pid,
+            "记录里的 pid 不是当前监听该端口的进程（记录已过期，pid 可能被系统复用）\
+             ⇒ 不杀任何进程，只清记录"
+        ),
+        None => tracing::info!(
+            port = persisted.port,
+            "端口上已没有监听 ⇒ 记录确认过期（进程确实退出了），只清记录"
+        ),
+    }
     let _ = clear_service_state(&db_path);
     Ok(service_status(&state))
 }
@@ -2598,29 +2663,199 @@ fn 按退出码给指引(code: i32) -> &'static str {
 
 /// Single health probe used by startup recovery to decide whether a persisted
 /// service is still alive.
+///
+/// 🔴 **两次探测 + 间隔**，不是一次：这条路失败的后果不是「再试一次」，
+/// 而是 `recover_service` 立刻 `kill_pid` 掉一个**可能正健康的服务**
+/// （2026-10-19 P100：关 APP 再重开就撞上「端口被占用」，正是这条判据太脆的
+/// 一种走法）。代价不对称 —— 多等 0.8 秒的代价是零，误杀的代价是用户重载模型。
+///
+/// 仍然保留「快失败」的语义：真死了的进程第一探就连不上，第二探只是补一次
+/// 引擎正忙（显存吃紧、刚被唤醒）时的瞬时不应答。
 async fn health_check_once(port: u16) -> bool {
     let Ok(client) = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(5))
         .build()
     else {
         return false;
     };
     let url = format!("http://127.0.0.1:{}/v1/models", port);
-    client
-        .get(&url)
-        .send()
-        .await
-        .map(|response| response.status().is_success())
-        .unwrap_or(false)
+    for 次 in 0..2 {
+        let 活着 = client
+            .get(&url)
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false);
+        if 活着 {
+            return true;
+        }
+        if 次 == 0 {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+    }
+    false
+}
+
+/// 问一句「占着这个端口的是不是**我方引擎**」。
+///
+/// 判据是**协议级**的：`GET /v1/models` 能回一份带 `id` 的模型列表。
+/// 只看「端口在听」不够 —— 任何程序（IDE 的内置服务、另一个工具的 Web UI）
+/// 都能让端口在听，那样会把别人的服务误认成引擎、甚至接管过来。
+///
+/// 返回引擎**自报**的模型（路径或别名），由调用方决定「是不是我要的那个」。
+/// 拿不到（连不上 / 非 200 / 回执解析不了）一律返回 `None`，按「不是引擎」处理：
+/// 这条路只在端口已经确认被占用时走，宁可报「请换端口」也不能误接管。
+async fn 识别端口上的引擎(host: &str, port: u16) -> Option<String> {
+    let 客户端 = reqwest::Client::builder()
+        // 8 秒：这是**本地回环**，慢到 8 秒还没答的进程基本是卡死的；
+        // 但也确实见过显存吃紧时引擎短暂不应答，所以不取 2 秒那么短，
+        // 免得把「还活着只是喘」误判成「不是引擎」。
+        .timeout(Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let 基址 = format!("http://{}:{port}", 探测主机(host));
+    let 正文 = 取回执(&客户端, &format!("{基址}/v1/models")).await?;
+    crate::model_sidecar::解析模型回执(&正文).ok()
+}
+
+/// 端口上已经有一份**我方引擎**在跑时，直接接管，而不是报「端口被占用」。
+///
+/// 这条路径补的是 2026-10-19 P100 实测的那个死角：`recover_service` 手里的
+/// 记录一旦缺失（换过安装包 / 数据目录），重开 APP 就**再也接不上**自己上一次
+/// 起的服务，而前端自动启动又必然撞上它 —— 用户被卡在「既接管不了、也起不来」。
+///
+/// 接管与「本次启动」的区别只在**进程归属**：参数、上下文、旁车配置一律沿用
+/// 进程里已有的（接管不重算，见 `respawn` 之外的注释）；因此这里**不推导附加参数**、
+/// 不隔离 DLL、不动显存 —— 那些动作的前提都是「要新起一个进程」。
+fn 接管遗留引擎(
+    app: &AppHandle,
+    state: &AppState,
+    model_id: &str,
+    host: &str,
+    port: u16,
+    引擎自报: &str,
+) -> ServiceInfo {
+    // pid 只是为了让「停止」和持久化记录有东西可写。查不到就写 0，
+    // **不阻断接管**：进程确实在服务，拿不到 pid 只是以后不能按 pid 杀它，
+    // 按端口总能再找回来。`kill_pid` 那边要因此跳过 0。
+    let pid = 端口上正在监听的进程(port).unwrap_or(0);
+    let info = {
+        let mut inner = state.inner.lock().expect("state lock poisoned");
+        let 安全模式 = inner.service.safe_mode;
+        inner.service.model_id = Some(model_id.to_string());
+        inner.service.port = Some(port);
+        inner.service.host = Some(host.to_string());
+        inner.service.pid = if pid == 0 { None } else { Some(pid) };
+        inner.service.status = ServiceStatus::Running;
+        // 关键：`process = None` ⇒ 这是**接管态**。看门狗据此跳过 `try_wait`，
+        // 「停止」据此走 `kill_pid` 而不是 `child.kill()`。
+        inner.service.process = None;
+        let persisted = PersistedServiceState {
+            model_id: model_id.to_string(),
+            port,
+            pid,
+            safe_mode: 安全模式,
+            host: host.to_string(),
+        };
+        // 补写记录：下次重开就能走正常的 `recover_service`，不必再靠这条兜底。
+        let _ = save_service_state(&inner.db_path, &persisted);
+        ServiceInfo {
+            model_id: Some(model_id.to_string()),
+            port: Some(port),
+            host: Some(host.to_string()),
+            status: ServiceStatus::Running,
+            safe_mode: 安全模式,
+            message: format!(
+                "接口端口 {port} 上已有上次运行的本地AI服务（{引擎自报}），已直接接管，没有重复启动。"
+            ),
+        }
+    };
+    tracing::info!(
+        port,
+        pid,
+        model_id,
+        引擎自报 = %引擎自报,
+        "端口上已有本机引擎在服务 ⇒ 接管它（没有重复启动，也没有让用户换端口）"
+    );
+    let _ = app.emit("service_status_changed", &info);
+    spawn_service_watchdog(app.clone(), state.clone());
+    info
+}
+
+/// 按端口反查正在 LISTENING 的进程 pid（Windows `netstat -ano`）。
+///
+/// 为什么不用名字找：APP 起的是 `llama-server-cuda.exe` / `llama-server-vulkan.exe`
+/// （瘦启动器，后端起什么由同目录 DLL 决定），按 `llama-server.exe` 精确匹配会
+/// **一个都匹配不上**——2026-10-19 就因此漏杀，服务仍占着显存，OOM 被误读成
+/// 「模型不支持部分卸载」。端口是唯一稳的锚点。
+#[cfg(windows)]
+fn 端口上正在监听的进程(port: u16) -> Option<u32> {
+    let mut command = Command::new("netstat");
+    command.args(["-ano", "-p", "tcp"]);
+    crate::proc::hide_console(&mut command);
+    let 输出 = command.output().ok()?;
+    let 文本 = String::from_utf8_lossy(&输出.stdout);
+    从netstat里取pid(&文本, port)
+}
+
+#[cfg(not(windows))]
+fn 端口上正在监听的进程(_port: u16) -> Option<u32> {
+    // 本项目只发 Windows 包；别的平台按「查不到」处理，接管仍能成立（pid 写 0）。
+    None
+}
+
+/// 从 `netstat -ano` 的文本里取出监听某个端口的 pid。
+///
+/// 抽成纯函数是为了能测：这段代码的核心是一个**后缀匹配**，而「后缀匹配」
+/// 正是本项目栽过的那一类（键名用后缀匹配把 `x.y` 认成 `y`）。必须钉住
+/// 「`:8000` 不命中 `:18000`」「ESTABLISHED 不算监听」两条。
+fn 从netstat里取pid(文本: &str, port: u16) -> Option<u32> {
+    let 后缀 = format!(":{port}");
+    for 行 in 文本.lines() {
+        let 列: Vec<&str> = 行.split_whitespace().collect();
+        // 典型行：`  TCP    127.0.0.1:8000    0.0.0.0:0    LISTENING    12345`
+        if 列.len() < 5 || !列[0].eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        if !列[3].eq_ignore_ascii_case("LISTENING") {
+            continue;
+        }
+        // `ends_with(":8000")` 不会把 `:18000` 认成同一个（末尾五个字符对不上）。
+        if 列[1].ends_with(&后缀) {
+            if let Ok(pid) = 列[4].parse::<u32>() {
+                return Some(pid);
+            }
+        }
+    }
+    None
 }
 
 /// Best-effort termination of a process (and its children) by pid. Used to stop
 /// a reattached server or clean up a stale/zombie one on Windows.
 fn kill_pid(pid: u32) {
+    // pid 0 = 「接管时没查到 pid」的占位（见 `接管遗留引擎`）。`taskkill /PID 0`
+    // 会去杀 Idle 进程并报错，语义上没有任何意义 —— 直接跳过，别留一条注定
+    // 失败的调用去污染日志。
+    if pid == 0 {
+        tracing::debug!("kill_pid：pid 为 0（接管时没查到），跳过");
+        return;
+    }
     let mut command = Command::new("taskkill");
     command.args(["/PID", &pid.to_string(), "/T", "/F"]);
     crate::proc::hide_console(&mut command);
-    let _ = command.output();
+    // 结果**必须**记下来：此前是 `let _ = command.output();`，杀失败了也一声不响，
+    // 于是「服务没停掉、端口还占着」在下一次启动时表现为「端口被占用」，
+    // 排查方向直接被带偏（2026-10-19 P100）。
+    match command.output() {
+        Ok(输出) if !输出.status.success() => tracing::warn!(
+            pid,
+            状态 = ?输出.status.code(),
+            输出 = %String::from_utf8_lossy(&输出.stderr).trim(),
+            "kill_pid：taskkill 未能结束该进程（可能已退出、或权限不足）"
+        ),
+        Err(错误) => tracing::warn!(pid, 错误 = %错误, "kill_pid：taskkill 没能执行"),
+        _ => {}
+    }
 }
 
 fn set_failed(app: &AppHandle, state: &AppState, message: String) -> ServiceInfo {
@@ -3783,9 +4018,53 @@ mod tests {
         assert!(crate::model_sidecar::核对模型(r"d:/m/base-q4_k_m.gguf", &自报).is_empty());
     }
 
+    // ── 2026-10-19 P100：端口被自己上一轮的引擎占着 ⇒ 接管，不是「请换端口」 ──
+
+    #[test]
+    fn 从netstat里取pid_只认监听且端口精确匹配() {
+        // 真实 `netstat -ano -p tcp` 的形状（表头两行也要能跳过）。
+        // 🔴 `:18000` 那行**刻意放在前面**：真实 netstat 的输出顺序是不定的，
+        // 而这里要钉住的正是「查 8000 时不许被 18000 抢先命中」。若去掉冒号
+        // 只比数字后缀，第一条命中的就是 18000 那一行 —— 断言当场变红。
+        let 文本 = "\r\n活动连接\r\n\r\n  协议  本地地址          外部地址        状态           PID\r\n\
+                    TCP    127.0.0.1:18000        0.0.0.0:0              LISTENING       9999\r\n\
+                    TCP    127.0.0.1:8000         0.0.0.0:0              LISTENING       4321\r\n\
+                    TCP    127.0.0.1:8000         127.0.0.1:51234        ESTABLISHED     4321\r\n";
+        assert_eq!(从netstat里取pid(文本, 8000), Some(4321), "命中的应是监听那一行");
+        // 🔴 后缀匹配的经典坑：`:8000` 不许把 `:18000` 认成自己。
+        assert_eq!(从netstat里取pid(文本, 18000), Some(9999));
+        assert_eq!(从netstat里取pid(文本, 800), None, "没这个端口就是 None");
+        // 只有 ESTABLISHED、没有 LISTENING 时**不能**算 —— 那不是「在提供服务」。
+        let 只有连接 = "  TCP    127.0.0.1:8000    127.0.0.1:51234    ESTABLISHED    4321\r\n";
+        assert_eq!(从netstat里取pid(只有连接, 8000), None);
+    }
+
     #[tokio::test]
-    async fn 模型身份在接管到别的模型时会报出两边名字() {
+    async fn 识别端口上的引擎_能从假引擎拿到自报模型() {
         let 端口 = 起假引擎(回执响应(
+            r#"{"object":"list","data":[{"id":"D:\\m\\qwen3-1.7b-q8_0.gguf"}]}"#,
+        ));
+        assert_eq!(
+            识别端口上的引擎("127.0.0.1", 端口).await.as_deref(),
+            Some(r"D:\m\qwen3-1.7b-q8_0.gguf"),
+            "能答出模型列表 ⇒ 判定为我方引擎"
+        );
+    }
+
+    #[tokio::test]
+    async fn 识别端口上的引擎_对占了端口但不是引擎的程序返回None() {
+        // ★ 反例：端口在听、也回了 HTTP，但答的不是引擎格式。
+        // 少了这条，任何占着 8000 的 Web 服务都会被「接管」过来。
+        let 端口 = 起假引擎(回执响应("I am not llama.cpp"));
+        assert_eq!(
+            识别端口上的引擎("127.0.0.1", 端口).await,
+            None,
+            "端口在听 ≠ 是我方引擎，必须落回「请换端口」"
+        );
+    }
+
+    #[tokio::test]
+    async fn 模型身份在接管到别的模型时会报出两边名字() {        let 端口 = 起假引擎(回执响应(
             r#"{"object":"list","data":[{"id":"D:\\m\\Spark-X2.5-4B-Q6_K.gguf"}]}"#,
         ));
         let 客户端 = reqwest::Client::new();
