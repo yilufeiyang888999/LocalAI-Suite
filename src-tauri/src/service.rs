@@ -564,7 +564,10 @@ pub async fn start_service_core(
     // We do this *synchronously* before any `.await` point so the Mutex scope
     // is atomic: the first task to reach this sets status=Starting, and any
     // concurrent task sees it and bails.
-    {
+    // 记下「进这次启动之前手上那个进程」的 pid：端口随后若仍被占，可能就是它
+    // 没退干净（2026-10-19 P100：`taskkill` 拒绝访问，父进程没了、子进程还占着
+    // 8000）。判据不能停在我们发过 kill。
+    let 刚停掉的pid: Option<u32> = {
         let mut inner = state.inner.lock().expect("state lock poisoned");
         if inner.service.status == ServiceStatus::Starting {
             return Err(AppError::Message(
@@ -572,17 +575,17 @@ pub async fn start_service_core(
             ));
         }
         // Kill any existing process (whether spawned this session or reattached).
-        if let Some(mut child) = inner.service.process.take() {
-            let _ = child.kill();
-        } else if let Some(pid) = inner.service.pid {
-            kill_pid(pid);
-        }
+        let 上一进程 = inner.service.pid;
+        let 上一端口 = inner.service.port;
+        结束服务进程(inner.service.process.take(), 上一进程, 上一端口);
         inner.service.pid = None;
         inner.service.status = ServiceStatus::Starting;
         inner.service.model_id = Some(model_id.to_string());
         // Keep host/port — they are needed for the restarting_same_address
         // check below and will be overwritten by set_starting later.
-    }
+        // 块值 = 进本次启动前手上的 pid（供端口被占时判断「是不是自己的残留」）。
+        上一进程
+    };
     // Emit *now* so the frontend's ThirdPartyConnect/ChatView cards see the
     // new model_id immediately, rather than waiting for set_starting /
     // set_running to fire after the await points below. Without this, if any
@@ -711,25 +714,58 @@ pub async fn start_service_core(
         match 识别端口上的引擎(&host, port).await {
             Some(引擎自报) => {
                 let 期望 = model_path.display().to_string();
-                let 问题 = crate::model_sidecar::核对模型(&期望, &引擎自报);
-                if 问题.is_empty() {
-                    return Ok(接管遗留引擎(app, state, model_id, &host, port, &引擎自报));
+                // 🔴 第一步：**先假设它是「刚被我们停掉、还没退干净」的那个进程**。
+                //
+                // 2026-10-19 P100（`06:47:18`）的原文：
+                // `kill_pid：taskkill 未能结束该进程 … 无法终止 PID 11748
+                //  （属于 PID 8868 子进程）的原因: 拒绝访问`。
+                // 父进程（记录里的 pid）没了、子进程还占着 8000 与 6.4 GiB 显存 ——
+                // 于是切换模型时界面报「正在运行另一个模型」，而那个「另一个」正是
+                // 我们自己 7 秒前刚停掉的 qwen3-1.7B。
+                //
+                // 判据：只有**本次进来之前手上确实有进程**（刚停掉的pid 有值）才走这条。
+                // 首次启动（新会话、手上没进程）时端口上那份可能是用户自己的服务，
+                // 那种情况**不许**动它，仍然只报「另一个模型」。
+                let mut 已让出 = false;
+                if 刚停掉的pid.is_some() {
+                    if let Some(端口pid) = 端口上正在监听的进程(port) {
+                        tracing::warn!(
+                            port,
+                            端口pid,
+                            刚停掉的pid = 刚停掉的pid.unwrap_or(0),
+                            模型 = %引擎自报,
+                            "端口仍被本机引擎占着 —— 很可能是刚停掉的那个进程没退干净\
+                             （taskkill 只结束了父进程）；按端口找到真正的监听者再终止一次"
+                        );
+                        kill_pid(端口pid);
+                    }
+                    已让出 = 等端口释放(&host, port, Duration::from_secs(10)).await;
+                    if 已让出 {
+                        tracing::info!(port, "端口已让出，继续按本次请求启动（不再判模型）");
+                    }
                 }
-                // 是我方引擎、但跑的不是要启动的那个模型：**不许**接管（否则界面
-                // 显示 A、实际跑 B），也不许静默杀掉（那会把用户正在用的服务干掉）。
-                // 报出两边名字，让用户能决定是停服务还是换端口。
-                let info = set_failed(
-                    app,
-                    state,
-                    format!(
-                        "接口端口 {} 上正在运行另一个模型（{}），不是这次要启动的「{}」。\
-                         请先在那边停止服务，或到设置里换一个端口。",
-                        port,
-                        引擎自报,
-                        期望
-                    ),
-                );
-                return Err(AppError::Message(info.message));
+                if !已让出 {
+                    let 问题 = crate::model_sidecar::核对模型(&期望, &引擎自报);
+                    if 问题.is_empty() {
+                        return Ok(接管遗留引擎(app, state, model_id, &host, port, &引擎自报));
+                    }
+                    // 是我方引擎、但跑的不是要启动的那个模型：**不许**接管（否则界面
+                    // 显示 A、实际跑 B）。报出两边名字与占用 pid，让用户能处置。
+                    let 占用pid = 端口上正在监听的进程(port);
+                    let info = set_failed(
+                        app,
+                        state,
+                        format!(
+                            "接口端口 {} 上正在运行另一个模型（{}，进程 {}），\
+                             不是这次要启动的「{}」。请先在那边停止服务，或到设置里换一个端口。",
+                            port,
+                            引擎自报,
+                            占用pid.map(|pid| pid.to_string()).unwrap_or_else(|| "未知".to_string()),
+                            期望
+                        ),
+                    );
+                    return Err(AppError::Message(info.message));
+                }
             }
             None => {
                 let info = set_failed(
@@ -832,6 +868,11 @@ pub async fn start_service_core(
     tracing::info!(
         %model_id,
         backend = ?backend,
+        // 🔴 报**实际生效**的后端，不是请求的那个。P100（TCC）上请求 Vulkan
+        // 会被保底改成 CUDA 隔离，而这一行原先只打 `backend=Vulkan` ——
+        // 日志于是宣称了一条没发生的事，后端一致性校验「两轮都跑在 CUDA 上」
+        // 就变得无法从日志解释（2026-10-19 实测）。
+        实际后端 = ?实际隔离后端,
         host = %host,
         port,
         gpu_layers = ?params.n_gpu_layers,
@@ -885,7 +926,7 @@ pub async fn start_service_core(
             // 只 WARN 不阻断：部分卸载是「能跑但慢」，判成失败会把可用变不可用。
             // 位置在健康检查之后（`:812` 已过）⇒ 权重早已加载完，读显存不会读到半载值。
             if backend.is_gpu() {
-                核对计划全量卸载(&model_path, params.n_gpu_layers, backend).await;
+                核对计划全量卸载(&model_path, params.n_gpu_layers, 实际隔离后端).await;
             }
             set_running(app, state, child, false, "AI服务已启动，可以开始聊天。".to_string(), &extra_args)
         }
@@ -933,7 +974,7 @@ pub async fn start_service_core(
                     // 而且更需要：能走到这里说明激进那组已经起不来了，显存本来就紧。
                     // ⚠️ 不走上面那条 812 的「没上卡」分支（它 return 了），两条不是重复：
                     //    那条报的是「显存停在空载」，这条报的是「上了卡但没全上去」。
-                    核对计划全量卸载(&model_path, conservative.n_gpu_layers, backend).await;
+                    核对计划全量卸载(&model_path, conservative.n_gpu_layers, 实际隔离后端).await;
                     return set_running(app, state, child, false, "AI服务已启动，但用的是更保守的参数（上下文更短）。".to_string(), &extra_args);
                 }
             }
@@ -1017,13 +1058,8 @@ pub fn stop_service_core(app: &AppHandle, state: &AppState) -> ServiceInfo {
     stop_service_watchdog(state);
     let info = {
         let mut inner = state.inner.lock().expect("state lock poisoned");
-        if let Some(mut child) = inner.service.process.take() {
-            let _ = child.kill();
-        } else if let Some(pid) = inner.service.pid {
-            // Reattached process from a previous run: we have no Child handle,
-            // so stop it by pid instead.
-            kill_pid(pid);
-        }
+        let 旧端口 = inner.service.port;
+        结束服务进程(inner.service.process.take(), inner.service.pid, 旧端口);
         let _ = clear_service_state(&inner.db_path);
         inner.service.status = ServiceStatus::Stopped;
         inner.service.port = None;
@@ -1862,7 +1898,7 @@ async fn launch_service(
     // missing DLL, incompatible GPU backend), we fail fast instead of waiting
     // out the full 180s timeout.
     if let Err(error) = wait_for_health(&mut child, port, 2, startup_timeout_secs).await {
-        let _ = child.kill();
+        结束服务进程(Some(child), None, Some(port));
         return Err(error);
     }
 
@@ -2830,6 +2866,52 @@ fn 从netstat里取pid(文本: &str, port: u16) -> Option<u32> {
     None
 }
 
+/// 结束当前服务进程 —— 并且**失败要留日志**。
+///
+/// 🔴 2026-10-19 P100 实测：`taskkill` 回 **`拒绝访问`**（`pid=8868` 的子进程
+/// `11748` 杀不掉），而这条路径当时写的是 `let _ = child.kill()` —— 静默。
+/// 后果是状态里写着「已停止」、系统里那个进程仍占着 8000 与 6.4 GiB 显存，
+/// 下一次启动就表现为「端口被占用」或「正在运行另一个模型」，
+/// 而排查方向会被引到端口配置上。
+///
+/// 另外**必须补一次 `kill_pid`**：`Child::kill` 只结束直接子进程。实测那次
+/// 残留的 `11748` 是子进程，父进程没了它照样活着占端口。
+///
+/// 🔴 **接管态不许按「记录里的 pid」杀**。那条 pid 属于**上一个会话**，
+/// 中间隔着重开 APP 的时间窗，完全可能已被系统复用 —— 而 `taskkill /T /F`
+/// 会连带杀掉它的整棵子进程树。2026-10-19 那次 `拒绝访问` 反而帮了忙：
+/// 若 `8868` 当时被复用成 `services.exe` 之类，后果不是「服务没起来」而是系统出事。
+/// 唯一可信的实体是**现在占着那个端口的进程**，所以接管态一律按端口反查，
+/// 端口上没人听就**不动手**（进程已经退出，记录只是过期）。
+fn 结束服务进程(process: Option<Child>, pid: Option<u32>, port: Option<u16>) {
+    match process {
+        Some(mut child) => {
+            let 子pid = child.id();
+            // 本次会话亲手 spawn 的：`Child` 句柄还在，pid 在这个窗口内不会被复用。
+            match child.kill() {
+                Ok(()) => tracing::info!(pid = 子pid, "已请求结束服务子进程"),
+                Err(错误) => tracing::warn!(
+                    pid = 子pid,
+                    错误 = %错误,
+                    "结束服务子进程失败 —— 它可能仍然占着端口与显存（下一步会按 pid 再试一次）"
+                ),
+            }
+            kill_pid(子pid);
+        }
+        None => match (port.and_then(端口上正在监听的进程), pid) {
+            (Some(端口pid), _) => {
+                tracing::info!(端口pid, 记录pid = ?pid, "接管态：按端口找到真正的监听进程并终止");
+                kill_pid(端口pid);
+            }
+            (None, Some(pid)) => tracing::info!(
+                pid,
+                "端口上已无监听 ⇒ 进程已退出；**不**按记录里的 pid 终止（可能已被系统复用）"
+            ),
+            (None, None) => {}
+        },
+    }
+}
+
 /// Best-effort termination of a process (and its children) by pid. Used to stop
 /// a reattached server or clean up a stale/zombie one on Windows.
 fn kill_pid(pid: u32) {
@@ -2862,11 +2944,8 @@ fn set_failed(app: &AppHandle, state: &AppState, message: String) -> ServiceInfo
     tracing::error!(reason = %message, "llama-server failed to start");
     let info = {
         let mut inner = state.inner.lock().expect("state lock poisoned");
-        if let Some(mut child) = inner.service.process.take() {
-            let _ = child.kill();
-        } else if let Some(pid) = inner.service.pid {
-            kill_pid(pid);
-        }
+        let 失败端口 = inner.service.port;
+        结束服务进程(inner.service.process.take(), inner.service.pid, 失败端口);
         inner.service.pid = None;
         let _ = clear_service_state(&inner.db_path);
         inner.service.status = ServiceStatus::Failed;
@@ -3141,6 +3220,27 @@ async fn wait_for_port_available(host: &str, port: u16) -> bool {
         }
     }
     false
+}
+
+/// 等端口**真正**释放，最多 `上限`（每 500 ms 探一次）。
+///
+/// 与 `wait_for_port_available` 的区别只在用途：那个是「启动前预检」的短窗口
+/// （3 秒，吸收正常退出的延迟）；这个是**已经确认占用者是我方引擎、且刚发过
+/// 终止**之后的长窗口 —— 2026-10-19 P100 实测那次残留了 7 秒才走干净。
+///
+/// 不合并成一个函数：两处的「等多久」来自完全不同的判据，合并就等于让预检
+/// 也为最坏情况买单（每次端口冲突都白等 10 秒）。
+async fn 等端口释放(host: &str, port: u16, 上限: Duration) -> bool {
+    let 截止 = Instant::now() + 上限;
+    loop {
+        if is_port_available(host, port) {
+            return true;
+        }
+        if Instant::now() >= 截止 {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Split a user-provided extra-args string into individual arguments on
@@ -4060,6 +4160,25 @@ mod tests {
             识别端口上的引擎("127.0.0.1", 端口).await,
             None,
             "端口在听 ≠ 是我方引擎，必须落回「请换端口」"
+        );
+    }
+
+    #[tokio::test]
+    async fn 等端口释放_占着就超时_放开才返回true() {
+        use std::net::TcpListener;
+        let 监听 = TcpListener::bind("127.0.0.1:0").expect("应能绑定空闲端口");
+        let 端口 = 监听.local_addr().expect("拿到本地地址").port();
+        // ① 还占着：必须在窗口结束时报 false（否则「等端口」等于没有，
+        //    切模型时仍会撞上没退干净的旧进程）。
+        assert!(
+            !等端口释放("127.0.0.1", 端口, Duration::from_millis(300)).await,
+            "端口仍被监听时不许返回 true"
+        );
+        // ② 放开后：同一个函数要能等到 true（判据不是「恒 false」）。
+        drop(监听);
+        assert!(
+            等端口释放("127.0.0.1", 端口, Duration::from_secs(3)).await,
+            "端口释放后应当等到 true"
         );
     }
 
