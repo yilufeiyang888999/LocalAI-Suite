@@ -552,6 +552,8 @@ pub async fn start_service_core(
     // file) and must return *before* the guard below flips status to Starting,
     // otherwise a resolve failure would leave the service stuck in Starting.
     let (server_path, model_path, install_dir) = resolve_paths(state)?;
+    // 权限级别只打一次：它是「引擎为什么杀不掉」的前置判据（见 提示提权状态）。
+    提示提权状态();
 
     // ---- Guard: kill any existing process and prevent concurrent starts ----
     //
@@ -727,6 +729,7 @@ pub async fn start_service_core(
                 // 首次启动（新会话、手上没进程）时端口上那份可能是用户自己的服务，
                 // 那种情况**不许**动它，仍然只报「另一个模型」。
                 let mut 已让出 = false;
+                let mut 上次终止 = 终止结果::未尝试;
                 if 刚停掉的pid.is_some() {
                     if let Some(端口pid) = 端口上正在监听的进程(port) {
                         tracing::warn!(
@@ -737,7 +740,7 @@ pub async fn start_service_core(
                             "端口仍被本机引擎占着 —— 很可能是刚停掉的那个进程没退干净\
                              （taskkill 只结束了父进程）；按端口找到真正的监听者再终止一次"
                         );
-                        kill_pid(端口pid);
+                        上次终止 = kill_pid(端口pid);
                     }
                     已让出 = 等端口释放(&host, port, Duration::from_secs(10)).await;
                     if 已让出 {
@@ -752,18 +755,28 @@ pub async fn start_service_core(
                     // 是我方引擎、但跑的不是要启动的那个模型：**不许**接管（否则界面
                     // 显示 A、实际跑 B）。报出两边名字与占用 pid，让用户能处置。
                     let 占用pid = 端口上正在监听的进程(port);
-                    let info = set_failed(
-                        app,
-                        state,
+                    let 占位 = 占用pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "未知".to_string());
+                    // 🔴 「杀不掉」和「别人的服务」是两回事，文案必须分开。
+                    // 2026-10-19 P100（`07:16:31`）：报「端口上正在运行另一个模型」时，
+                    // 那个「另一个」其实就是 APP 自己上一次起的 qwen3-1.7B ——
+                    // 只是它被以管理员身份启动，普通权限的本次程序 `taskkill` 不掉。
+                    // 用户看到「另一个模型」只会去找「那边的服务」，永远找不到。
+                    let 文案 = if 上次终止 == 终止结果::拒绝访问 {
                         format!(
-                            "接口端口 {} 上正在运行另一个模型（{}，进程 {}），\
-                             不是这次要启动的「{}」。请先在那边停止服务，或到设置里换一个端口。",
-                            port,
-                            引擎自报,
-                            占用pid.map(|pid| pid.to_string()).unwrap_or_else(|| "未知".to_string()),
-                            期望
-                        ),
-                    );
+                            "接口端口 {port} 上的引擎（进程 {占位}）还在运行，但本程序结束不掉它 —— \
+                             Windows 拒绝访问，说明它是用**管理员权限**启动的。\
+                             请右键「以管理员身份运行」本程序后再切换，\
+                             或打开任务管理器结束这个进程。"
+                        )
+                    } else {
+                        format!(
+                            "接口端口 {port} 上正在运行另一个模型（{引擎自报}，进程 {占位}），\
+                             不是这次要启动的「{期望}」。请先在那边停止服务，或到设置里换一个端口。"
+                        )
+                    };
+                    let info = set_failed(app, state, 文案);
                     return Err(AppError::Message(info.message));
                 }
             }
@@ -1047,7 +1060,41 @@ pub fn stop_model_service(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> AppResult<ServiceInfo> {
-    Ok(stop_service_core(&app, &state))
+    let 结果 = stop_service_core(&app, &state);
+    // 🔴 没停下就**必须**报错，不能返回 Ok 让界面显示「已停止」。
+    // 前端 `stopService()` 的 catch 分支会把这句话原样显示出来，并重新拉一次状态 ——
+    // 那正是我们要的：用户看到「没能停下来 + 怎么办」，而不是被一句「已停止」骗着
+    // 去切模型，然后撞上「端口上正在运行另一个模型」。
+    if 结果.status != ServiceStatus::Stopped {
+        return Err(AppError::Message(结果.message));
+    }
+    Ok(结果)
+}
+
+/// 停止之后，「那个进程是不是还在」——**只用现场可见的事实**判断。
+///
+/// 🔴 这条判据是这一轮的核心。2026-10-19 P100 的日志（`07:16:04`、`07:16:26`）：
+///
+/// ```text
+/// 接管态：按端口找到真正的监听进程并终止 端口pid=2468 记录pid=Some(2468)
+/// kill_pid：taskkill 未能结束该进程 pid=2468 状态=Some(128)
+///   输出= 无法终止 PID 2468 (属于 PID 11688 子进程) 的原因: 拒绝访问
+/// llama-server stopped            ← 状态写成停止、记录清掉，进程却还在
+/// ```
+///
+/// 于是界面说「已停止」，用户接着切模型，撞上那个仍占着 8000 的进程，
+/// 报「端口上正在运行另一个模型」——**一个谎引出第二个谎**。
+///
+/// 参数取 `(端口上现在监听的 pid, 停止前记录的 pid)`：
+/// * 同号 ⇒ 没停下；
+/// * 端口有人在听、但我们没有 pid 可比（接管时查不到）⇒ 同样不许宣称停掉了；
+/// * 端口空、或换成了别的 pid（旧的那个确实退了，端口被别人抢走）⇒ 认作已停。
+fn 停止后仍是同一个进程(仍在监听: Option<u32>, 停止前的pid: Option<u32>) -> bool {
+    match (仍在监听, 停止前的pid) {
+        (Some(现在), Some(旧的)) => 现在 == 旧的,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 /// Stop the running local service (killing our spawned child or a reattached
@@ -1056,10 +1103,68 @@ pub fn stop_service_core(app: &AppHandle, state: &AppState) -> ServiceInfo {
     // Stop the auto-restart watchdog *first* so it doesn't try to revive the
     // process we are about to kill.
     stop_service_watchdog(state);
+    // 先把现场取出来：`结束服务进程` 要跑 `netstat` / `taskkill`（外部命令，
+    // 几百毫秒），**绝不能握着状态锁做** —— 同线程重复加锁会自死锁。
+    let (进程, 旧pid, 旧端口, 旧模型, 旧host, 安全模式) = {
+        let mut inner = state.inner.lock().expect("state lock poisoned");
+        (
+            inner.service.process.take(),
+            inner.service.pid,
+            inner.service.port,
+            inner.service.model_id.clone(),
+            inner.service.host.clone(),
+            inner.service.safe_mode,
+        )
+    };
+    let 结果 = 结束服务进程(进程, 旧pid, 旧端口);
+    // 判据 = 现场，不是「我们发过 kill」。
+    let 仍在监听 = 旧端口.and_then(端口上正在监听的进程);
+    if 停止后仍是同一个进程(仍在监听, 旧pid) {
+        let 端口 = 旧端口.unwrap_or(0);
+        let 占用 = 仍在监听.unwrap_or(0);
+        let 原因 = if 结果 == 终止结果::拒绝访问 {
+            "（Windows 拒绝访问：它是以管理员权限启动的，当前程序权限不够）"
+        } else {
+            ""
+        };
+        let 文案 = format!(
+            "AI服务没能停下来：接口端口 {端口} 上的引擎（进程 {占用}）仍在运行{原因}。\
+             请以管理员身份重新打开本程序再点停止，或打开任务管理器结束这个进程。"
+        );
+        tracing::error!(
+            port = 端口,
+            pid = 占用,
+            终止结果 = ?结果,
+            "停止服务失败：那个进程仍在监听端口 —— 状态**不**改成已停止"
+        );
+        let info = {
+            let mut inner = state.inner.lock().expect("state lock poisoned");
+            // 状态照实写回 Running：它**确实**还在服务，用户还能继续聊天。
+            // 写 Stopped 只会让人以为停掉了，然后被下一次启动的报错误导。
+            inner.service.status = ServiceStatus::Running;
+            inner.service.port = 旧端口;
+            inner.service.host = 旧host;
+            inner.service.model_id = 旧模型;
+            inner.service.pid = if 占用 == 0 { None } else { Some(占用) };
+            inner.service.safe_mode = 安全模式;
+            ServiceInfo {
+                model_id: inner.service.model_id.clone(),
+                port: inner.service.port,
+                host: inner.service.host.clone(),
+                status: ServiceStatus::Running,
+                safe_mode: 安全模式,
+                message: 文案.clone(),
+            }
+        };
+        // 记录**不清**：它还在跑，下次重开应当照常接管（而不是靠端口兜底去认领）。
+        // 看门狗**要重新拉起**：刚才第一步就把它停了，而状态现在写的是 Running ——
+        // 「Running 却没有看门狗」是另一种不一致（进程真挂了没人发现）。
+        spawn_service_watchdog(app.clone(), state.clone());
+        let _ = app.emit("service_status_changed", &info);
+        return info;
+    }
     let info = {
         let mut inner = state.inner.lock().expect("state lock poisoned");
-        let 旧端口 = inner.service.port;
-        结束服务进程(inner.service.process.take(), inner.service.pid, 旧端口);
         let _ = clear_service_state(&inner.db_path);
         inner.service.status = ServiceStatus::Stopped;
         inner.service.port = None;
@@ -1077,7 +1182,7 @@ pub fn stop_service_core(app: &AppHandle, state: &AppState) -> ServiceInfo {
         }
     };
     let _ = app.emit("service_status_changed", &info);
-    tracing::info!("llama-server stopped");
+    tracing::info!(端口 = ?旧端口, 终止结果 = ?结果, "llama-server stopped");
     info
 }
 
@@ -1110,6 +1215,8 @@ pub async fn recover_service(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> AppResult<ServiceInfo> {
+    // 权限级别只打一次：起点在接管这条路上，「上次那个引擎杀不掉」是它的主要形态。
+    提示提权状态();
     // 先看本会话的状态：已经在管（或正在起）服务时直接返回当前状态，
     // **连持久化记录都不读** —— 那一份此刻代表的是上个会话，不是现场（见 `应当尝试接管`）。
     // 锁必须在调 `service_status` 之前释放：那是同一个 Mutex，同线程重入 = 自死锁。
@@ -1227,7 +1334,9 @@ pub async fn recover_service(
     // 真正的处置是清掉这条过期记录，不是动手。
     let 端口上的pid = 端口上正在监听的进程(persisted.port);
     match 端口上的pid {
-        Some(pid) if pid == persisted.pid => kill_pid(pid),
+        Some(pid) if pid == persisted.pid => {
+            kill_pid(pid);
+        }
         Some(pid) => tracing::warn!(
             port = persisted.port,
             记录pid = persisted.pid,
@@ -2883,7 +2992,7 @@ fn 从netstat里取pid(文本: &str, port: u16) -> Option<u32> {
 /// 若 `8868` 当时被复用成 `services.exe` 之类，后果不是「服务没起来」而是系统出事。
 /// 唯一可信的实体是**现在占着那个端口的进程**，所以接管态一律按端口反查，
 /// 端口上没人听就**不动手**（进程已经退出，记录只是过期）。
-fn 结束服务进程(process: Option<Child>, pid: Option<u32>, port: Option<u16>) {
+fn 结束服务进程(process: Option<Child>, pid: Option<u32>, port: Option<u16>) -> 终止结果 {
     match process {
         Some(mut child) => {
             let 子pid = child.id();
@@ -2896,31 +3005,119 @@ fn 结束服务进程(process: Option<Child>, pid: Option<u32>, port: Option<u16
                     "结束服务子进程失败 —— 它可能仍然占着端口与显存（下一步会按 pid 再试一次）"
                 ),
             }
-            kill_pid(子pid);
+            // 🔴 两条终止路径的**权限路径不同**，必须都试：
+            // `Child::kill` 走 `TerminateProcess(建进程时的句柄)`，不受完整性级别限制；
+            // `taskkill` 要**新开**一个进程句柄，目标级别比我们高就 `拒绝访问`。
+            // 本次会话亲手起的进程两条都能成；接管来的（没有 `Child`）只有后者。
+            kill_pid(子pid)
         }
         None => match (port.and_then(端口上正在监听的进程), pid) {
             (Some(端口pid), _) => {
                 tracing::info!(端口pid, 记录pid = ?pid, "接管态：按端口找到真正的监听进程并终止");
-                kill_pid(端口pid);
+                kill_pid(端口pid)
             }
-            (None, Some(pid)) => tracing::info!(
-                pid,
-                "端口上已无监听 ⇒ 进程已退出；**不**按记录里的 pid 终止（可能已被系统复用）"
-            ),
-            (None, None) => {}
+            (None, Some(pid)) => {
+                tracing::info!(
+                    pid,
+                    "端口上已无监听 ⇒ 进程已退出；**不**按记录里的 pid 终止（可能已被系统复用）"
+                );
+                终止结果::本来就没有
+            }
+            (None, None) => 终止结果::未尝试,
         },
+    }
+}
+
+/// 当前进程**实际**有没有管理员权限。
+///
+/// 不看「人在不在管理员组」：UAC 下非提权进程虽然在管理员组里，令牌完整性级别
+/// 仍只有「中」（`S-1-16-8192`），照样杀不掉高完整性进程。
+/// `whoami /groups` 里 `Mandatory Label` 那一行的 SID 是**语言无关**的，
+/// 所以按 SID 判、不按「管理员」这种本地化文本判（本机是中文 Windows，
+/// 解析中文标签在别的语言包上必崩）。
+#[cfg(windows)]
+fn 当前是否提权() -> Option<bool> {
+    let mut command = Command::new("whoami");
+    command.args(["/groups"]);
+    crate::proc::hide_console(&mut command);
+    let 输出 = command.output().ok()?;
+    let 文本 = String::from_utf8_lossy(&输出.stdout);
+    // 12288 = 高完整性（提权）；16384 = 系统完整性。中完整性是 8192，不在此列。
+    Some(文本.contains("S-1-16-12288") || 文本.contains("S-1-16-16384"))
+}
+
+#[cfg(not(windows))]
+fn 当前是否提权() -> Option<bool> {
+    None
+}
+
+/// 把「本程序以什么权限在跑」写进日志 —— 这是「引擎杀不掉」那条的**唯一前置判据**。
+///
+/// 🔴 2026-10-19 P100 的整轮排查卡在这里：日志里只有一句 `拒绝访问`，
+/// 谁也不知道本程序是不是提权跑的、那个引擎又是谁起的。缺了这条，
+/// 「权限不足」与「进程被别的程序保护」在日志里**同形**。
+///
+/// 只打一次（`Once`）：每次启动都打会变成噪声。
+fn 提示提权状态() {
+    static 已提示: std::sync::Once = std::sync::Once::new();
+    已提示.call_once(|| match 当前是否提权() {
+        Some(true) => tracing::warn!(
+            "本程序以管理员身份运行：它起的引擎继承高完整性，退出 APP 后仍会继续跑，\
+             但下次用**普通权限**打开本程序将杀不掉它（taskkill 拒绝访问）。\
+             若打算关掉 APP 让服务继续跑，请固定用同一种权限启动"
+        ),
+        Some(false) => tracing::info!("本程序以普通权限运行（UAC 未提权）"),
+        None => tracing::debug!("查不到当前权限级别（whoami 不可用）"),
+    });
+}
+
+/// 一次终止尝试的**结果**。
+///
+/// 🔴 它只回答「为什么没成」，**不**回答「停没停下」。判「停没停下」只看现场
+/// （端口是否还归那个 pid）—— 沿用本项目那条：日志只记发生过的事，
+/// 状态要看现场。`taskkill` 报成功也只说明命令没报错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum 终止结果 {
+    /// 没发终止：手上没有进程，或 pid 是 0 的占位。
+    未尝试,
+    /// `taskkill` 报成功。
+    已结束,
+    /// `taskkill` 说「没有此进程的实例」—— 进程本来就已经退出，属正常收尾。
+    本来就没有,
+    /// `taskkill` 说「拒绝访问」：目标的完整性级别高于本进程（典型：上一次以
+    /// **管理员身份**运行 APP，它起的引擎继承高完整性；这次普通权限启动就杀不掉）。
+    拒绝访问,
+    /// 其它失败。
+    其他,
+}
+
+/// `taskkill` 退出码 → 结果。
+///
+/// 抽成纯函数是为了能钉住映射：这两个码（128 / 255）是 2026-10-19 P100 实测
+/// 出来的，**不是** MSDN 上的文档值 —— 一旦上游行为变了，要能靠单测发现。
+fn 由退出码判终止结果(码: Option<i32>) -> 终止结果 {
+    match 码 {
+        Some(0) => 终止结果::已结束,
+        // 255 = 「没有此进程的实例」：进程在 taskkill 打开它之前就已经退出。
+        // 这是**正常收尾**（本次会话刚 `child.kill()` 过的就是这种），不是故障。
+        Some(255) => 终止结果::本来就没有,
+        // 128 = 「拒绝访问」。❗这条必须与「没有此实例」分开：2026-10-19 P100 的
+        // 日志里 9 条 WARN 有 8 条是「没有此实例」，唯一那条「拒绝访问」被埋住了，
+        // 结果把「杀不掉」误判成「端口被占」，排查方向整整偏了一轮。
+        Some(128) => 终止结果::拒绝访问,
+        _ => 终止结果::其他,
     }
 }
 
 /// Best-effort termination of a process (and its children) by pid. Used to stop
 /// a reattached server or clean up a stale/zombie one on Windows.
-fn kill_pid(pid: u32) {
+fn kill_pid(pid: u32) -> 终止结果 {
     // pid 0 = 「接管时没查到 pid」的占位（见 `接管遗留引擎`）。`taskkill /PID 0`
     // 会去杀 Idle 进程并报错，语义上没有任何意义 —— 直接跳过，别留一条注定
     // 失败的调用去污染日志。
     if pid == 0 {
         tracing::debug!("kill_pid：pid 为 0（接管时没查到），跳过");
-        return;
+        return 终止结果::未尝试;
     }
     let mut command = Command::new("taskkill");
     command.args(["/PID", &pid.to_string(), "/T", "/F"]);
@@ -2929,14 +3126,35 @@ fn kill_pid(pid: u32) {
     // 于是「服务没停掉、端口还占着」在下一次启动时表现为「端口被占用」，
     // 排查方向直接被带偏（2026-10-19 P100）。
     match command.output() {
-        Ok(输出) if !输出.status.success() => tracing::warn!(
-            pid,
-            状态 = ?输出.status.code(),
-            输出 = %String::from_utf8_lossy(&输出.stderr).trim(),
-            "kill_pid：taskkill 未能结束该进程（可能已退出、或权限不足）"
-        ),
-        Err(错误) => tracing::warn!(pid, 错误 = %错误, "kill_pid：taskkill 没能执行"),
-        _ => {}
+        Ok(输出) => {
+            let 码 = 输出.status.code();
+            let 结果 = 由退出码判终止结果(if 输出.status.success() { Some(0) } else { 码 });
+            match 结果 {
+                终止结果::已结束 => tracing::info!(pid, "kill_pid：已结束该进程（含子进程）"),
+                // 「进程已不在」不是故障，降到 DEBUG：否则日志里一片 WARN，
+                // 真正那条「拒绝访问」会被淹掉。
+                终止结果::本来就没有 => tracing::debug!(pid, "kill_pid：进程已不在，无需终止"),
+                终止结果::拒绝访问 => tracing::warn!(
+                    pid,
+                    状态 = ?码,
+                    输出 = %String::from_utf8_lossy(&输出.stderr).trim(),
+                    "kill_pid：拒绝访问 —— 目标进程的权限级别高于本程序，杀不掉\
+                     （多半是上一次以管理员身份运行 APP 时起的引擎）。\
+                     需要以管理员身份重新运行本程序，或到任务管理器结束该进程"
+                ),
+                _ => tracing::warn!(
+                    pid,
+                    状态 = ?码,
+                    输出 = %String::from_utf8_lossy(&输出.stderr).trim(),
+                    "kill_pid：taskkill 未能结束该进程"
+                ),
+            }
+            结果
+        }
+        Err(错误) => {
+            tracing::warn!(pid, 错误 = %错误, "kill_pid：taskkill 没能执行");
+            终止结果::其他
+        }
     }
 }
 
@@ -4137,6 +4355,35 @@ mod tests {
         // 只有 ESTABLISHED、没有 LISTENING 时**不能**算 —— 那不是「在提供服务」。
         let 只有连接 = "  TCP    127.0.0.1:8000    127.0.0.1:51234    ESTABLISHED    4321\r\n";
         assert_eq!(从netstat里取pid(只有连接, 8000), None);
+    }
+
+    /// `taskkill` 的退出码必须分得开「拒绝访问」与「本来就没有」。
+    ///
+    /// 2026-10-19 P100：这两类失败在旧代码里都打成同一句 WARN，日志里 9 条 WARN
+    /// 有 8 条是「没有此实例」，唯一那条「拒绝访问」被埋掉 —— 于是「杀不掉」被
+    /// 误读成「端口被占」，整轮排查方向都错了。
+    #[test]
+    fn taskkill退出码要分开拒绝访问与本来就没有() {
+        assert_eq!(由退出码判终止结果(Some(0)), 终止结果::已结束);
+        assert_eq!(由退出码判终止结果(Some(255)), 终止结果::本来就没有);
+        assert_eq!(由退出码判终止结果(Some(128)), 终止结果::拒绝访问);
+        assert_eq!(由退出码判终止结果(Some(1)), 终止结果::其他);
+        assert_eq!(由退出码判终止结果(None), 终止结果::其他);
+        // 「本来就没有」不许和「拒绝访问」同形 —— 这一条是上面那段事故的正向钉子。
+        assert_ne!(由退出码判终止结果(Some(255)), 由退出码判终止结果(Some(128)));
+    }
+
+    /// 「停止」之后到底停没停，只认现场：端口上还是不是那个 pid。
+    #[test]
+    fn 停止后仍是同一个进程_只认端口上现在的pid() {
+        // 端口还在、pid 一模一样 ⇒ 没停下（2026-10-19 P100 的 07:16:04 就是这种）。
+        assert!(停止后仍是同一个进程(Some(2468), Some(2468)));
+        // 端口还在、但我们没有 pid 可比 ⇒ 同样不许宣称停掉了。
+        assert!(停止后仍是同一个进程(Some(2468), None));
+        // 端口空了 ⇒ 停了。
+        assert!(!停止后仍是同一个进程(None, Some(2468)));
+        // 端口被**别的**进程占了 ⇒ 旧那个确实退了，认作已停（新占用者由启动路径处置）。
+        assert!(!停止后仍是同一个进程(Some(999), Some(2468)));
     }
 
     #[tokio::test]
