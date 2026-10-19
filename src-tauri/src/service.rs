@@ -569,25 +569,117 @@ pub async fn start_service_core(
     // 记下「进这次启动之前手上那个进程」的 pid：端口随后若仍被占，可能就是它
     // 没退干净（2026-10-19 P100：`taskkill` 拒绝访问，父进程没了、子进程还占着
     // 8000）。判据不能停在我们发过 kill。
-    let 刚停掉的pid: Option<u32> = {
+    //
+    // 同时把**进本次启动前的完整现场**存下来：停旧服务失败时要原样放回去。
+    // 只恢复一半（例如把状态改回 Running 却留着新 model_id）比不恢复更糟 ——
+    // 界面会显示「正在运行 Ornith」而端口上跑的还是 1.7B，正是这一轮要根治的谎报。
+    struct 启动前现场 {
+        进程: Option<Child>,
+        pid: Option<u32>,
+        端口: Option<u16>,
+        模型: Option<String>,
+        host: Option<String>,
+        状态: ServiceStatus,
+        安全模式: bool,
+    }
+    let 现场 = {
         let mut inner = state.inner.lock().expect("state lock poisoned");
         if inner.service.status == ServiceStatus::Starting {
             return Err(AppError::Message(
                 "AI服务正在启动中，请稍候。".to_string(),
             ));
         }
-        // Kill any existing process (whether spawned this session or reattached).
-        let 上一进程 = inner.service.pid;
-        let 上一端口 = inner.service.port;
-        结束服务进程(inner.service.process.take(), 上一进程, 上一端口);
+        let 现场 = 启动前现场 {
+            // Kill any existing process (whether spawned this session or reattached).
+            进程: inner.service.process.take(),
+            pid: inner.service.pid,
+            端口: inner.service.port,
+            模型: inner.service.model_id.clone(),
+            host: inner.service.host.clone(),
+            状态: inner.service.status.clone(),
+            安全模式: inner.service.safe_mode,
+        };
         inner.service.pid = None;
         inner.service.status = ServiceStatus::Starting;
         inner.service.model_id = Some(model_id.to_string());
         // Keep host/port — they are needed for the restarting_same_address
         // check below and will be overwritten by set_starting later.
-        // 块值 = 进本次启动前手上的 pid（供端口被占时判断「是不是自己的残留」）。
-        上一进程
+        现场
     };
+    let 刚停掉的pid: Option<u32> = 现场.pid;
+    // 🔴 停旧服务这一步**必须看结果**。
+    //
+    // 此前这里写的是 `结束服务进程(inner.service.process.take(), …);` —— 返回值被
+    // 直接丢掉。于是「拒绝访问」只留一条 WARN，启动流程照走，接着就是双重谎报：
+    //
+    //   1. 旧引擎（1.7B，管理员权限起的）还占着 8000，新引擎绑不上端口；
+    //   2. 健康探测命中的是**旧引擎**，连续两次 200 ⇒ 「启动成功」；
+    //   3. 日志写下 `llama-server running model_id=Some("local-Ornith-1.5-9B-Q8_0")`，
+    //      界面显示已切到 9B，实际跑的还是 1.7B（2026-10-19 P100 `07:42:10`）。
+    //
+    // 所以在**拉起任何进程之前**就要判「旧的到底停没停」，没停就不许往下走。
+    let 终止 = 结束服务进程(现场.进程, 现场.pid, 现场.端口);
+    let 仍在监听 = 现场.端口.and_then(端口上正在监听的进程);
+    if 停止没能生效(终止, 仍在监听, 现场.pid) {
+        let 端口 = 现场.端口.unwrap_or(0);
+        let 占用 = 仍在监听.or(现场.pid).unwrap_or(0);
+        let 原因 = if 终止 == 终止结果::拒绝访问 {
+            "本程序没有权限结束它 —— 它是以管理员身份运行的那一次起的引擎"
+        } else {
+            "它仍在监听这个端口"
+        };
+        let 文案 = format!(
+            "上一个 AI 服务没能停下来（接口端口 {端口} 上的进程 {占用}）。{原因}，\
+             所以这次**没有**启动「{model_id}」—— 否则新引擎绑不上端口，\
+             界面上会显示已经换了模型、实际跑的还是旧的那个。\
+             请右键「以管理员身份运行」本程序后再切换，或打开任务管理器结束进程 {占用}。"
+        );
+        tracing::error!(
+            port = 端口,
+            pid = 占用,
+            终止结果 = ?终止,
+            拒绝启动 = model_id,
+            "停旧服务失败 ⇒ 拒绝启动新模型：状态保持原样，绝不谎报已切换"
+        );
+        let info = {
+            let mut inner = state.inner.lock().expect("state lock poisoned");
+            // 句柄已经交给 `结束服务进程` 消费掉了；进程若还活着，我们手里没有句柄，
+            // 这正是「接管态」（`process = None`）—— 停止走按端口反查的 kill_pid。
+            inner.service.process = None;
+            inner.service.pid = 现场.pid;
+            inner.service.port = 现场.端口;
+            inner.service.host = 现场.host.clone();
+            inner.service.model_id = 现场.模型.clone();
+            inner.service.status = 现场.状态.clone();
+            inner.service.safe_mode = 现场.安全模式;
+            ServiceInfo {
+                model_id: inner.service.model_id.clone(),
+                port: inner.service.port,
+                host: inner.service.host.clone(),
+                status: inner.service.status.clone(),
+                safe_mode: inner.service.safe_mode,
+                message: 文案.clone(),
+            }
+        };
+        if info.status == ServiceStatus::Running {
+            // 状态是 Running 就必须有看门狗：前面进 `Starting` 时看门狗已经停了，
+            // 「Running 却没人在看」是另一种不一致（进程真挂了没人发现）。
+            spawn_service_watchdog(app.clone(), state.clone());
+        }
+        let _ = app.emit("service_status_changed", &info);
+        return Err(AppError::Message(info.message));
+    }
+    if 现场.pid.is_some() {
+        // 切换模型此前**没有**任何「停了没有」的痕迹：日志里只有 `switched current
+        // model` 紧接着 `starting llama-server`，中间那段是空的。补一条，让
+        // 「正常切换」与「切换时没停下来」在日志里可区分。
+        tracing::info!(
+            pid = 现场.pid.unwrap_or(0),
+            port = ?现场.端口,
+            终止结果 = ?终止,
+            "已结束上一个服务，准备启动新模型"
+        );
+    }
     // Emit *now* so the frontend's ThirdPartyConnect/ChatView cards see the
     // new model_id immediately, rather than waiting for set_starting /
     // set_running to fire after the await points below. Without this, if any
@@ -944,6 +1036,14 @@ pub async fn start_service_core(
             set_running(app, state, child, false, "AI服务已启动，可以开始聊天。".to_string(), &extra_args)
         }
         Err(error) => {
+            // 端口被**别的引擎**占着 ⇒ 重试没有意义：保守参数与 CPU 兜底同样绑不上
+            // 端口，那两次只会多打两条 `GPU launch failed; retrying…`，把真正的错因
+            // 埋掉（2026-10-19 P100 `07:42` 之后就是这样：连报三次「显卡没起来」，
+            // 而显卡一点问题都没有）。
+            if 是端口占用类错误(&error.to_string()) {
+                let info = set_failed(app, state, error.to_string());
+                return Err(AppError::Message(info.message));
+            }
             if backend == EngineBackend::Cpu {
                 let info = set_failed(app, state, error.to_string());
                 return Err(AppError::Message(info.message));
@@ -1094,6 +1194,26 @@ fn 停止后仍是同一个进程(仍在监听: Option<u32>, 停止前的pid: Op
         (Some(现在), Some(旧的)) => 现在 == 旧的,
         (Some(_), None) => true,
         (None, _) => false,
+    }
+}
+
+/// 启动前那次「停旧服务」到底有没有生效 —— 没生效就**不许拉起新进程**。
+///
+/// 🔴 与 `停止后仍是同一个进程` 的关键差别：**不能**把「端口有人在听、但我们没有
+/// pid 可比」判成「没停下」。启动路径上那种情形多半是**别人的服务**占着端口，
+/// 正确处置是交给后面的端口分支去识别（能识出我方引擎就接管，否则报清楚），
+/// 在这里拦下来只会把「可以接管」变成「莫名无法启动」。
+///
+/// 所以只看两条**明确的反证**：
+/// * 端口上现在那个 pid，还是我们刚才要停的那个；
+/// * `taskkill` 明确回了「拒绝访问」—— 命令都说权限不够了，进程一定还在。
+fn 停止没能生效(终止: 终止结果, 仍在监听: Option<u32>, 停止前的pid: Option<u32>) -> bool {
+    if 终止 == 终止结果::拒绝访问 {
+        return true;
+    }
+    match (仍在监听, 停止前的pid) {
+        (Some(现在), Some(旧的)) => 现在 == 旧的,
+        _ => false,
     }
 }
 
@@ -2011,6 +2131,14 @@ async fn launch_service(
         return Err(error);
     }
 
+    // 🔴 健康检查之后**再问一句「端口上服务的是不是我刚起的这个进程」**。
+    // 旧引擎还占着端口时，`wait_for_health` 会被它的 200 直接骗过 —— 见
+    // `确认本次进程在服务` 里 2026-10-19 P100（`07:42:10`）的原文。
+    if let Err(error) = 确认本次进程在服务(child.id(), port, model_path).await {
+        结束服务进程(Some(child), None, Some(port));
+        return Err(error);
+    }
+
     Ok(child)
 }
 
@@ -2863,6 +2991,99 @@ async fn 识别端口上的引擎(host: &str, port: u16) -> Option<String> {
     crate::model_sidecar::解析模型回执(&正文).ok()
 }
 
+/// 端口类错误的统一前缀。
+///
+/// 两件事都靠它：`是端口占用类错误` 用它判「不该重试」，文案本身也以它开头。
+/// 改文案时**必须**同步这里 —— 有一条单测钉住「三处构造点都以它开头」。
+const 端口类错误前缀: &str = "接口端口";
+
+/// 这条错误是不是「端口被别的引擎占着」—— 是的话**不许重试**。
+///
+/// `start_service_core` 的失败分支会先用保守参数再起一次、再用 CPU 兜底起一次。
+/// 端口被占着时那两次注定同样失败（都绑不上端口），只是把真正的错因埋进两条
+/// `GPU launch failed; retrying…` 的 WARN 里，最后才由 CPU 分支报出来。
+fn 是端口占用类错误(消息: &str) -> bool {
+    消息.starts_with(端口类错误前缀)
+}
+
+/// 「端口上监听的是不是刚 spawn 的那个进程」的三种结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum 端口归属 {
+    是本次进程,
+    /// 端口上是**别的**进程。
+    是别的进程(u32),
+    /// 查不到端口上的 pid（netstat 不可用 / 非 Windows）⇒ 没有反证。
+    无法确认,
+}
+
+fn 判端口归属(端口pid: Option<u32>, 本次pid: u32) -> 端口归属 {
+    match 端口pid {
+        Some(pid) if pid == 本次pid => 端口归属::是本次进程,
+        Some(pid) => 端口归属::是别的进程(pid),
+        None => 端口归属::无法确认,
+    }
+}
+
+/// 健康检查通过**只证明这个端口上有东西在答**，不证明答的是本次起的进程。
+///
+/// 🔴 2026-10-19 P100（`07:42:10`）就是被这一点骗了：旧引擎
+/// （`qwen3_1_7b_light`，管理员权限那一次起的、`taskkill` 拒绝访问）还占着 8000
+/// 且 `/v1/models` 正常应答；新起的 Ornith 进程绑不上端口、却也活了一会儿 ——
+/// 健康探测连续两次 200，于是日志写下
+/// `llama-server running model_id=Some("local-Ornith-1.5-9B-Q8_0")`，
+/// 界面显示切到了 9B，**实际跑的还是 1.7B**。
+///
+/// 判据用**进程身份**（端口 pid 与 `child.id()` 比对），它比模型名更硬：这个窗口内
+/// pid 不会被复用，而模型名要绕过一次 `/v1/models` 解析才拿得到。只有查不到端口
+/// pid 时才退回模型身份核对；两者都拿不到时**放行**（打 WARN）——
+/// 「无法确认」不等于「确认有问题」，拿它拦启动会在 netstat 被封的机器上变成死路。
+async fn 确认本次进程在服务(child_pid: u32, port: u16, 期望模型: &Path) -> AppResult<()> {
+    let 期望 = 期望模型.display().to_string();
+    match 判端口归属(端口上正在监听的进程(port), child_pid) {
+        端口归属::是本次进程 => Ok(()),
+        端口归属::是别的进程(占用) => {
+            let 自报 = 识别端口上的引擎("127.0.0.1", port).await;
+            // 自报对得上 = 端口上跑的正是这个模型（可能是同一棵进程树里的另一个
+            // pid，例如瘦启动器把真正监听的进程另起了一个），这种情况放行。
+            if let Some(自报) = &自报 {
+                if crate::model_sidecar::核对模型(&期望, 自报).is_empty() {
+                    tracing::debug!(
+                        port,
+                        端口pid = 占用,
+                        本次pid = child_pid,
+                        "端口上监听的不是本次 spawn 的那个 pid，但引擎自报的模型一致 ⇒ 视为已在服务"
+                    );
+                    return Ok(());
+                }
+            }
+            let 是谁 = 自报.unwrap_or_else(|| "另一个引擎".to_string());
+            Err(AppError::Message(format!(
+                "{端口类错误前缀} {port} 上现在是**另一个引擎**在服务（{是谁}，进程 {占用}），\
+                 不是这次启动的「{期望}」—— 新起的进程（{child_pid}）没能绑上端口。\
+                 多半是上一个引擎没被彻底结束（它若以管理员权限启动，普通权限的本程序结束不掉）。\
+                 请右键「以管理员身份运行」本程序后再切换，或到任务管理器结束进程 {占用}。"
+            )))
+        }
+        端口归属::无法确认 => match 识别端口上的引擎("127.0.0.1", port).await {
+            Some(自报) if crate::model_sidecar::核对模型(&期望, &自报).is_empty() => Ok(()),
+            Some(自报) => Err(AppError::Message(format!(
+                "{端口类错误前缀} {port} 上跑的是「{自报}」，不是这次启动的「{期望}」—— \
+                 新起的进程（{child_pid}）没能绑上端口。\
+                 请先停掉端口上的服务，或到设置里换一个端口。"
+            ))),
+            None => {
+                tracing::warn!(
+                    port,
+                    本次pid = child_pid,
+                    "查不到端口归属于哪个进程，也问不出引擎自报的模型 ⇒ 本次**无法确认**\
+                     端口上服务的是不是刚起的进程；按启动成功处理，但这不算证据"
+                );
+                Ok(())
+            }
+        },
+    }
+}
+
 /// 端口上已经有一份**我方引擎**在跑时，直接接管，而不是报「端口被占用」。
 ///
 /// 这条路径补的是 2026-10-19 P100 实测的那个死角：`recover_service` 手里的
@@ -2997,19 +3218,34 @@ fn 结束服务进程(process: Option<Child>, pid: Option<u32>, port: Option<u16
         Some(mut child) => {
             let 子pid = child.id();
             // 本次会话亲手 spawn 的：`Child` 句柄还在，pid 在这个窗口内不会被复用。
-            match child.kill() {
-                Ok(()) => tracing::info!(pid = 子pid, "已请求结束服务子进程"),
-                Err(错误) => tracing::warn!(
-                    pid = 子pid,
-                    错误 = %错误,
-                    "结束服务子进程失败 —— 它可能仍然占着端口与显存（下一步会按 pid 再试一次）"
-                ),
-            }
+            let 句柄成功 = match child.kill() {
+                Ok(()) => {
+                    tracing::info!(pid = 子pid, "已请求结束服务子进程");
+                    true
+                }
+                Err(错误) => {
+                    tracing::warn!(
+                        pid = 子pid,
+                        错误 = %错误,
+                        "结束服务子进程失败 —— 它可能仍然占着端口与显存（下一步会按 pid 再试一次）"
+                    );
+                    false
+                }
+            };
             // 🔴 两条终止路径的**权限路径不同**，必须都试：
             // `Child::kill` 走 `TerminateProcess(建进程时的句柄)`，不受完整性级别限制；
             // `taskkill` 要**新开**一个进程句柄，目标级别比我们高就 `拒绝访问`。
             // 本次会话亲手起的进程两条都能成；接管来的（没有 `Child`）只有后者。
-            kill_pid(子pid)
+            let 结果 = kill_pid(子pid);
+            // 🔴 句柄已经把它终止了，随后 `taskkill` 报的「没有此实例」是**必然**的
+            // （进程刚被我们杀掉）。这不叫「本来就没有」—— 那是「本来就没在跑」，
+            // 会让排查者以为这个服务从没起来过。2026-10-19 P100（`07:39:32`）
+            // 日志里就写着 `终止结果=本来就没有`，而两秒前它还 `llama-server running`。
+            if 句柄成功 && 结果 == 终止结果::本来就没有 {
+                终止结果::已结束
+            } else {
+                结果
+            }
         }
         None => match (port.and_then(端口上正在监听的进程), pid) {
             (Some(端口pid), _) => {
@@ -4386,6 +4622,96 @@ mod tests {
         assert!(!停止后仍是同一个进程(Some(999), Some(2468)));
     }
 
+    /// 启动前「停旧服务没生效」的判据：只认两条明确反证。
+    ///
+    /// 2026-10-19 P100（`07:42:02`）：切模型时 `taskkill` 拒绝访问，旧引擎继续占着
+    /// 8000。旧代码把 `结束服务进程` 的返回值丢掉，于是照常启动 —— 新引擎绑不上
+    /// 端口，健康探测被旧引擎的 200 骗过，日志写下「Ornith 已运行」，实际跑的是 1.7B。
+    #[test]
+    fn 停止没能生效_只认明确反证() {
+        // 端口上还是刚才那个 pid ⇒ 没停下。
+        assert!(停止没能生效(终止结果::已结束, Some(8892), Some(8892)));
+        // `taskkill` 明说拒绝访问 ⇒ 进程一定还在，即使这一下 netstat 没查到。
+        assert!(停止没能生效(终止结果::拒绝访问, None, Some(8892)));
+        assert!(停止没能生效(终止结果::拒绝访问, Some(8892), Some(8892)));
+        // 端口空了 ⇒ 停了。
+        assert!(!停止没能生效(终止结果::已结束, None, Some(8892)));
+        // 🔴 端口有人在听、但我们本来就没有 pid ⇒ **不算**没停下：
+        // 那多半是别人的服务，要交给端口分支去识别/接管，不能在这里拦成「无法启动」。
+        assert!(!停止没能生效(终止结果::未尝试, Some(4321), None));
+        // 旧的那个确实退了、端口被别的进程占了 ⇒ 也放行（后面按端口识别）。
+        assert!(!停止没能生效(终止结果::已结束, Some(999), Some(8892)));
+    }
+
+    #[test]
+    fn 判端口归属_三分法() {
+        assert_eq!(判端口归属(Some(7148), 7148), 端口归属::是本次进程);
+        assert_eq!(判端口归属(Some(8892), 7148), 端口归属::是别的进程(8892));
+        assert_eq!(判端口归属(None, 7148), 端口归属::无法确认);
+    }
+
+    /// `是端口占用类错误` 靠文案前缀判断，前缀必须与三处构造点一致。
+    ///
+    /// 三处分别是：端口被别人占（"…已被占用，请换端口"）、端口上是另一个模型、
+    /// 端口上是高阶权限的引擎。漏掉任何一处，对应的错误就会被当成「显卡没起来」
+    /// 去重试两次 —— 白等，还把真正的错因埋掉。
+    #[test]
+    fn 端口类错误前缀与实际文案对齐() {
+        assert_eq!(端口类错误前缀, "接口端口");
+        let 三处 = [
+            format!("{端口类错误前缀} 8000 已被占用，请在设置里换一个端口。"),
+            format!(
+                "{端口类错误前缀} 8000 上正在运行另一个模型（D:\\m\\a.gguf，进程 8892），\
+                 不是这次要启动的「D:\\m\\b.gguf」。请先在那边停止服务，或到设置里换一个端口。"
+            ),
+            format!(
+                "{端口类错误前缀} 8000 上的引擎（进程 8892）还在运行，但本程序结束不掉它 —— \
+                 Windows 拒绝访问，说明它是用**管理员权限**启动的。"
+            ),
+        ];
+        for 文案 in 三处 {
+            assert!(是端口占用类错误(&文案), "端口类错误必须被识别出来：{文案}");
+        }
+        // 反例：显卡/超时类错误绝不能被当成端口问题 —— 否则会白白跳过重试。
+        assert!(!是端口占用类错误("显卡加速没能生效，当前用的是普通（CPU）速度"));
+        assert!(!是端口占用类错误("AI服务启动超时，请稍后重试或换一个更小的模型。"));
+    }
+
+    /// 健康检查 200 ≠ 本次起的进程在服务 —— 判据是**端口上那个 pid**。
+    ///
+    /// 这条直接对应 07:42 的现场：旧引擎（1.7B）在 8000 上正常应答，新起的
+    /// Ornith 进程没绑上端口，却照样被判成「启动成功」。
+    #[tokio::test]
+    async fn 确认本次进程在服务_端口上是别人时必须拒绝() {
+        let 端口 = 起假引擎(回执响应(
+            r#"{"object":"list","data":[{"id":"D:\\m\\qwen3_1_7b_light\\Qwen3-1.7B-Q8_0.gguf"}]}"#,
+        ));
+        let 我 = std::process::id();
+        let 旧 = Path::new(r"D:\m\qwen3_1_7b_light\Qwen3-1.7B-Q8_0.gguf");
+        let 新 = Path::new(r"D:\m\Ornith-1.5-9B-Q8_0\Ornith-1.5-9B-Q8_0.gguf");
+
+        // 端口上就是本进程（假装是「我们刚 spawn 的」）⇒ 通过。
+        确认本次进程在服务(我, 端口, 旧)
+            .await
+            .expect("端口归属对得上就该通过");
+
+        // 端口上是本进程，但调用方声称自己 spawn 的是另一个 pid，期望模型也是新的：
+        // 这正是 07:42 那次 —— 旧引擎在服务、新进程没绑上端口。
+        let 错误 = 确认本次进程在服务(我.wrapping_add(1), 端口, 新)
+            .await
+            .expect_err("端口上是别的引擎且模型对不上，必须拒绝");
+        let 文案 = 错误.to_string();
+        assert!(文案.contains("另一个引擎"), "应说清是别的引擎在服务：{文案}");
+        assert!(
+            文案.contains("Qwen3-1.7B-Q8_0.gguf"),
+            "应报出占位引擎自报的模型，否则用户不知道该去停哪个：{文案}"
+        );
+        assert!(
+            是端口占用类错误(&文案),
+            "端口类错误必须走前缀判据（不许再重试两次）：{文案}"
+        );
+    }
+
     #[tokio::test]
     async fn 识别端口上的引擎_能从假引擎拿到自报模型() {
         let 端口 = 起假引擎(回执响应(
@@ -4647,6 +4973,29 @@ mod tests {
             "启动路径有两条分支（激进一次成功 / 保守参数重试）都要核对；少一条就有一半启动路径不受保护"
         );
         // ⚠️ 这条**不**证明运行时真的走到了那两条分支 —— 那只能靠实机日志（判据 G-5）。
+    }
+
+    /// 判据存在 ≠ 判据被调用 —— 这两条钉住**调用点**。
+    ///
+    /// 2026-10-19 P100（`07:42`）的病根就是这个：`结束服务进程` 写得没问题，
+    /// 但调用处是裸调用 `结束服务进程(…);`，返回值直接丢掉，于是「拒绝访问」
+    /// 只留一条 WARN、启动照走。同理，`wait_for_health` 通过之后若不核对端口归属，
+    /// 旧引擎的 200 会把新进程「绑不上端口」这件事完全盖住。
+    #[test]
+    fn 启动路径真的检查了停旧服务的结果与端口归属() {
+        let 源码 = include_str!("service.rs");
+        assert!(
+            源码.contains(concat!("let 终止 = 结束服务", "进程(")),
+            "启动前停旧服务必须把结果接住；裸调用会重现 07:42 那次「停不掉还照常启动」"
+        );
+        assert!(
+            源码.contains(concat!("if 停止没能生", "效(")),
+            "接住结果之后必须据此中止启动（没停就不许拉起新进程）"
+        );
+        assert!(
+            源码.contains(concat!("确认本次进程在服务(child", ".id()")),
+            "健康检查之后必须核对端口归属，否则旧引擎的 200 会把新进程的失败盖掉"
+        );
     }
 
     // ── 旁车项并入：它决定「已并入本次启动命令行」那句日志的**真值** ──────────
