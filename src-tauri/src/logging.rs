@@ -12,17 +12,93 @@ use crate::{
     error::{AppError, AppResult},
 };
 
+/// 这次启动的日志级别到底是谁说了算。
+///
+/// 必须如实报出来：首行写「INFO」而实际按 `RUST_LOG=debug` 在跑，会让所有
+/// 「看到 DEBUG 行就算走到了、没看到就算没走到」的判据集体失准 —— 判据本身
+/// 没错，是证据的来源被谎报了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum 级别来源 {
+    /// 设置里的 `log_level`（已按 `normalize_level` 归一）。
+    配置,
+    /// 环境变量 `RUST_LOG` 的原样指令，可带多条 directive。
+    环境变量,
+}
+
+impl 级别来源 {
+    /// 日志里用的 ASCII 字面量（日志要能 grep，不写中文）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::配置 => "settings",
+            Self::环境变量 => "RUST_LOG",
+        }
+    }
+}
+
+/// 决定这次真正生效的过滤指令 —— `init` 与首行日志共用这一份判断，
+/// 不另写一套等价逻辑（两处定义必然漂移，且漂移时不报错只给错报告）。
+///
+/// 规则与原先的 `EnvFilter::try_from_default_env()` 完全一致：`RUST_LOG` 存在
+/// 且是合法指令时才盖过设置，否则回落到 `normalize_level(设置值)`。
+/// 非法 `RUST_LOG` 的原文一并带出，由调用方单独 WARN —— 静默忽略等于又一次
+/// 「看起来按你的要求跑了」。
+///
+/// 返回 `(来源, 生效指令, 被忽略的 RUST_LOG 原文)`。
+pub fn 选择过滤(设置级别: &str, 环境变量: Option<&str>) -> (级别来源, String, Option<String>) {
+    if let Some(raw) = 环境变量 {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            if EnvFilter::try_new(trimmed).is_ok() {
+                return (级别来源::环境变量, trimmed.to_string(), None);
+            }
+            return (
+                级别来源::配置,
+                normalize_level(设置级别).to_string(),
+                Some(raw.to_string()),
+            );
+        }
+    }
+    (级别来源::配置, normalize_level(设置级别).to_string(), None)
+}
+
+/// `logging::init` 的产物：要留到进程结束的 writer guard，加上「实际生效了什么」。
+///
+/// `guard` 为 `None` 表示日志目录建不出来（只剩控制台输出），不是失败。
+pub struct 日志初始化 {
+    /// 只靠 `Drop` 生效（把非阻塞 writer 的缓冲刷出去），**永不读取** ——
+    /// 所以显式允许 dead_code：一旦被当成无用字段优化掉，日志会静默丢尾巴。
+    #[allow(dead_code)]
+    pub guard: Option<WorkerGuard>,
+    /// 设置文件里的原值，原样报出（非法值也照报，别替用户美化）。
+    pub 设置级别: String,
+    pub 级别来源: 级别来源,
+    /// 真正交给 `EnvFilter` 的指令原文。
+    pub 生效指令: String,
+    /// `RUST_LOG` 设了但解析不了时的原文；`None` 表示没这回事。
+    pub 环境变量无效: Option<String>,
+}
+
 /// Initialize logging: console + daily-rolling file under `data_dir/logs`.
 ///
 /// The base level comes from the user's `log_level` setting (DEBUG/INFO/WARN/
 /// ERROR); a `RUST_LOG` env var still overrides it for developers. The returned
 /// guard flushes the non-blocking writer on drop, so callers must keep it alive
-/// for the lifetime of the app. Returns `None` (console only) when the log
-/// directory can't be created.
-pub fn init(data_dir: &Path, log_level: &str) -> Option<WorkerGuard> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(normalize_level(log_level)));
+/// for the lifetime of the app.
+pub fn init(data_dir: &Path, log_level: &str) -> 日志初始化 {
+    let 环境变量 = std::env::var("RUST_LOG").ok();
+    let (来源, 指令, 无效) = 选择过滤(log_level, 环境变量.as_deref());
+    // `选择过滤` 保证这里一定合法：要么是归一后的单级别，要么是刚被
+    // `EnvFilter::try_new` 验过的原文，因此 `new` 不会 panic。
+    let filter = EnvFilter::new(&指令);
     let console = fmt::layer().with_target(false);
+
+    let 结果 = |guard: Option<WorkerGuard>| 日志初始化 {
+        guard,
+        设置级别: log_level.to_string(),
+        级别来源: 来源,
+        生效指令: 指令.clone(),
+        环境变量无效: 无效.clone(),
+    };
 
     let logs_dir = data_dir.join("logs");
     if std::fs::create_dir_all(&logs_dir).is_err() {
@@ -30,7 +106,7 @@ pub fn init(data_dir: &Path, log_level: &str) -> Option<WorkerGuard> {
             .with(filter)
             .with(console)
             .init();
-        return None;
+        return 结果(None);
     }
 
     let appender = tracing_appender::rolling::daily(&logs_dir, "localai.log");
@@ -45,7 +121,7 @@ pub fn init(data_dir: &Path, log_level: &str) -> Option<WorkerGuard> {
         .with(console)
         .with(file)
         .init();
-    Some(guard)
+    结果(Some(guard))
 }
 
 /// Map a user-facing log level (DEBUG/INFO/WARN/ERROR, any case) to the tracing
@@ -302,5 +378,53 @@ mod tests {
         assert_eq!(normalize_level(" Error "), "error");
         // Unknown values fall back to info.
         assert_eq!(normalize_level("verbose"), "info");
+    }
+
+    #[test]
+    fn reports_settings_level_when_no_env_override() {
+        let (来源, 指令, 无效) = 选择过滤("DEBUG", None);
+        assert_eq!(来源, 级别来源::配置);
+        assert_eq!(来源.as_str(), "settings");
+        // 设置里的写法不统一（大小写/空格），生效值必须是归一后的。
+        assert_eq!(指令, "debug");
+        assert!(无效.is_none());
+    }
+
+    #[test]
+    fn env_override_beats_settings_and_is_reported_verbatim() {
+        // 反例就是这次要修的谎报：设置写 INFO，实际按 debug 在跑。
+        // 旧实现首行打的是「log_level=INFO」，没人看得出 DEBUG 行为什么会出现。
+        let (来源, 指令, 无效) = 选择过滤("INFO", Some("debug"));
+        assert_eq!(来源, 级别来源::环境变量);
+        assert_eq!(来源.as_str(), "RUST_LOG");
+        assert_eq!(指令, "debug");
+        assert_ne!(指令, normalize_level("INFO"));
+        assert!(无效.is_none());
+
+        // 多 directive 的写法也必须原样保留，不能被拆成单级别报出去。
+        let (来源, 指令, _) = 选择过滤("INFO", Some("localai=debug,hyper=warn"));
+        assert_eq!(来源, 级别来源::环境变量);
+        assert_eq!(指令, "localai=debug,hyper=warn");
+    }
+
+    #[test]
+    fn invalid_env_falls_back_loudly() {
+        // 非法指令不能静默吞掉：回落设置，同时把原文交出去让调用方 WARN。
+        let (来源, 指令, 无效) = 选择过滤("WARN", Some("localai=nonsense"));
+        assert_eq!(来源, 级别来源::配置);
+        assert_eq!(指令, "warn");
+        assert_eq!(无效.as_deref(), Some("localai=nonsense"));
+    }
+
+    #[test]
+    fn blank_env_is_treated_as_unset() {
+        // `RUST_LOG=""` 与没设等价（`try_from_default_env` 也是这个行为），
+        // 不该被报成「无效环境变量」—— 否则每台机器都会白亮一条 WARN。
+        for raw in ["", "   "] {
+            let (来源, 指令, 无效) = 选择过滤("INFO", Some(raw));
+            assert_eq!(来源, 级别来源::配置);
+            assert_eq!(指令, "info");
+            assert!(无效.is_none(), "空 RUST_LOG 不该被当成非法指令");
+        }
     }
 }

@@ -50,12 +50,25 @@ pub fn run() {
     // or opens the files we're about to delete. Best-effort: never panics.
     data_mgmt::perform_pending_reset(&data_dir);
     let settings = load_settings(&data_dir).unwrap_or_default();
-    let _log_guard = logging::init(&data_dir, &settings.log_level);
+    // 注意：这个变量**不能**叫 `_log_guard` —— `_` 开头的绑定会在语句结束就
+    // 被丢掉，非阻塞 writer 的缓冲随之丢失。整个 `日志` 要活到 run() 末尾。
+    let 日志 = logging::init(&data_dir, &settings.log_level);
+    // 三个字段分开报：设置里配的是什么、实际生效的指令是什么、是谁定的。
+    // 只报一个 `log_level` 等于把「配置值」冒充成「生效值」，靠 DEBUG 行成立的
+    // 判据会全部失准。
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        log_level = %settings.log_level,
+        settings_level = %日志.设置级别,
+        effective_level = %日志.生效指令,
+        level_source = %日志.级别来源.as_str(),
         "LocalAI-Installer backend starting"
     );
+    if let Some(raw) = 日志.环境变量无效.as_deref() {
+        tracing::warn!(
+            rust_log_ignored = raw,
+            "环境变量 RUST_LOG 不是合法的日志过滤指令，已按设置里的日志级别启动"
+        );
+    }
     let db_path = init_database(&data_dir).unwrap_or_else(|error| {
         tracing::warn!("failed to initialize sqlite database: {}", error);
         database::database_path(&data_dir)
