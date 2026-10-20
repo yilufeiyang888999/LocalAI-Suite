@@ -58,16 +58,28 @@
 | 内存 | 8 GB 起；跑 7B 以上建议 16 GB |
 | 工具链 | Node.js ≥ 20、Rust ≥ 1.80、Python ≥ 3.10 |
 
+> **仓库根目录的 `index.html` 不能双击打开。**
+> 它只是 Vite 的开发入口，用 `<script type="module" src="/src/main.ts">` 引入 TypeScript 源码：
+> 浏览器不认 `.ts`，`file://` 协议下 ES 模块又会被 CORS 拦掉，双击只会得到一个空白页。
+> 仓库里也没有 `dist/`（构建产物与 `node_modules/` 都在 `.gitignore` 里）。
+> 要看界面只有两条路——装安装包，或起开发服务器（见下）。
+
 ### ① 桌面应用
 
 ```bash
-npm install
-npm run tauri:dev          # 开发模式
+npm install                # 或 npm ci（按 lock 文件精确安装）
+npm run dev                # 只起前端：浏览器访问 http://127.0.0.1:1420
+npm run tauri:dev          # 开发模式：前端 + Rust 后端，桌面窗口
 npm run tauri:build -- --bundles nsis   # 出安装包
 ```
 
 首次启动会自动检测显卡、推荐后端与量化档位，并按实际空闲显存计算能开多大上下文。
 模型与引擎在应用内下载，不下进仓库。
+
+> `npm run dev` 在浏览器里**只能看到外壳**：前端 39 个后端命令调用全部集中在 `src/api/tauri.ts`，
+> 一律走 Tauri 的 `invoke`，且没有「非 Tauri 环境」的兜底 —— 挂载时的硬件检测会直接失败，
+> 页面停在加载态、按钮点了报错。
+> 这是预期行为，不是装坏了；要看真实功能请用安装包或 `npm run tauri:dev`。
 
 ### ② 知识库
 
