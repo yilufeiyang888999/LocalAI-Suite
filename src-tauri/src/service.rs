@@ -697,7 +697,34 @@ pub async fn start_service_core(
     };
     // 附加参数只在**这里**算一次：三个启动分支（激进参数 / 保守参数 / CPU 兜底）
     // 共用同一份，且配置文件有问题时**在任何一次拉起之前**就失败，不会先起一次再报错。
-    let (extra_args, 旁车生效项) = 推导附加参数(state, &model_path)?;
+    //
+    // 🔴 这里**绝不能**写成裸 `?`。
+    //
+    // 状态在上面（guard 里）已经被翻成 `Starting`，而 `Starting` 下**启动与停止
+    // 两个按钮都是灰的**。裸 `?` 一返回，没人把状态改回去，界面上就永久停在
+    // 「AI服务正在启动」，用户改好配置也点不动，只能关掉 APP 重开。
+    //
+    // 2026-10-20 P100 实测：四条旁车配置反例（C-13~C-16）**每条都逼着重开一次
+    // APP** —— 报错弹窗说得清清楚楚「配置不合法」，改好再点启动却被告知
+    // 「AI服务正在启动中，请稍候」，而那个「启动中」永远不会结束。用户会以为
+    // 改配置没生效，反复去改配置，实际卡住的是状态机。
+    //
+    // 复位成 **Stopped**、不是 `现场.状态`：能走到这一行说明上面的「停旧服务」
+    // 已经成功，旧进程被 `结束服务进程` 收走了。恢复成 Running 会谎报「服务还在
+    // 跑」—— 那是本项目已经栽过一次的坑（见上方「停旧服务失败」分支的注释）。
+    let (extra_args, 旁车生效项) = match 推导附加参数(state, &model_path) {
+        Ok(值) => 值,
+        Err(错误) => {
+            tracing::error!(
+                模型 = %model_path.display(),
+                错误 = %错误,
+                "旁车配置不合法 ⇒ 拒绝启动：状态复位为未启动（否则界面永久卡在「正在启动」）"
+            );
+            let info = 复位为已停止(state, &format!("启动失败，服务已复位为未启动：{错误}"));
+            let _ = app.emit("service_status_changed", &info);
+            return Err(错误);
+        }
+    };
     if !旁车生效项.is_empty() {
         // 🔴 「已并入本次启动命令行」这句**只在这条路径上说** —— 这里是真的要起进程。
         // 接管路径（`recover_service`）也调同一个推导函数，但那里没有起进程、没有
@@ -1230,6 +1257,41 @@ fn 停止没能生效(终止: 终止结果, 仍在监听: Option<u32>, 停止前
     }
 }
 
+/// 把服务状态复位成「已停止」，返回新的状态对象（调用方负责 `emit`）。
+///
+/// 两个调用点，同一个理由：**状态已经不在真实状态上了，必须收尾**。
+///
+/// * `stop_service_core` —— 正常停止；
+/// * `start_service_core` —— 状态翻成 `Starting` 之后的失败路径。
+///
+/// 🔴 后者的教训（2026-10-20 P100 实测）：`Starting` 下启动与停止两个按钮都是
+/// 灰的，只要有一条失败路径忘了复位，用户就得关掉 APP 重开 —— 而界面上那句
+/// 「AI服务正在启动中，请稍候」看起来像是在正常工作，排查时会把人引向配置。
+///
+/// 抽成一个函数而不是两处各写一遍：本项目栽过「同一逻辑两处定义，改一处跑另
+/// 一处，不报错只给错结果」的坑。
+fn 复位为已停止(state: &AppState, 说明: &str) -> ServiceInfo {
+    let mut inner = state.inner.lock().expect("state lock poisoned");
+    // 持久化快照一并清掉：重开 APP 时 `recover_service` 会读它决定要不要接管，
+    // 留着一份指向「刚才没起来的那个模型」的快照，只会让下一次重开多绕一圈。
+    let _ = clear_service_state(&inner.db_path);
+    inner.service.process = None;
+    inner.service.status = ServiceStatus::Stopped;
+    inner.service.port = None;
+    inner.service.host = None;
+    inner.service.model_id = None;
+    inner.service.pid = None;
+    inner.service.safe_mode = false;
+    ServiceInfo {
+        model_id: None,
+        port: None,
+        host: None,
+        status: ServiceStatus::Stopped,
+        safe_mode: false,
+        message: 说明.to_string(),
+    }
+}
+
 /// Stop the running local service (killing our spawned child or a reattached
 /// pid) and clear its persisted snapshot. Shared by the command and update flow.
 pub fn stop_service_core(app: &AppHandle, state: &AppState) -> ServiceInfo {
@@ -1296,24 +1358,7 @@ pub fn stop_service_core(app: &AppHandle, state: &AppState) -> ServiceInfo {
         let _ = app.emit("service_status_changed", &info);
         return info;
     }
-    let info = {
-        let mut inner = state.inner.lock().expect("state lock poisoned");
-        let _ = clear_service_state(&inner.db_path);
-        inner.service.status = ServiceStatus::Stopped;
-        inner.service.port = None;
-        inner.service.host = None;
-        inner.service.model_id = None;
-        inner.service.pid = None;
-        inner.service.safe_mode = false;
-        ServiceInfo {
-            model_id: None,
-            port: None,
-            host: None,
-            status: ServiceStatus::Stopped,
-            safe_mode: false,
-            message: "AI服务已停止。".to_string(),
-        }
-    };
+    let info = 复位为已停止(state, "AI服务已停止。");
     let _ = app.emit("service_status_changed", &info);
     tracing::info!(端口 = ?旧端口, 终止结果 = ?结果, "llama-server stopped");
     info
@@ -5058,6 +5103,80 @@ mod tests {
         assert!(
             源码.contains(concat!("确认本次进程在服务(child", ".id()")),
             "健康检查之后必须核对端口归属，否则旧引擎的 200 会把新进程的失败盖掉"
+        );
+    }
+
+    /// 启动失败必须把状态复位 —— 否则界面永久卡在「正在启动」，用户只能重开 APP。
+    ///
+    /// 2026-10-20 P100 实测现场：`launch.json` 写坏 ⇒ 启动失败 ⇒ 状态停在
+    /// `Starting`。此时**启动与停止两个按钮同时变灰**，而弹窗说的是「配置不合法」，
+    /// 用户改好配置再点启动，得到的是「AI服务正在启动中，请稍候」—— 那个「启动中」
+    /// 永远不会结束。四条旁车配置反例（C-13~C-16）每条都逼着重开一次 APP。
+    #[test]
+    fn 启动失败必须把状态复位_不能卡在正在启动() {
+        let (目录, 库) = 建临时数据目录();
+        let state = AppState::new(
+            crate::settings::AppSettings::default(),
+            目录,
+            库,
+            Default::default(),
+        );
+        // 复刻 guard 把状态翻成 Starting 之后的样子：pid / port / model_id 都已被
+        // 新值覆盖。这些字段若留着，界面会显示「正在运行 qwen3_1_7b_light」。
+        {
+            let mut inner = state.inner.lock().expect("state lock poisoned");
+            inner.service.status = ServiceStatus::Starting;
+            inner.service.model_id = Some("qwen3_1_7b_light".to_string());
+            inner.service.port = Some(8000);
+            inner.service.host = Some("0.0.0.0".to_string());
+            inner.service.pid = Some(1234);
+            inner.service.safe_mode = true;
+        }
+
+        let info = 复位为已停止(&state, "启动失败，服务已复位为未启动：配置不合法");
+
+        assert_eq!(info.status, ServiceStatus::Stopped);
+        assert!(info.model_id.is_none(), "模型名留着会让界面继续显示它");
+        assert!(info.port.is_none());
+        assert!(
+            info.message.contains("已复位"),
+            "文案要能让人看出这不是「用户点了停止」，否则两种结局同形"
+        );
+
+        let inner = state.inner.lock().expect("state lock poisoned");
+        assert_ne!(
+            inner.service.status,
+            ServiceStatus::Starting,
+            "停在 Starting 会让启动与停止两个按钮同时变灰，用户只能重开 APP"
+        );
+        assert_eq!(inner.service.status, ServiceStatus::Stopped);
+        assert!(
+            inner.service.pid.is_none(),
+            "pid 留着会让「停止」去杀一个根本没起来的进程"
+        );
+        assert!(inner.service.model_id.is_none());
+        assert!(!inner.service.safe_mode, "安全模式标志属于那次没成功的启动");
+    }
+
+    /// 判据存在 ≠ 判据被调用（同 `启动路径真的检查了停旧服务的结果与端口归属` 的理由）。
+    ///
+    /// 上面那条只证明「复位函数本身对」，**不证明有人在失败路径上调它**。这里钉
+    /// 的是「旁车配置解析失败时不许裸 `?` 早退」—— 那个 `?` 正是 2026-10-20 界面
+    /// 卡死的直接原因。
+    #[test]
+    fn 旁车配置失败不能裸问号早退() {
+        let 源码 = include_str!("service.rs");
+        assert!(
+            !源码.contains(concat!("推导附加参数(state, &model_path)", "?;")),
+            "裸 `?` 早退会让状态永久停在 Starting（2026-10-20 实测：四条反例每条都要重开 APP）"
+        );
+        assert!(
+            源码.contains(concat!("match 推导附加参数", "(state, &model_path)")),
+            "旁车配置解析失败必须被接住并复位，而不是把错误原样抛回去"
+        );
+        assert!(
+            源码.contains(concat!("let info = 复位为已停", "止(state, &format!")),
+            "复位之后要把新状态 emit 给前端；只改内存里的值，界面仍然卡着"
         );
     }
 
