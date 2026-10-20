@@ -90,7 +90,7 @@ const GPU_STARTUP_TIMEOUT_SECS: u64 = 120;
 /// JIT step, so the original tighter budget is fine.
 const CPU_STARTUP_TIMEOUT_SECS: u64 = 90;
 
-/// 模型权重与 KV 之外的运行期 GPU 占用（GiB）—— **全项目唯一来源**。
+/// 模型权重与 KV 之外的运行期 GPU 占用（GiB）—— **WDDM 档**。
 ///
 /// 含 CUDA context、compute buffer、驱动与运行库，外加「别贴着边启动」的余量。
 ///
@@ -99,14 +99,49 @@ const CPU_STARTUP_TIMEOUT_SECS: u64 = 90;
 /// `nvidia-smi used − 权重 1.7084 − KV 2.1876` 反推开销：
 /// **1.8394 / 1.8384 / 1.8237 GiB**（三次独立吻合，取最坏值 1.84）。
 ///
+/// ⚠️ 这个数是**在 WDDM 上反推的**，里面混着桌面合成器/浏览器那些挂在同一块
+/// 显存上的常驻占用。TCC 卡不输出画面，开销小得多 ⇒ 必须走 `显存开销_gib`
+/// 按驱动模式取，不要直接引用本常量（见下一段）。
+///
 /// 低估的代价不是「少开点上下文」这么温和：规划器会以为还够放 fp16 KV，
 /// 实际开出来溢出到共享内存 —— llama.cpp 不报错，只是慢得莫名其妙，
 /// 排错时极难定位到「预留少算了 0.5 GiB」。
 ///
 /// ⚠️ 改这个数必须同步改 `cuda_launch_params` 的单测期望值 —— 它们全是按
-/// 这个常量算出来的预算。`models::estimate_vram_gb` 也直接引用本常量
+/// 这个常量算出来的预算。`models::estimate_vram_gb` 也通过 `显存开销_gib` 拿值
 /// （那里曾另有一份硬编码 1.3，两处各自漂移）。
 pub(crate) const GPU_OVERHEAD_GB: f64 = 1.84;
+
+/// **TCC**（计算专用模式）上同口径的开销（GiB）。
+///
+/// 比 WDDM 小一半以上，差的正是**显示子系统**：TCC 卡不输出画面，没有桌面
+/// 合成器、DWM 与浏览器的常驻占用压在它身上。
+///
+/// 实测（P100 / TCC，`nvidia-smi used − 权重 − KV` 反推）：
+/// - Qwen3-1.7B Q8_0，ctx 40960，fp16 KV ⇒ **0.376 GiB**
+/// - Ornith-1.5-9B Q8_0，ctx 40960，q8 KV ⇒ **0.651 GiB**
+///
+/// 两点差 1.7×，说明它也和层数/上下文规模有关（9B 32 层 > 1.7B 28 层）。
+/// 取**上界 0.65** —— 与 WDDM 取「三次中最坏值」同一个原则：宁可少算可用显存，
+/// 也不要让 KV 溢出到共享内存（llama.cpp 不报错，只是慢得莫名其妙）。
+///
+/// ⚠️ 只有两个样本，且都是 40K 上下文。真要在 TCC 上开 100K+ 之前先量一次。
+pub(crate) const TCC_显存开销_GIB: f64 = 0.65;
+
+/// 按驱动模式取「权重与 KV 之外的运行期占用」。
+///
+/// 🔴 为什么必须分档：一个数会让两端都错。
+/// - 放 TCC 上沿用 1.84 ⇒ 规划器少算约 1.2 GiB 可用显存 ⇒ **上下文被人为压掉
+///   一截**（P100 上就是「明明能开 40960 却只给三万多」）；
+/// - 放 WDDM 上用 0.65 ⇒ 预算超出真实占用 ⇒ KV 溢出到共享内存，**启动成功但龟速**。
+///
+/// 驱动模式读不到时按 **WDDM**（较大那个）处理：无法证明是 TCC，就按有余量的算。
+pub(crate) fn 显存开销_gib(驱动模式: Option<&str>) -> f64 {
+    match 驱动模式 {
+        Some(m) if crate::hardware::is_tcc_mode(m) => TCC_显存开销_GIB,
+        _ => GPU_OVERHEAD_GB,
+    }
+}
 
 /// fp16 与目标上下文的差距在这个比例以内时，不再为那点长度降精度。
 ///
@@ -146,15 +181,20 @@ fn round_ctx(ctx: f64) -> u32 {
 /// division, because only the per-token term is proportional to ctx — folding it
 /// into the per-token figure would over-estimate the reachable context.
 /// `max_context` caps the context at the model's trained limit.
+///
+/// `开销_gib` 是权重与 KV 之外的一次性占用，**由调用方按驱动模式给**
+/// （`显存开销_gib`）：TCC 与 WDDM 差 1.2 GiB，写死任何一个都会让另一端错。
+/// 做成参数而不是在函数里自己查，是为了让它继续是纯函数、单测能钉住预算。
 fn cuda_launch_params(
     available_vram_gb: f64,
     weight_gb: f64,
     kv_gb_per_token_fp16: f64,
     kv_fixed_gb: f64,
     max_context: u32,
+    开销_gib: f64,
 ) -> LaunchParams {
     let target = max_context.max(2048) as f64;
-    let budget = available_vram_gb - weight_gb - GPU_OVERHEAD_GB - kv_fixed_gb;
+    let budget = available_vram_gb - weight_gb - 开销_gib - kv_fixed_gb;
     // q8 KV 是半量（kv_factor 0.5），也是这里能给出的最省档；先算出来用于
     // 判断「是否还剩任何可用余量」。
     let max_ctx_q8 = budget / (kv_gb_per_token_fp16 * 0.5);
@@ -717,6 +757,12 @@ pub async fn start_service_core(
         // 切换模型此前**没有**任何「停了没有」的痕迹：日志里只有 `switched current
         // model` 紧接着 `starting llama-server`，中间那段是空的。补一条，让
         // 「正常切换」与「切换时没停下来」在日志里可区分。
+        //
+        // 再补一条 `llama-server stopped`：停止按钮那条路径有它（`stop_service_core`
+        // 结尾），切模型这条没有 ⇒ 同一件事（引擎停了）两种路径两种形态，
+        // 日志里切换前后**对不齐**，按「stopped 行」做统计的人会漏掉全部切换。
+        // 能走到这里说明 `停止没能生效` 已判为 false（真的停了），不是提前报喜。
+        tracing::info!(端口 = ?现场.端口, 终止结果 = ?终止, "llama-server stopped");
         tracing::info!(
             pid = 现场.pid.unwrap_or(0),
             port = ?现场.端口,
@@ -1044,12 +1090,14 @@ pub async fn start_service_core(
                 // 空卡能全量、现在不能，差额只可能被人占走了；
                 // 空卡也不够，那就是这个模型本身装不下这张卡，
                 // 「卡被占」是冤枉别人（27B 放 8G 卡就是这种）。
+                let 开销_gib = 显存开销_gib(驱动模式.as_deref());
                 let 计划 = cuda_launch_params(
                     vram,
                     weight_gb,
                     kv_profile.per_token_fp16,
                     kv_profile.fixed_fp16,
                     max_ctx,
+                    开销_gib,
                 );
                 let 空卡计划 = cuda_launch_params(
                     total_vram,
@@ -1057,6 +1105,7 @@ pub async fn start_service_core(
                     kv_profile.per_token_fp16,
                     kv_profile.fixed_fp16,
                     max_ctx,
+                    开销_gib,
                 );
                 降档 = 判定降档(total_vram, vram, 空载基线, 计划, 空卡计划);
                 tracing::info!(
@@ -4278,7 +4327,7 @@ mod tests {
     fn small_model_fits_fp16_at_default_context() {
         // 8G 卡跑 Qwen3-1.7B：权重 1.71 + 保留 1.84 = 3.55，余 4.45 GiB。
         // fp16 KV（112 KB/token）够约 41.6K，16K 目标档轻松放下 → 走 fp16 最快。
-        let p = cuda_launch_params(8.0, W1_7B, KV1_7B, NO_KV_FIXED, 16384);
+        let p = cuda_launch_params(8.0, W1_7B, KV1_7B, NO_KV_FIXED, 16384, GPU_OVERHEAD_GB);
         assert_eq!(p.n_gpu_layers, Some(999));
         assert_eq!(p.ctx_size, 16384);
         assert_eq!(p.parallel, 1);
@@ -4291,7 +4340,7 @@ mod tests {
         // 只剩约 1.48 GiB。fp16 KV（144 KB/token）只够约 10.8K，差一点点不到
         // 16K 目标档，于是退一档用 q8 半量 + flash attention 补上。
         // 这正是「按参数量估算 KV」看不到的差别。
-        let p = cuda_launch_params(8.0, W8B, KV8B, NO_KV_FIXED, 16384);
+        let p = cuda_launch_params(8.0, W8B, KV8B, NO_KV_FIXED, 16384, GPU_OVERHEAD_GB);
         assert_eq!(p.n_gpu_layers, Some(999));
         assert_eq!(p.ctx_size, 16384);
         assert_eq!(p.parallel, 1);
@@ -4303,7 +4352,7 @@ mod tests {
         // 6GB: fp16 falls short of 32k but q8 (half footprint + flash attention)
         // reaches it. This is the path an advanced user hits by raising
         // --ctx-size past what fp16 can hold on a smaller card.
-        let p = cuda_launch_params(6.0, W1_7B, KV1_7B, NO_KV_FIXED, 32768);
+        let p = cuda_launch_params(6.0, W1_7B, KV1_7B, NO_KV_FIXED, 32768, GPU_OVERHEAD_GB);
         assert_eq!(p.n_gpu_layers, Some(999));
         assert_eq!(p.ctx_size, 32768);
         assert!(p.kv_quant, "large context beyond fp16 capacity should use q8 KV");
@@ -4314,7 +4363,7 @@ mod tests {
     fn tight_vram_takes_largest_q8_context() {
         // 4.5GB: even q8 can't reach 32k, so take the largest q8 context,
         // rounded down to a 2048 multiple (and never below 2048).
-        let p = cuda_launch_params(4.5, W1_7B, KV1_7B, NO_KV_FIXED, 32768);
+        let p = cuda_launch_params(4.5, W1_7B, KV1_7B, NO_KV_FIXED, 32768, GPU_OVERHEAD_GB);
         assert_eq!(p.n_gpu_layers, Some(999));
         assert!(p.kv_quant);
         assert!(p.ctx_size < 32768 && p.ctx_size >= 2048);
@@ -4325,14 +4374,14 @@ mod tests {
     fn very_low_vram_falls_back_to_partial_offload() {
         // Qwen3-8B 权重 4.68 + 保留 1.84 = 6.52：可用显存低于 6.52 的卡全量装不进，
         // 按层数分档部分卸载，至少还能起来。
-        let tight = cuda_launch_params(4.0, W8B, KV8B, NO_KV_FIXED, 32768);
+        let tight = cuda_launch_params(4.0, W8B, KV8B, NO_KV_FIXED, 32768, GPU_OVERHEAD_GB);
         assert_eq!(tight.n_gpu_layers, Some(20));
         assert_eq!(tight.parallel, 1);
 
-        let lower = cuda_launch_params(2.8, W8B, KV8B, NO_KV_FIXED, 32768);
+        let lower = cuda_launch_params(2.8, W8B, KV8B, NO_KV_FIXED, 32768, GPU_OVERHEAD_GB);
         assert_eq!(lower.n_gpu_layers, Some(12));
 
-        let lowest = cuda_launch_params(1.5, W8B, KV8B, NO_KV_FIXED, 32768);
+        let lowest = cuda_launch_params(1.5, W8B, KV8B, NO_KV_FIXED, 32768, GPU_OVERHEAD_GB);
         assert_eq!(lowest.n_gpu_layers, Some(8));
     }
 
@@ -4340,7 +4389,7 @@ mod tests {
     fn context_never_exceeds_model_trained_limit() {
         // A tiny model with a small trained context must not be over-extended
         // just because there's plenty of VRAM.
-        let p = cuda_launch_params(16.0, W1_7B, KV1_7B, NO_KV_FIXED, 8192);
+        let p = cuda_launch_params(16.0, W1_7B, KV1_7B, NO_KV_FIXED, 8192, GPU_OVERHEAD_GB);
         assert!(p.ctx_size <= 8192);
         assert!(!p.kv_quant, "small context at high VRAM should use fp16");
     }
@@ -4350,7 +4399,7 @@ mod tests {
         // 余量只够几百个 token 时不能硬给 2048：`round_ctx` 的 2048 下限会让
         // 实际占用超出预算，llama.cpp 把 KV 溢出到共享内存，表现为
         // 「启动成功但龟速」。这种情况必须明确退回部分卸载。
-        let p = cuda_launch_params(6.0, W8B, KV8B, NO_KV_FIXED, 32768);
+        let p = cuda_launch_params(6.0, W8B, KV8B, NO_KV_FIXED, 32768, GPU_OVERHEAD_GB);
         assert_eq!(
             p.n_gpu_layers,
             Some(20),
@@ -4363,11 +4412,57 @@ mod tests {
     fn context_is_monotonic_in_vram() {
         // More VRAM never yields a smaller context (at equal or better KV
         // precision), across the full range.
-        let ctx =
-            |vram: f64| cuda_launch_params(vram, W8B, KV8B, NO_KV_FIXED, 32768).ctx_size;
+        let ctx = |vram: f64| {
+            cuda_launch_params(vram, W8B, KV8B, NO_KV_FIXED, 32768, GPU_OVERHEAD_GB).ctx_size
+        };
         assert!(ctx(4.0) <= ctx(5.5));
         assert!(ctx(5.5) <= ctx(6.0));
         assert!(ctx(6.0) <= ctx(8.0));
+    }
+
+    #[test]
+    fn overhead_is_bucketed_by_driver_model() {
+        assert!((显存开销_gib(Some("TCC")) - TCC_显存开销_GIB).abs() < 1e-9);
+        assert!((显存开销_gib(Some("  tcc  ")) - TCC_显存开销_GIB).abs() < 1e-9);
+        assert!((显存开销_gib(Some("WDDM")) - GPU_OVERHEAD_GB).abs() < 1e-9);
+        // 读不到就按有余量的 WDDM 算 —— 无法证明是 TCC 时不许乐观。
+        assert!((显存开销_gib(None) - GPU_OVERHEAD_GB).abs() < 1e-9);
+        assert!((显存开销_gib(Some("N/A")) - GPU_OVERHEAD_GB).abs() < 1e-9);
+        // 分档的全部意义就在这个不等号上：写成同一个数这条立刻红。
+        assert!(
+            TCC_显存开销_GIB < GPU_OVERHEAD_GB,
+            "TCC 不跑桌面，预留必须小于 WDDM"
+        );
+    }
+
+    #[test]
+    fn tcc_overhead_buys_more_context_than_wddm() {
+        // 同一张卡、同样 4.5 GiB 可用显存、同一个 1.7B 模型，只换驱动模式。
+        // 取值要挑在「fp16 KV 装不下、必须降 q8」的紧边界上：那里预留差 1.19 GiB
+        // 直接决定能开多少上下文。给 6.33 GiB 时两档都能被 40960 封顶，测不出区别
+        // （第一版就是这么写的，断言拿到 40960 vs 40960）。
+        let wddm = cuda_launch_params(
+            4.5,
+            W1_7B,
+            KV1_7B,
+            NO_KV_FIXED,
+            40960,
+            显存开销_gib(Some("WDDM")),
+        );
+        let tcc = cuda_launch_params(
+            4.5,
+            W1_7B,
+            KV1_7B,
+            NO_KV_FIXED,
+            40960,
+            显存开销_gib(Some("TCC")),
+        );
+        assert!(
+            tcc.ctx_size > wddm.ctx_size,
+            "TCC 档应换到更多上下文：{} vs {}",
+            tcc.ctx_size,
+            wddm.ctx_size
+        );
     }
 
     #[test]
@@ -4375,7 +4470,7 @@ mod tests {
         // The single-slot pin is the core fix for the 4× KV blowup; it must
         // hold across every VRAM tier.
         for vram in [1.0, 2.0, 4.0, 5.5, 6.0, 8.0, 16.0] {
-            let p = cuda_launch_params(vram, W8B, KV8B, NO_KV_FIXED, 32768);
+            let p = cuda_launch_params(vram, W8B, KV8B, NO_KV_FIXED, 32768, GPU_OVERHEAD_GB);
             assert_eq!(p.parallel, 1, "vram={vram}");
         }
     }
@@ -4386,7 +4481,7 @@ mod tests {
         //   budget = 8.0 − 1.71 − 1.84 = 4.45 GiB，fp16 每 token 112 KB
         //   → 够约 41.6K，足以放满原生上下文。
         // 放在旧代码里这里只会得到 16384（`min(context_length, 16384)`）。
-        let p = cuda_launch_params(8.0, W1_7B, KV1_7B, NO_KV_FIXED, 40_960);
+        let p = cuda_launch_params(8.0, W1_7B, KV1_7B, NO_KV_FIXED, 40_960, GPU_OVERHEAD_GB);
         assert!(
             p.ctx_size > 16_384,
             "原生 40960 的模型不该被卡在 16384，实际 {}",
@@ -4407,7 +4502,7 @@ mod tests {
         // `overhead_matches_measured_footprint`。
         //   可用 6.33 − 1.71 − 1.84 = 2.78 GiB → fp16 约 26.0K
         //   26.0K × 1.05 = 27.3K ≥ 26,624 ⇒ 落在容忍带内
-        let p = cuda_launch_params(6.33, W1_7B, KV1_7B, NO_KV_FIXED, 26_624);
+        let p = cuda_launch_params(6.33, W1_7B, KV1_7B, NO_KV_FIXED, 26_624, GPU_OVERHEAD_GB);
         assert!(!p.kv_quant, "差距在容忍带内就该保留 fp16");
         assert!(
             p.ctx_size < 26_624 && p.ctx_size >= 24_576,
@@ -4448,7 +4543,7 @@ mod tests {
         //   不是本机实测（本机空载 usable 为 6.33）。若换成 6.33，q8 只到约 85K，
         //   过不了这里 131,072 的下限 —— 但那不影响本条要证明的事：**4B 模型在
         //   8G 卡上能开到的上下文远大于旧的硬编码 16384**。
-        let p = cuda_launch_params(7.2, W_SPARK_Q6, KV_SPARK, KV_FIXED_SPARK, CTX_SPARK_NATIVE);
+        let p = cuda_launch_params(7.2, W_SPARK_Q6, KV_SPARK, KV_FIXED_SPARK, CTX_SPARK_NATIVE, GPU_OVERHEAD_GB);
         assert_eq!(p.n_gpu_layers, Some(999), "全量卸载应能装下");
         assert_eq!(p.parallel, 1);
         assert!(p.kv_quant, "fp16 放不下 1M 原生上下文，退 q8 换长度");
@@ -4466,13 +4561,14 @@ mod tests {
         // 变小 —— 这就是「固定项要先扣掉」的意义所在。若哪天有人把
         // kv_fixed_gb 误加进每 token 项并相乘，这条会立刻炸掉。
         let 无固定 =
-            cuda_launch_params(7.2, W_SPARK_Q6, KV_SPARK, NO_KV_FIXED, CTX_SPARK_NATIVE);
+            cuda_launch_params(7.2, W_SPARK_Q6, KV_SPARK, NO_KV_FIXED, CTX_SPARK_NATIVE, GPU_OVERHEAD_GB);
         let 有固定 = cuda_launch_params(
             7.2,
             W_SPARK_Q6,
             KV_SPARK,
             KV_FIXED_SPARK,
             CTX_SPARK_NATIVE,
+            GPU_OVERHEAD_GB,
         );
         assert!(
             有固定.ctx_size < 无固定.ctx_size,
@@ -6016,6 +6112,7 @@ mod tests {
             LEGACY_KV_GIB_PER_TOKEN_PER_BILLION * 9.197,
             0.0,
             模型.context_length as u32,
+            GPU_OVERHEAD_GB,
         );
 
         assert_ne!(参数, DEFAULT_CUDA_PARAMS, "回落生效后不该再是兜底默认值");

@@ -400,7 +400,7 @@ fn lookup_bandwidth(vendor: &GpuVendor, name: &str) -> Option<u32> {
 }
 
 /// Real-world efficiency factor for the roofline decode estimate, bucketed by
-/// GPU generation.
+/// GPU generation **and** by how big the weights are.
 ///
 /// `tok/s ≈ bandwidth / weight_bytes` is the *theoretical* ceiling; how close a
 /// real llama.cpp build gets depends mostly on whether the silicon has tensor
@@ -410,14 +410,32 @@ fn lookup_bandwidth(vendor: &GpuVendor, name: &str) -> Option<u32> {
 /// | Class | Measured efficiency | Example |
 /// |---|---|---|
 /// | Modern, tensor-accelerated | 49–67% | RTX 4060 Laptop 8B-Q4: 35 t/s of 52 theoretical |
-/// | Pascal and older (no fp16) | ~18% | Tesla P100 27B-Q3: 11 t/s of 61 theoretical |
+/// | Pascal, small weights (≤ 4 GiB) | ~26% | Tesla P100 1.7B-Q8: 111 t/s of 428 theoretical |
+/// | Pascal, large weights (> 4 GiB) | ~18% | Tesla P100 27B-Q3: 11 t/s of 61 theoretical |
 /// | AMD / Intel (Vulkan/Vulkan-only) | ~35% | conservative middle ground |
+///
+/// **Why Pascal splits in two** (2026-10-20, P100 / 732 GB/s, both measured):
+/// 1.7B-Q8_0 (1.708 GiB) ran 110–113 t/s ⇒ 25.9%; 27B-UD-Q3_K_XL (11.92 GiB)
+/// ran 10.5–11.4 t/s ⇒ 17.9%. Same card, same backend, same KV precision class —
+/// the only change is the weight size. The small model spends proportionally
+/// more of each token on fixed per-step work (sampling, logits, kernel launch)
+/// that the roofline model doesn't account for, so it lands closer to the
+/// ceiling. Using 0.20 for both understated the 1.7B by 1.3× — which is exactly
+/// the model the VRAM planner cares most about on an 8–16 GiB card.
+///
+/// ⚠️ **单位口径**：这里的 `weight_gb` 是 **GiB**（与 `nvidia-smi` 一致），
+/// 而 `bandwidth_gbs` 是十进制 GB/s。理论值 = `732 / 1.708 = 428`（不是
+/// `732 / 1.834 = 399`）—— 系数必须按代码里的单位标定，否则会凭空多算 7%。
+///
+/// ⚠️ **Two data points only.** The 4 GiB threshold is a gap between them, not
+/// a measured knee; anything in 2–10 GiB is interpolation. If a 4B/8B lands on
+/// this card later, measure it before trusting the estimate.
 ///
 /// The previous flat `0.7` matched modern consumer cards but overstated a
 /// bandwidth-rich Pascal card by 3.8× — a P100 would be advertised at ~42 t/s
 /// while actually delivering ~11. Every figure below is anchored to a measured
 /// system, and `estimate_tokens_per_second` has regression tests pinning them.
-fn efficiency_for(name: &str, vendor: &GpuVendor) -> f64 {
+fn efficiency_for(name: &str, vendor: &GpuVendor, weight_gb: f64) -> f64 {
     let lower = name.to_ascii_lowercase();
 
     // NVIDIA: tensor cores arrived with Volta (V100) and became broadly useful
@@ -429,7 +447,9 @@ fn efficiency_for(name: &str, vendor: &GpuVendor) -> f64 {
             "quadro p", "mx1", "mx2", "mx3", "mx250", "mx330", "mx350",
         ];
         if PASCAL_OR_OLDER.iter().any(|kw| lower.contains(kw)) {
-            return 0.20;
+            // 4 GiB 是实测两点（1.708 / 11.92）之间的空档，不是测出来的拐点。
+            // 系数按「weight 用 GiB」的口径标定：1.7B 111/428=0.26、27B 11/61=0.18。
+            return if weight_gb <= 4.0 { 0.26 } else { 0.18 };
         }
         return 0.60;
     }
@@ -450,7 +470,9 @@ fn efficiency_for(name: &str, vendor: &GpuVendor) -> f64 {
 /// resident weight size (GGUF file size for dense models, active fraction for MoE).
 ///
 /// `gpu_name` / `vendor` select the efficiency bucket; pass the adapter name and
-/// vendor of the GPU that will actually serve the model.
+/// vendor of the GPU that will actually serve the model. `weight_gb` is also
+/// used to pick the Pascal sub-bucket (small vs large weights — see
+/// `efficiency_for`).
 pub fn estimate_tokens_per_second(
     bandwidth_gbs: u32,
     weight_gb: f64,
@@ -460,7 +482,7 @@ pub fn estimate_tokens_per_second(
     if bandwidth_gbs == 0 || weight_gb <= 0.0 {
         return 0.0;
     }
-    f64::from(bandwidth_gbs) / weight_gb * efficiency_for(gpu_name, vendor)
+    f64::from(bandwidth_gbs) / weight_gb * efficiency_for(gpu_name, vendor, weight_gb)
 }
 
 /// Windows NVIDIA driver floor for the bundled CUDA 12.4 `llama.cpp` build. An
@@ -558,14 +580,45 @@ fn classify_vendor(name: &str) -> GpuVendor {
     }
 }
 
+/// 归一化适配器名字，用于**跨来源**去重。
+///
+/// `nvidia-smi` 报 `Tesla P100-PCIE-16GB`，WMI 报 `NVIDIA Tesla P100-PCIE-16GB` ——
+/// 只差一个厂商前缀，按完整名字相等就判不出重复，同一张卡被数两次
+/// （P100 虚机实测 `gpu_count=3`，实际只有 1 张；这是 P2-6「3 → 1 → 3 抖动」的
+/// 真正来源，此前一直当成 WMI 不稳）。
+///
+/// 归一步骤：小写 → 去掉 `(R)` / `(TM)` 这类商标噪声 → 去掉厂商前缀 →
+/// 只留字母数字。`NVIDIA Tesla P100-PCIE-16GB` 与 `Tesla P100-PCIE-16GB`
+/// 因此都变成 `teslap100pcie16gb`。
+///
+/// ⚠️ 归一化后为空（名字全是符号）时**不能**据此判重 —— 那会把两个无名条目
+/// 合成一个。判重那边保留了原始名相等的兜底。
+fn 归一化适配器名(name: &str) -> String {
+    let mut s = name.trim().to_ascii_lowercase();
+    for 噪声 in ["(r)", "(tm)", "®", "™"] {
+        s = s.replace(噪声, "");
+    }
+    for 前缀 in ["nvidia ", "amd ", "intel ", "advanced micro devices inc "] {
+        if let Some(rest) = s.strip_prefix(前缀) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    s.retain(|c| c.is_ascii_alphanumeric());
+    s
+}
+
 /// Merge the authoritative nvidia-smi list with WMI-discovered controllers,
 /// dropping WMI duplicates (by name) and re-indexing the result. nvidia-smi
 /// entries win because their VRAM is accurate.
 fn merge_gpus(mut primary: Vec<GpuInfo>, secondary: Vec<GpuInfo>) -> Vec<GpuInfo> {
     for gpu in secondary {
-        let duplicate = primary
-            .iter()
-            .any(|existing| existing.name.eq_ignore_ascii_case(&gpu.name));
+        let 候选 = 归一化适配器名(&gpu.name);
+        let duplicate = primary.iter().any(|existing| {
+            // 归一化后空名字不参与判重（见 `归一化适配器名` 的备注）。
+            let 现有 = 归一化适配器名(&existing.name);
+            (!现有.is_empty() && 现有 == 候选) || existing.name.eq_ignore_ascii_case(&gpu.name)
+        });
         if !duplicate {
             primary.push(gpu);
         }
@@ -783,6 +836,64 @@ mod tests {
     }
 
     #[test]
+    fn merge_dedups_the_same_card_reported_with_different_prefixes() {
+        // P100 虚机实测的现场：同一张卡两个来源两个名字，前缀只差 `NVIDIA `。
+        // 旧实现按完整名字相等去重 ⇒ 判不出重复 ⇒ `gpu_count=3`（实际 1 张）。
+        let nvidia = vec![gpu("Tesla P100-PCIE-16GB", 16.0)];
+        let wmi = vec![
+            gpu("NVIDIA Tesla P100-PCIE-16GB", 4.0),
+            gpu("Microsoft Basic Display Adapter", 0.0),
+        ];
+        // WMI 那条 Basic Display 在真实链路里已被 `is_virtual_adapter` 滤掉，
+        // 这里直接从源头去掉，只看前缀差异这一件事。
+        let wmi = wmi
+            .into_iter()
+            .filter(|g| !is_virtual_adapter(&g.name))
+            .collect();
+
+        let merged = merge_gpus(nvidia, wmi);
+
+        assert_eq!(merged.len(), 1, "同一张卡不该被数成两张");
+        assert_eq!(merged[0].name, "Tesla P100-PCIE-16GB");
+        assert_eq!(merged[0].vram_gb, 16.0, "保留 nvidia-smi 的准确显存");
+    }
+
+    #[test]
+    fn merge_still_separates_two_genuinely_different_cards() {
+        // 去重不能过火：两张真卡名字不同就别合并。
+        let nvidia = vec![gpu("Tesla P100-PCIE-16GB", 16.0)];
+        let wmi = vec![gpu("NVIDIA GeForce RTX 3060", 12.0)];
+
+        let merged = merge_gpus(nvidia, wmi);
+
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn normalizes_adapter_names_across_sources() {
+        // 前缀 + 商标噪声 + 大小写，三种差异都要吃掉。
+        assert_eq!(
+            归一化适配器名("NVIDIA Tesla P100-PCIE-16GB"),
+            归一化适配器名("Tesla P100-PCIE-16GB")
+        );
+        assert_eq!(
+            归一化适配器名("AMD Radeon RX 7900 XTX"),
+            归一化适配器名("Radeon RX 7900 XTX")
+        );
+        assert_eq!(
+            归一化适配器名("Intel(R) UHD Graphics 630"),
+            归一化适配器名("Intel UHD Graphics 630")
+        );
+        // 不同卡不能被归一成同一个串。
+        assert_ne!(
+            归一化适配器名("Tesla P100-PCIE-16GB"),
+            归一化适配器名("Tesla P40")
+        );
+        // 纯符号名字归一后为空 —— 判重那边靠这个空值拒绝比较。
+        assert!(归一化适配器名("---").is_empty());
+    }
+
+    #[test]
     fn merge_prefers_nvidia_smi_and_dedups_by_name() {
         // nvidia-smi entry (accurate VRAM) plus WMI listing the same NVIDIA card
         // and a separate integrated Intel GPU.
@@ -874,12 +985,41 @@ mod tests {
     fn pascal_is_bucketed_below_tensor_accelerated_cards() {
         let nv = GpuVendor::NVIDIA;
         // Same bandwidth, different generations → different efficiency.
-        assert!(efficiency_for("Tesla P100-PCIE-16GB", &nv) < 0.3);
-        assert!(efficiency_for("NVIDIA GeForce RTX 4090", &nv) > 0.5);
-        assert!(efficiency_for("NVIDIA GeForce GTX 1080 Ti", &nv) < 0.3);
-        assert!(efficiency_for("NVIDIA GeForce RTX 4060 Laptop GPU", &nv) > 0.5);
+        assert!(efficiency_for("Tesla P100-PCIE-16GB", &nv, 1.708) < 0.3);
+        assert!(efficiency_for("NVIDIA GeForce RTX 4090", &nv, 20.0) > 0.5);
+        assert!(efficiency_for("NVIDIA GeForce GTX 1080 Ti", &nv, 5.0) < 0.3);
+        assert!(efficiency_for("NVIDIA GeForce RTX 4060 Laptop GPU", &nv, 8.0) > 0.5);
         // Non-NVIDIA vendors fall into their own buckets.
-        assert!((0.3..0.5).contains(&efficiency_for("AMD Radeon RX 7900 XTX", &GpuVendor::AMD)));
+        assert!(
+            (0.3..0.5).contains(&efficiency_for("AMD Radeon RX 7900 XTX", &GpuVendor::AMD, 20.0))
+        );
+    }
+
+    #[test]
+    fn pascal_splits_by_weight_size_on_the_two_measured_points() {
+        // 2026-10-20，同一张 P100（732 GB/s），两个实测点：
+        //   1.7B-Q8_0  1.708 GiB → 110~113 t/s
+        //   27B-Q3_K_XL 11.92 GiB → 10.5~11.4 t/s
+        // 一个 0.20 覆盖不了这两档（1.7B 会被低估 1.4×），所以按权重分档。
+        let nv = GpuVendor::NVIDIA;
+        let p100 = "Tesla P100-PCIE-16GB";
+        assert!((efficiency_for(p100, &nv, 1.708) - 0.26).abs() < 1e-9);
+        assert!((efficiency_for(p100, &nv, 11.92) - 0.18).abs() < 1e-9);
+
+        // 估算值必须落在实测区间里（不是"接近"，是落进去）。
+        let 小 = estimate_tokens_per_second(732, 1.708, p100, &nv);
+        assert!((110.0..=113.0).contains(&小), "1.7B 估出 {小} t/s，实测 110~113");
+        let 大 = estimate_tokens_per_second(732, 11.92, p100, &nv);
+        assert!(
+            (10.5..=11.4).contains(&大),
+            "27B 估出 {大} t/s，实测 10.5~11.4"
+        );
+
+        // 阈值本身不是测出来的拐点：4 GiB 只是两点之间的空档。
+        assert!(efficiency_for(p100, &nv, 4.0) > efficiency_for(p100, &nv, 4.01));
+        // 现代卡不受权重分档影响（样本只有一端，不改）。
+        assert!((efficiency_for("NVIDIA GeForce RTX 4090", &nv, 1.0) - 0.60).abs() < 1e-9);
+        assert!((efficiency_for("NVIDIA GeForce RTX 4090", &nv, 20.0) - 0.60).abs() < 1e-9);
     }
 
     fn nvidia(name: &str, vram_gb: f64, driver: &str) -> GpuInfo {

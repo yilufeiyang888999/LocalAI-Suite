@@ -388,7 +388,14 @@ pub fn import_local_model(
         }
     };
 
-    let estimated_vram_gb = estimate_vram_gb(file_bytes, gguf_metadata.as_ref());
+    // 导入模型这条路上没有缓存过的驱动模式，现查一次（nvidia-smi 一次调用，
+    // 相比解析 GGUF 的耗时可以忽略）。查不到就按 WDDM 档 —— `显存开销_gib` 兜底。
+    let 驱动模式 = crate::hardware::nvidia_driver_model();
+    let estimated_vram_gb = estimate_vram_gb(
+        file_bytes,
+        gguf_metadata.as_ref(),
+        crate::service::显存开销_gib(驱动模式.as_deref()),
+    );
     let name = model_path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -439,14 +446,17 @@ pub fn import_local_model(
 ///
 /// 此前只有文件大小时用的是 `文件大小 × 1.1 + 0.5`：这会低估未量化模型的权重，
 /// 又会把混合注意力模型的 KV 高估数倍。有 GGUF 结构后按真实层结构计算。
-fn estimate_vram_gb(file_bytes: u64, gguf: Option<&crate::gguf::GgufMetadata>) -> f64 {
+///
+/// `开销_gib` 由调用方按驱动模式给出（`service::显存开销_gib`）—— TCC 卡不跑
+/// 桌面，开销比 WDDM 小 1.2 GiB，写死一个数会让某一端多报/少报。
+fn estimate_vram_gb(file_bytes: u64, gguf: Option<&crate::gguf::GgufMetadata>, 开销_gib: f64) -> f64 {
     // 显存一律按 GiB（1024³）计，与 `nvidia-smi` 的口径一致；用 10⁹ 会与
     // 可用显存相减时引入约 7% 的系统偏差。
     let weight_gb = file_bytes as f64 / crate::gguf::每GiB字节;
-    // 计算缓冲 + 驱动与运行库占用。与启动规划共用同一个常量 —— 这里曾经
+    // 计算缓冲 + 驱动与运行库占用。与启动规划共用同一个来源 —— 这里曾经
     // 也硬编码了一份 1.3，两处会各自漂移（实测需 1.84，反推过程见
     // `service.rs` 的 `GPU_OVERHEAD_GB` 注释）。
-    let overhead_gb = crate::service::GPU_OVERHEAD_GB;
+    let overhead_gb = 开销_gib;
     // 以 8K 上下文作为「能不能跑」的门槛；启动时再按可用显存求最大上下文。
     let kv_gb = gguf.map(|meta| meta.kv_gb(8192, 2.0)).unwrap_or(0.5);
     let total = weight_gb + overhead_gb + kv_gb;
