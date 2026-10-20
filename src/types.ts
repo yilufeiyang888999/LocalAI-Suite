@@ -243,6 +243,12 @@ export interface ServiceInfo {
   status: 'stopped' | 'starting' | 'running' | 'failed';
   safe_mode: boolean;
   message: string;
+  /**
+   * 启动成功但性能打折的原因（当前只有「显卡上还有别的程序占着显存，
+   * 只好少卸几层」这一种）。`null`/缺省 = 没话可说，**不是**「一切正常」
+   * —— 接管态也拿不到这个信息。
+   */
+  warning?: string | null;
 }
 
 export interface DiagnoseResult {

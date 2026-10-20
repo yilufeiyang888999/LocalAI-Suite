@@ -710,6 +710,12 @@ async function sendChatbi() {
         {{ props.restoringGpu ? '正在尝试恢复显卡加速' : '恢复显卡加速' }}
       </button>
     </div>
+    <!-- 启动成功但性能打折（0.1.7-1）：不能写进上面那条绿色状态条 ——
+         绿底写着「只有一半层上了卡」，等于用配色宣布一切正常。 -->
+    <div v-if="props.service?.status === 'running' && props.service?.warning" class="degraded-bar">
+      <span class="degraded-icon">!</span>
+      <span>{{ props.service.warning }}</span>
+    </div>
 
     <div class="chat-layout">
       <aside class="session-list">

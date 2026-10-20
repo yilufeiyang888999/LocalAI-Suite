@@ -27,6 +27,17 @@ pub struct ServiceInfo {
     pub status: ServiceStatus,
     pub safe_mode: bool,
     pub message: String,
+    /// 启动成功但**性能打折**的原因（当前只有一种：显卡上还有别的程序占着显存，
+    /// 只好少卸几层）。`None` = 没有可说的，界面不该凭空报喜或报忧。
+    ///
+    /// 为什么必须单独一个字段，而不是塞进 `message`（2026-10-20，0.1.7-1）：
+    /// `message` 挂在状态条上，而 `running` 的状态条是**绿色**的 —— 把
+    /// 「只有一半层上了卡」写进绿条，等于用配色宣布一切正常。这是「让用户
+    /// 误以为成功」的另一种形态，跟不提示一样糟。
+    ///
+    /// ⚠️ 不持久化：重开 APP 走接管时无从知道当初的计划，`None` 是**未知**，
+    /// 不是「一切正常」。
+    pub warning: Option<String>,
 }
 
 /// Concrete `llama-server` launch tuning. `n_gpu_layers` is `None` for CPU-only
@@ -247,6 +258,9 @@ struct KvProfile {
     per_token_fp16: f64,
     /// 不随上下文增长的常量（滑动窗口层封顶后）。
     fixed_fp16: f64,
+    /// 主干层数（已扣掉 MTP 层）。只用于把「上了 20 层」说成人话 ——
+    /// 光说 20 层，用户不知道这是一半还是九成。读不到层结构时为 `None`。
+    主干层数: Option<u32>,
 }
 
 /// 定位一个模型真实的 GGUF 文件，按可靠性排序返回候选路径。
@@ -331,6 +345,13 @@ fn resolve_kv_profile(
             per_token_fp16: meta.kv_bytes_per_token(KV_ELEMENT_BYTES_FP16)
                 / crate::gguf::每GiB字节,
             fixed_fp16: meta.kv_fixed_gb(KV_ELEMENT_BYTES_FP16),
+            // 与 `full_attention_layers` 同一口径：`block_count` 含 MTP 层，
+            // 而 llama.cpp 不加载那些层，所以「总共几层」也要先扣掉 ——
+            // 否则「20/33 层」这种说法会把 MTP 算进分母。
+            主干层数: meta
+                .block_count
+                .map(|总| 总.saturating_sub(meta.mtp_layers.unwrap_or(0)))
+                .filter(|主干| *主干 > 0),
         };
         if profile.per_token_fp16 > 0.0 {
             tracing::info!(
@@ -351,6 +372,9 @@ fn resolve_kv_profile(
     KvProfile {
         per_token_fp16: LEGACY_KV_GIB_PER_TOKEN_PER_BILLION * fallback_params_billions,
         fixed_fp16: 0.0,
+        // 读不到层结构就没法说「20/32 层」。留 `None`，文案会自动省略这一段，
+        // 而不是编一个分母出来。
+        主干层数: None,
     }
 }
 
@@ -581,6 +605,10 @@ pub async fn start_service_core(
         host: Option<String>,
         状态: ServiceStatus,
         安全模式: bool,
+        /// 上一轮启动留下的降档提示。切模型失败要把现场**原样**恢复 ——
+        /// 只恢复状态不恢复提示，界面上那条「卡被占」会凭空消失，
+        /// 而服务其实还是那个降档跑着的服务。
+        警告: Option<String>,
     }
     let 现场 = {
         let mut inner = state.inner.lock().expect("state lock poisoned");
@@ -598,6 +626,7 @@ pub async fn start_service_core(
             host: inner.service.host.clone(),
             状态: inner.service.status.clone(),
             安全模式: inner.service.safe_mode,
+            警告: inner.service.warning.clone(),
         };
         inner.service.pid = None;
         inner.service.status = ServiceStatus::Starting;
@@ -652,6 +681,7 @@ pub async fn start_service_core(
             inner.service.model_id = 现场.模型.clone();
             inner.service.status = 现场.状态.clone();
             inner.service.safe_mode = 现场.安全模式;
+            inner.service.warning = 现场.警告.clone();
             ServiceInfo {
                 model_id: inner.service.model_id.clone(),
                 port: inner.service.port,
@@ -659,6 +689,7 @@ pub async fn start_service_core(
                 status: inner.service.status.clone(),
                 safe_mode: inner.service.safe_mode,
                 message: 文案.clone(),
+                warning: 现场.警告,
             }
         };
         if info.status == ServiceStatus::Running {
@@ -910,6 +941,13 @@ pub async fn start_service_core(
         }
     }
 
+    // 本次启动「为什么没能全量卸到显卡上」的归因。默认 `无从判断` ——
+    // CPU 启动、拿不到显存、模型元数据查不到都会走不到判定，
+    // 那时**不许**编一个原因出来（缺字段不能当成某个已知旧值）。
+    let mut 降档 = 降档::无从判断;
+    // 主干层数，用于把「上了 20 层」说成人话。读不到层结构就是 None。
+    let mut 主干层数: Option<u32> = None;
+
     let params = if backend.is_gpu() {
         let hw = tokio::task::spawn_blocking(crate::hardware::detect_hardware)
             .await
@@ -928,19 +966,12 @@ pub async fn start_service_core(
             .filter(|free| *free > 0.0)
             .unwrap_or(total_vram);
         tracing::info!(total_vram_gb = total_vram, usable_vram_gb = vram, "computing GPU launch params from usable VRAM");
-        // 2026-10-19 P100 `07:42`：旧引擎没杀掉（拒绝访问），可用显存从 15.898 掉到
-        // 9.448，规划器「合理地」降成 20 层 / 3072 ctx，而日志里只有上面那一行
-        // `computing GPU launch params` —— 降档本身看不出异常，真因就此被埋掉。
-        // 把「卡上有别人」这件事单独说出来，降档才有个解释可查。
-        if 显存被别的进程占着(total_vram, vram) {
-            tracing::warn!(
-                total_vram_gb = total_vram,
-                usable_vram_gb = vram,
-                已被占用_gib = total_vram - vram,
-                "可用显存明显少于总量 —— 卡上有别的进程占着（也可能是刚停掉的那个引擎还没完全释放）。\
-                 本次启动参数会按剩余显存降档，gpu_layers / ctx_size 偏小并不代表模型只需要这么多"
-            );
-        }
+        // 驱动模式决定「空载该占多少」：TCC 没有桌面合成，WDDM 有。见 `空载基线_gib`。
+        let 驱动模式 = tokio::task::spawn_blocking(crate::hardware::nvidia_driver_model)
+            .await
+            .ok()
+            .flatten();
+        let 空载基线 = 空载基线_gib(驱动模式.as_deref());
         let (data_dir, db_path, current_model_path) = {
             let inner = state.inner.lock().expect("state lock poisoned");
             (
@@ -992,14 +1023,58 @@ pub async fn start_service_core(
                 .unwrap_or(KvProfile {
                     per_token_fp16: LEGACY_KV_GIB_PER_TOKEN_PER_BILLION * active_billions,
                     fixed_fp16: 0.0,
+                    主干层数: None,
                 });
-                cuda_launch_params(
+                主干层数 = kv_profile.主干层数;
+                // 同一套参数算**两遍**：一遍按「现在真正空着的显存」，一遍按
+                // 「整张卡都归我用」。两者的差就是归因的唯一依据 ——
+                // 空卡能全量、现在不能，差额只可能被人占走了；
+                // 空卡也不够，那就是这个模型本身装不下这张卡，
+                // 「卡被占」是冤枉别人（27B 放 8G 卡就是这种）。
+                let 计划 = cuda_launch_params(
                     vram,
                     weight_gb,
                     kv_profile.per_token_fp16,
                     kv_profile.fixed_fp16,
                     max_ctx,
-                )
+                );
+                let 空卡计划 = cuda_launch_params(
+                    total_vram,
+                    weight_gb,
+                    kv_profile.per_token_fp16,
+                    kv_profile.fixed_fp16,
+                    max_ctx,
+                );
+                降档 = 判定降档(total_vram, vram, 空载基线, 计划, 空卡计划);
+                tracing::info!(
+                    驱动模式 = ?驱动模式,
+                    空载基线_gib = 空载基线,
+                    他人占用_gib = total_vram - vram - 空载基线,
+                    归因 = ?降档,
+                    计划的层数 = ?计划.n_gpu_layers,
+                    空卡能给的层数 = ?空卡计划.n_gpu_layers,
+                    "显存归因：这次降档算谁的"
+                );
+                if let 降档::卡被占 { 他人_gib, .. } = 降档 {
+                    // 2026-10-19 P100 `07:42`：旧引擎没杀掉（拒绝访问），可用显存
+                    // 从 15.898 掉到 9.448，规划器「合理地」降成 20 层 / 3072 ctx，
+                    // 而日志里只有一行看起来毫无问题的 `computing GPU launch params`
+                    // —— 降档本身看不出异常，真因就此被埋掉。
+                    // 2026-10-20：这条 WARN 过去用「可用 < 总量×0.80」判，在
+                    // WDDM 笔记本上**每次启动都亮**（实测 5.784/7.960 = 0.726，
+                    // 占着卡的只是桌面合成）⇒ 报警恒亮 = 报警失效。现在只在
+                    // 「卡被占确实让计划变差了」时才报，见 `判定降档`。
+                    tracing::warn!(
+                        total_vram_gb = total_vram,
+                        usable_vram_gb = vram,
+                        他人占用_gib = 他人_gib,
+                        计划的层数 = ?计划.n_gpu_layers,
+                        空卡能给的层数 = ?空卡计划.n_gpu_layers,
+                        "卡上有别的进程占着显存 —— 本次启动只好按剩下的显存降档。\
+                         界面上会同时给出提示（这条 WARN 不再是日志里的孤证）"
+                    );
+                }
+                计划
             }
             // Unknown VRAM or an imported model without metadata: keep the old
             // conservative fixed params.
@@ -1010,6 +1085,9 @@ pub async fn start_service_core(
     };
 
     set_starting(app, state, model_id, &host, port, false);
+    // 提示文案在**开进程之前**就算好：它是计划的一部分，不是事后的猜测。
+    // `None` = 没话可说（全量、模型本来就装不下、读不到显存都走这里）。
+    let 降档提醒 = 降档提示(降档, params, 主干层数);
     tracing::info!(
         %model_id,
         backend = ?backend,
@@ -1024,6 +1102,7 @@ pub async fn start_service_core(
         ctx_size = params.ctx_size,
         parallel = params.parallel,
         kv_quant = params.kv_quant,
+        会提示降档 = 降档提醒.is_some(),
         "starting llama-server"
     );
     let startup_timeout = if backend.is_gpu() {
@@ -1059,6 +1138,9 @@ pub async fn start_service_core(
                     "显卡加速没能生效，当前用的是普通（CPU）速度，生成会明显偏慢。\
                      可以点「恢复显卡加速」重试，或在设置里换一种加速方式。"
                         .to_string(),
+                    // 已经退到 CPU 了，「卡被占多少」不再是主要矛盾 —— 这里再叠一条
+                    // 只会把上面那句「点恢复加速」冲淡。
+                    None,
                     &extra_args,
                 );
             }
@@ -1073,7 +1155,18 @@ pub async fn start_service_core(
             if backend.is_gpu() {
                 核对计划全量卸载(&model_path, params.n_gpu_layers, 实际隔离后端).await;
             }
-            set_running(app, state, child, false, "AI服务已启动，可以开始聊天。".to_string(), &extra_args)
+            // 🔴 0.1.7-1：这条路径此前**没有任何**降档痕迹 —— 界面写「启动成功」，
+            // 用户不知道只有一半层上了卡。现在把归因写进 `warning`，界面用琥珀色条
+            // 单独显示。仍然**不阻断**：部分卸载本身是合法工作状态。
+            set_running(
+                app,
+                state,
+                child,
+                false,
+                "AI服务已启动，可以开始聊天。".to_string(),
+                降档提醒.clone(),
+                &extra_args,
+            )
         }
         Err(error) => {
             // 端口被**别的引擎**占着 ⇒ 重试没有意义：保守参数与 CPU 兜底同样绑不上
@@ -1128,7 +1221,18 @@ pub async fn start_service_core(
                     // ⚠️ 不走上面那条 812 的「没上卡」分支（它 return 了），两条不是重复：
                     //    那条报的是「显存停在空载」，这条报的是「上了卡但没全上去」。
                     核对计划全量卸载(&model_path, conservative.n_gpu_layers, 实际隔离后端).await;
-                    return set_running(app, state, child, false, "AI服务已启动，但用的是更保守的参数（上下文更短）。".to_string(), &extra_args);
+                    // 这里**不**沿用 `降档提醒`：那句话念的是激进计划（如「20 层 / 3072」），
+                    // 而实际跑的是保守计划（999 层 / 4096）。照抄等于把一份错的计划
+                    // 念给用户听 —— 比不提示更糟。保守档本身已有专门文案。
+                    return set_running(
+                        app,
+                        state,
+                        child,
+                        false,
+                        "AI服务已启动，但用的是更保守的参数（上下文更短）。".to_string(),
+                        None,
+                        &extra_args,
+                    );
                 }
             }
 
@@ -1184,6 +1288,9 @@ pub async fn start_service_core(
                     child,
                     true,
                     "显卡加速暂时没启动成功，已切换到更稳妥的 CPU 模式。".to_string(),
+                    // 走到这里已经是 CPU 模式了，`safe_mode` 会触发界面上那条
+                    // 「恢复显卡加速」的黄条，不必再叠一条降档提示。
+                    None,
                     &extra_args,
                 ),
                 Err(safe_error) => {
@@ -1282,6 +1389,9 @@ fn 复位为已停止(state: &AppState, 说明: &str) -> ServiceInfo {
     inner.service.model_id = None;
     inner.service.pid = None;
     inner.service.safe_mode = false;
+    // 降档提示是「这一次启动」的属性：服务不在了，它就过期了。
+    // 留着会让界面在已停止状态下还挂着一条「卡被占」的黄条。
+    inner.service.warning = None;
     ServiceInfo {
         model_id: None,
         port: None,
@@ -1289,6 +1399,7 @@ fn 复位为已停止(state: &AppState, 说明: &str) -> ServiceInfo {
         status: ServiceStatus::Stopped,
         safe_mode: false,
         message: 说明.to_string(),
+        warning: None,
     }
 }
 
@@ -1349,6 +1460,9 @@ pub fn stop_service_core(app: &AppHandle, state: &AppState) -> ServiceInfo {
                 status: ServiceStatus::Running,
                 safe_mode: 安全模式,
                 message: 文案.clone(),
+                // 进程还是原来那个 ⇒ 当初的降档提示依然成立，不能因为
+                // 这次「停止失败」就把它丢了。
+                warning: inner.service.warning.clone(),
             }
         };
         // 记录**不清**：它还在跑，下次重开应当照常接管（而不是靠端口兜底去认领）。
@@ -1436,6 +1550,9 @@ pub async fn recover_service(
             inner.service.status = ServiceStatus::Running;
             inner.service.safe_mode = persisted.safe_mode;
             inner.service.process = None;
+            // 接管态对「当初按什么参数起的」一无所知 ⇒ 提示留 `None`。
+            // 这是**未知**，不是「一切正常」：判据缺失不许当成已知值。
+            inner.service.warning = None;
             ServiceInfo {
                 model_id: Some(persisted.model_id),
                 port: Some(persisted.port),
@@ -1447,6 +1564,7 @@ pub async fn recover_service(
                 } else {
                     "已恢复上次运行的本地AI服务。".to_string()
                 },
+                warning: None,
             }
         };
         let _ = app.emit("service_status_changed", &info);
@@ -1958,6 +2076,7 @@ fn service_status(state: &AppState) -> ServiceInfo {
         host: inner.service.host.clone(),
         status: inner.service.status.clone(),
         safe_mode: inner.service.safe_mode,
+        warning: inner.service.warning.clone(),
         message: match inner.service.status {
             ServiceStatus::Running if inner.service.safe_mode => "AI服务正在 CPU 安全模式运行。".to_string(),
             ServiceStatus::Running => "AI服务正在运行。".to_string(),
@@ -2086,6 +2205,9 @@ fn set_starting(
         inner.service.port = Some(port);
         inner.service.status = ServiceStatus::Starting;
         inner.service.safe_mode = safe_mode;
+        // 新一次启动开始 ⇒ 上一轮的降档提示作废（否则旧提示会挂在新启动上，
+        // 「正在启动」状态却带着「只上了一半层」的结论，自相矛盾）。
+        inner.service.warning = None;
         ServiceInfo {
             model_id: inner.service.model_id.clone(),
             port: inner.service.port,
@@ -2097,6 +2219,7 @@ fn set_starting(
             } else {
                 "本地AI服务正在启动。".to_string()
             },
+            warning: None,
         }
     };
     let _ = app.emit("service_status_changed", &info);
@@ -2206,6 +2329,8 @@ fn set_running(
     child: Child,
     safe_mode: bool,
     message: String,
+    // 启动成功但**性能打折**的原因（见 `ServiceInfo::warning`）。`None` = 无话可说。
+    warning: Option<String>,
     附加参数: &[String],
 ) -> AppResult<ServiceInfo> {
     let info = {
@@ -2215,6 +2340,9 @@ fn set_running(
         inner.service.pid = Some(pid);
         inner.service.status = ServiceStatus::Running;
         inner.service.safe_mode = safe_mode;
+        // 写进状态而不只是返回：`get_service_status` 会重建 `ServiceInfo`，
+        // 不落状态的话前端下一次轮询就把提示抹掉了。
+        inner.service.warning = warning.clone();
         if let (Some(model_id), Some(port), Some(host)) = (
             inner.service.model_id.clone(),
             inner.service.port,
@@ -2236,6 +2364,7 @@ fn set_running(
             status: inner.service.status.clone(),
             safe_mode: inner.service.safe_mode,
             message,
+            warning,
         }
     };
 
@@ -3082,25 +3211,129 @@ fn 判端口归属(端口pid: Option<u32>, 本次pid: u32) -> 端口归属 {
     }
 }
 
-/// 可用显存低于总量的这个比例 ⇒ 认为卡上有别的进程占着。
+/// 一次启动「为什么没能全量卸到显卡上」的归因。
 ///
-/// 0.80 的来历：TCC 的 P100 实测 `15.898 / 16.0 = 0.994`；带桌面合成的笔记本
-/// （WDDM）常见 `7.4 / 8.19 = 0.90`。已经被占掉 6.4 GiB 那次是 `9.448 / 16.0 = 0.59`。
-/// 阈值取在两者之间，既能抓住「卡上有另一个模型」，又不会把桌面合成的正常占用报成异常。
-const 显存占用告警比例: f64 = 0.80;
+/// 🔴 这个枚举存在的理由（**0.1.7-1**，2026-10-20）：启动参数按**可用**显存算，
+/// 卡上还有别的程序时规划器会「合理地」降档 —— 每一步都对，界面写着「启动成功」，
+/// 用户只知道慢、不知道慢在哪、更不知道关掉那个程序就能好。部分卸载本身是
+/// 合法态，所以**不能拦**；能做的只有把「是谁的锅」说清楚。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum 降档 {
+    /// 全量卸载，没有降档。此时无话可说。
+    未降档,
+    /// 降档了，但**把整张卡都给它也全量不了** —— 模型本来就比这张卡大
+    /// （27B-Q3 放 8G 卡）。这是选购问题，不是故障，启动时不提示。
+    与他人无关,
+    /// 降档了，且**空卡本来全量得下** ⇒ 差额是被别的进程占走的。
+    /// 这是唯一值得在界面上说的那种。
+    卡被占 {
+        /// 扣掉该驱动模式的空载基线之后，仍被别人占着的量（GiB）。
+        /// **只写进日志**：基线是估计值，把它当精确数字念给用户是过度自信。
+        他人_gib: f64,
+        /// 规划时读到的可用 / 总量（GiB）。提示里只念这两个 ——
+        /// 它们是用户能在任务管理器/`nvidia-smi` 里自己对上的事实。
+        可用_gib: f64,
+        总量_gib: f64,
+    },
+    /// 拿不到显存读数（非 N 卡 / `nvidia-smi` 不可用），或参数走了兜底档。
+    无从判断,
+}
 
-/// 可用显存是不是**明显**少于总量 —— 是的话，本次启动参数会被**静默降档**。
+/// 空载时「本来就该占着」的显存（GiB）—— 归因之前必须先扣掉它。
 ///
-/// 2026-10-19 P100（`07:42:03`）这个信号被完整吞掉了：旧引擎（`taskkill` 拒绝访问）
-/// 还占着 6.4 GiB，`usable_vram_gb` 从 `15.898` 掉到 `9.448`，规划器「按剩余显存
-/// 合理降档」成 `20 层 / 3072 ctx` —— 每一步看起来都对，于是没人发现卡上还有另一个
-/// 模型。所以判据**只 WARN 不阻断**（部分卸载本身是合法态），作用是把旁证说出来，
-/// 不让它藏在一条「看起来很正常」的 `computing GPU launch params` 后面。
-fn 显存被别的进程占着(总量: f64, 可用: f64) -> bool {
-    if 总量 <= 0.0 || 可用 <= 0.0 {
-        return false;
+/// 🔴 没有这个数，判据会在**常态机器上恒亮**（0.1.7-1 的现场）：
+/// 2026-10-20 本机 RTX 5060 Laptop / 8G，总量 7.960、空闲 5.760 ⇒ 桌面合成占
+/// 2.20 GiB，`可用/总量 = 0.724`。旧的「可用 < 总量×0.80 就算被占」于是**每次
+/// 启动都报**「卡上有别的进程占着」，而卡上只有桌面。报警在常态下亮着，用户
+/// 迟早学会无视它 —— 真被占的那次就没人看了，护栏自己失效。
+///
+/// 取**绝对值**而不是比例：桌面合成的开销与卡多大基本无关（2~3 GiB 量级），
+/// 用比例会让 24G 卡上的同样开销被判成「没占」、8G 卡上被判成「占了」。
+const 空载基线_TCC_GIB: f64 = 1.0; // P100 实测空载 0.1~0.2 GiB
+const 空载基线_WDDM_GIB: f64 = 3.0; // 笔记本实测 2.20 GiB，留多显示器/浏览器硬解的余量
+const 空载基线_未知_GIB: f64 = 1.5; // 认不出驱动模式时的折中
+
+/// 按驱动模式取空载基线。TCC 是计算专用模式（**没有桌面合成**），WDDM 有。
+///
+/// 纯函数：驱动模式由调用方拿到后传进来。放进函数里现查会让这条判据
+/// 变成「测不了」的 —— 而测不了的判据等于没有。
+fn 空载基线_gib(驱动模式: Option<&str>) -> f64 {
+    match 驱动模式
+        .map(|值| 值.trim().to_ascii_uppercase())
+        .as_deref()
+    {
+        Some("TCC") => 空载基线_TCC_GIB,
+        Some("WDDM") => 空载基线_WDDM_GIB,
+        _ => 空载基线_未知_GIB,
     }
-    可用 < 总量 * 显存占用告警比例
+}
+
+/// 归因：这次的降档该不该算到「别的进程头上」。
+///
+/// 判据只有一条 —— **反事实**：把整张卡都给这个模型，能全量吗？
+///
+/// * 能（`空卡计划` 全量）而现在不能 ⇒ 差额只能是被占走的（扣掉空载基线）；
+/// * 空卡也不能 ⇒ 模型本身就装不下这张卡，跟别人没关系。
+///
+/// 这一条替代了旧的「可用 < 总量×0.80」。旧判据只看**比例**，于是
+/// ①WDDM 笔记本上桌面合成那 2.2 GiB 让它在常态下恒亮；②27B 放 8G 卡上
+/// 报「卡被占」，而其实是模型比卡大 —— 两个方向都错，且错法不同。
+fn 判定降档(
+    总量: f64,
+    可用: f64,
+    空载基线: f64,
+    计划: LaunchParams,
+    空卡计划: LaunchParams,
+) -> 降档 {
+    if 总量 <= 0.0 || 可用 <= 0.0 {
+        return 降档::无从判断;
+    }
+    if 计划全量卸载(计划.n_gpu_layers) {
+        return 降档::未降档;
+    }
+    if !计划全量卸载(空卡计划.n_gpu_layers) {
+        return 降档::与他人无关;
+    }
+    let 他人_gib = 总量 - 可用 - 空载基线;
+    if 他人_gib <= 0.0 {
+        // 空卡本来全量得下，现在不行，但被占的量没有超过「该有的空载开销」——
+        // 差额来自常态占用（桌面/驱动/多显示器），不是某个可关掉的程序。
+        // 说「卡被占」只会让用户去关浏览器，关完还是这样。
+        return 降档::与他人无关;
+    }
+    降档::卡被占 {
+        他人_gib,
+        可用_gib: 可用,
+        总量_gib: 总量,
+    }
+}
+
+/// 把归因写成一句**人能照着做**的话。返回 `None` = 没什么可说的。
+///
+/// 三条硬要求（都来自踩过的坑）：
+/// 1. **不阻断**：部分卸载是合法态，这句话只能出现在启动成功之后；
+/// 2. **只念用户能核对的事实**（可用 / 总量 / 层数 / 上下文），
+///    不念估算出来的「别人占了多少」；
+/// 3. **给出下一步**：否则用户知道慢了也没法改变。
+fn 降档提示(归因: 降档, 计划: LaunchParams, 主干层数: Option<u32>) -> Option<String> {
+    let 降档::卡被占 {
+        可用_gib, 总量_gib, ..
+    } = 归因
+    else {
+        return None;
+    };
+    let 层数 = match (计划.n_gpu_layers, 主干层数) {
+        (Some(层), Some(总)) if 层 < 总 => format!("{层}/{总} 层"),
+        (Some(层), _) => format!("{层} 层"),
+        // CPU 启动不会走到这里（`卡被占` 只在 GPU 计划里判），留个兜底不撒谎。
+        (None, _) => "一部分层".to_string(),
+    };
+    Some(format!(
+        "显卡上还有别的程序占着显存（当前可用 {可用_gib:.1} GB，整卡 {总量_gib:.1} GB），\
+         所以这次只把 {层数} 放到了显卡上、上下文压到 {} —— 生成会明显偏慢。\
+         关掉占用显卡的程序后，点「停止」再「启动」会重新按余量分配。",
+        计划.ctx_size
+    ))
 }
 
 /// 健康检查通过**只证明这个端口上有东西在答**，不证明答的是本次起的进程。
@@ -3206,6 +3439,8 @@ fn 接管遗留引擎(
         // 关键：`process = None` ⇒ 这是**接管态**。看门狗据此跳过 `try_wait`，
         // 「停止」据此走 `kill_pid` 而不是 `child.kill()`。
         inner.service.process = None;
+        // 接管的是**别人起的**进程，计划不可知 ⇒ 提示留空（未知，不是正常）。
+        inner.service.warning = None;
         let persisted = PersistedServiceState {
             model_id: model_id.to_string(),
             port,
@@ -3224,6 +3459,7 @@ fn 接管遗留引擎(
             message: format!(
                 "接口端口 {port} 上已有上次运行的本地AI服务（{引擎自报}），已直接接管，没有重复启动。"
             ),
+            warning: None,
         }
     };
     tracing::info!(
@@ -3494,6 +3730,8 @@ fn set_failed(app: &AppHandle, state: &AppState, message: String) -> ServiceInfo
         let _ = clear_service_state(&inner.db_path);
         inner.service.status = ServiceStatus::Failed;
         inner.service.port = None;
+        // 没起来就没有「降档」可言；留着旧提示会让人以为服务在跑。
+        inner.service.warning = None;
         ServiceInfo {
             model_id: inner.service.model_id.clone(),
             port: inner.service.port,
@@ -3501,6 +3739,7 @@ fn set_failed(app: &AppHandle, state: &AppState, message: String) -> ServiceInfo
             status: inner.service.status.clone(),
             safe_mode: inner.service.safe_mode,
             message,
+            warning: None,
         }
     };
     let _ = app.emit("service_status_changed", &info);
@@ -4740,22 +4979,119 @@ mod tests {
         assert_eq!(判端口归属(None, 7148), 端口归属::无法确认);
     }
 
-    /// 阈值必须同时满足两件事：抓住「卡上还有另一个模型」，又不把桌面合成的
-    /// 正常占用报成异常。三个数全部取自实测日志，不是估出来的。
+    fn 全量计划() -> LaunchParams {
+        LaunchParams {
+            n_gpu_layers: Some(999),
+            ctx_size: 40960,
+            parallel: 1,
+            kv_quant: false,
+        }
+    }
+
+    fn 部分计划(层: u32, ctx: u32) -> LaunchParams {
+        LaunchParams {
+            n_gpu_layers: Some(层),
+            ctx_size: ctx,
+            parallel: 1,
+            kv_quant: true,
+        }
+    }
+
+    /// 归因判据认的是**反事实**（空卡能不能全量），不是「可用占总量的比例」。
+    ///
+    /// 五个数全部取自实测日志：P100 空卡 `15.898/16.0`、被旧引擎占着时
+    /// `9.448/16.0`、本机笔记本 `5.760/7.960`（桌面合成占 2.20）、
+    /// 27B-Q3 放 8G 卡（空卡也全量不了）。
+    ///
+    /// 🔴 后两个是**回归钉子**：旧判据（可用 < 总量×0.80）在这两种情形下都会报
+    /// 「卡被占」，而真相分别是「桌面合成」和「模型比卡大」—— 前者让报警在常态
+    /// 机器上恒亮（0.1.7-1 现场），后者是冤枉别人。
     #[test]
-    fn 显存被占只认明显的那一档() {
-        // P100 TCC 空卡：15.898 / 16.0 = 0.994（不报）
-        assert!(!显存被别的进程占着(16.0, 15.8984375));
-        // 笔记本 WDDM 带桌面合成：7.4 / 8.19 = 0.90（不报）
-        assert!(!显存被别的进程占着(8.19, 7.4));
-        // 2026-10-19 `07:42:03`：旧引擎占着 6.4 GiB，9.448 / 16.0 = 0.59（必须报）
-        assert!(显存被别的进程占着(16.0, 9.4482421875));
-        // 边界：正好 80% 不算「明显」（严格小于），避免在阈值上抖动
-        assert!(!显存被别的进程占着(10.0, 8.0));
-        assert!(显存被别的进程占着(10.0, 7.99));
-        // 两边任一拿不到 ⇒ 没有反证，不许报警（否则 netstat/nvidia-smi 被封的机器天天狼来了）
-        assert!(!显存被别的进程占着(0.0, 5.0));
-        assert!(!显存被别的进程占着(16.0, 0.0));
+    fn 降档归因认的是反事实不是比例() {
+        // P100 空卡：全量、无话可说
+        assert_eq!(
+            判定降档(16.0, 15.8984375, 空载基线_TCC_GIB, 全量计划(), 全量计划()),
+            降档::未降档
+        );
+        // 2026-10-19 `07:42:03`：旧引擎占着 6.4 GiB，9.448/16.0 ⇒ 必须归到别人头上
+        match 判定降档(
+            16.0,
+            9.4482421875,
+            空载基线_TCC_GIB,
+            部分计划(20, 3072),
+            全量计划(),
+        ) {
+            降档::卡被占 { 他人_gib, .. } => {
+                // 16.0 - 9.4482421875 - 1.0(TCC 空载基线) = 5.5517578125
+                assert!(
+                    (他人_gib - 5.5517578125).abs() < 1e-6,
+                    "他人_gib={他人_gib}"
+                );
+            }
+            其他 => panic!("P100 被占那次必须判成卡被占，实得 {其他:?}"),
+        }
+        // 🔴 本机常态（2026-10-20 `06:19` 实测 5.760/7.960）：占着卡的是桌面合成，
+        // 扣掉 WDDM 基线 3.0 之后没有「别人」⇒ 不许报。旧判据在这里**天天报**。
+        assert_eq!(
+            判定降档(7.96, 5.76, 空载基线_WDDM_GIB, 部分计划(20, 3072), 全量计划()),
+            降档::与他人无关,
+            "笔记本上桌面合成占 2.2 GiB 不是「卡被占」，报了就等于报警恒亮"
+        );
+        // 27B-Q3（12.244 GiB）放 8G 卡：空卡也只给部分层 ⇒ 是模型比卡大，
+        // 不是别人的锅。旧判据在这里同样会报。
+        assert_eq!(
+            判定降档(7.96, 7.2, 空载基线_WDDM_GIB, 部分计划(12, 2048), 部分计划(12, 2048)),
+            降档::与他人无关
+        );
+        // 显存读数两边任一拿不到 ⇒ 无从判断（不许编原因）
+        assert_eq!(
+            判定降档(0.0, 5.0, 空载基线_TCC_GIB, 部分计划(20, 3072), 全量计划()),
+            降档::无从判断
+        );
+        assert_eq!(
+            判定降档(16.0, 0.0, 空载基线_TCC_GIB, 部分计划(20, 3072), 全量计划()),
+            降档::无从判断
+        );
+    }
+
+    /// 空载基线按驱动模式分档 —— TCC 没有桌面合成，WDDM 有。
+    /// 大小写/空白都要能吃下（`nvidia-smi` 在不同驱动版本上输出格式不一）。
+    #[test]
+    fn 空载基线按驱动模式分档() {
+        assert_eq!(空载基线_gib(Some("TCC")), 空载基线_TCC_GIB);
+        assert_eq!(空载基线_gib(Some("tcc")), 空载基线_TCC_GIB);
+        assert_eq!(空载基线_gib(Some(" WDDM ")), 空载基线_WDDM_GIB);
+        // 查不到/认不出 ⇒ 折中值，不许退化成 0（0 会把常态占用全算到别人头上）
+        assert_eq!(空载基线_gib(None), 空载基线_未知_GIB);
+        assert_eq!(空载基线_gib(Some("N/A")), 空载基线_未知_GIB);
+        assert!(空载基线_未知_GIB > 0.0);
+    }
+
+    /// 提示只在这种情形出现：**降档确实是别人造成的**。
+    /// 其余三态一律 `None` —— 否则又变成「每天都说一遍」。
+    #[test]
+    fn 降档提示只在卡被占时说并且念得出数字() {
+        let 占着 = 降档::卡被占 {
+            他人_gib: 5.45,
+            可用_gib: 5.8,
+            总量_gib: 8.0,
+        };
+        let 文案 = 降档提示(占着, 部分计划(20, 3072), Some(32)).expect("卡被占必须给提示");
+        assert!(文案.contains("5.8"), "{文案}");
+        assert!(文案.contains("8.0"), "{文案}");
+        // 「只上了一半」必须看得出来：念层数与分母，不念抽象的「部分卸载」
+        assert!(文案.contains("20/32 层"), "{文案}");
+        assert!(文案.contains("3072"), "{文案}");
+        // 必须给下一步动作，否则用户知道慢了也没法改
+        assert!(文案.contains("停止") && 文案.contains("启动"), "{文案}");
+
+        // 主干层数读不到时不许编分母
+        let 无层数 = 降档提示(占着, 部分计划(20, 3072), None).unwrap();
+        assert!(无层数.contains("20 层") && !无层数.contains("20/"), "{无层数}");
+
+        for 无关 in [降档::未降档, 降档::与他人无关, 降档::无从判断] {
+            assert_eq!(降档提示(无关, 部分计划(20, 3072), Some(32)), None, "{无关:?}");
+        }
     }
 
     /// `是端口占用类错误` 靠文案前缀判断，前缀必须与三处构造点一致。

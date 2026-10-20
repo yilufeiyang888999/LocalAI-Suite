@@ -47,6 +47,10 @@ pub struct ServiceState {
     /// processes we reattached to after a restart (where `process` is None).
     pub pid: Option<u32>,
     pub safe_mode: bool,
+    /// 启动成功但性能打折的原因（见 `ServiceInfo::warning`）。
+    /// 存在状态里而不是只放在返回结构里：状态会被 `get_service_status`
+    /// 反复重建，只放返回值的话，前端一次轮询就能把提示抹掉。
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
