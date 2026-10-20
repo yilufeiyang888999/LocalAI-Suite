@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn legacy_config_without_kb_base_url_still_loads() {
         let 旧配置 = r#"{
-  "install_dir": "D:\\Ivan-File\\10-LocalAI-Installer",
+  "install_dir": "D:\\workspace\\10-LocalAI-Installer",
   "download_speed_limit": null,
   "mirror_source": "auto",
   "proxy": null,
@@ -306,8 +306,8 @@ mod tests {
   "extra_launch_args": "--ctx-size 16384",
   "service_host": "127.0.0.1",
   "service_port": 8000,
-  "llama_server_path": "D:\\Ivan-File\\10-LocalAI-Installer\\engine\\backends\\llama-server-cuda.exe",
-  "local_model_path": "D:\\Ivan-File\\10-LocalAI-Installer\\models\\Spark-X2.5-4B-Q6_K\\Spark-X2.5-4B-Q6_K.gguf",
+  "llama_server_path": "D:\\workspace\\10-LocalAI-Installer\\engine\\backends\\llama-server-cuda.exe",
+  "local_model_path": "D:\\workspace\\10-LocalAI-Installer\\models\\Spark-X2.5-4B-Q6_K\\Spark-X2.5-4B-Q6_K.gguf",
   "ai_display_name": null,
   "instance_id": "11111111-2222-3333-4444-555555555555"
 }"#;

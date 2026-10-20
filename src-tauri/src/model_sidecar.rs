@@ -430,7 +430,7 @@ pub fn 核对适配器(期望: &[(String, Option<f64>)], 实际: &[(String, Opti
 ///
 /// 为什么需要它：`{:?}` 打出来是 `[("…lora-v3-f16.gguf", Some(1.0))]` ——
 /// `Some(…)` 是 Rust 的 `Option` 内部表示，不是给「配错了微调包的人」看的东西。
-/// 日志里冒出 `Some` 会让人以为出了问题（2026-10-16 老李本机实测提出）。
+/// 日志里冒出 `Some` 会让人以为出了问题（2026-10-16 作者本机实测提出）。
 ///
 /// 🔴 **抹平只抹外层**：缩放缺失渲染成「缩放未报」，**不许也写成 `1.0`**。
 /// 判据里 `None` 与 `Some(1.0)` 按同一个值（缺省 1.0）比对 —— 但那说的是**比对**；
@@ -838,7 +838,7 @@ mod tests {
 
     #[test]
     fn 反斜杠路径的lora_scaled也能拆() {
-        let 参数 = 串(&["--lora-scaled", r"D:\Ivan-File\m\lora.gguf:0"]);
+        let 参数 = 串(&["--lora-scaled", r"D:\workspace\m\lora.gguf:0"]);
         let 适配器 = 期望的适配器(&参数);
         assert_eq!(适配器.len(), 1);
         assert_eq!(适配器[0].1, Some(0.0), "缩放 0 = 加载但不生效（纯基座），要保留");
@@ -1000,7 +1000,7 @@ mod tests {
 
     #[test]
     fn 渲染适配器时抹掉Some但保住缩放未报() {
-        // 日志是给人看的：`[("…", Some(1.0))]` 里的 `Some` 是 Rust 内部表示（老李实测提出）。
+        // 日志是给人看的：`[("…", Some(1.0))]` 里的 `Some` 是 Rust 内部表示（作者实测提出）。
         let 一个 = vec![(r"D:\m\lora-v3-f16.gguf".to_string(), Some(1.0))];
         assert_eq!(描述适配器(&一个), r#"[("D:\m\lora-v3-f16.gguf", 1.0)]"#);
 

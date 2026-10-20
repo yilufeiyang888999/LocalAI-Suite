@@ -199,7 +199,7 @@ def main():
     else:
         打印("（没找到 /tmp/llm-switch-*.log，本步跳过）")
 
-    # prefill 需要一个长度接近真实场景的提示：老李那次真实对话是 371 token，
+    # prefill 需要一个长度接近真实场景的提示：作者那次真实对话是 371 token，
     # 这里用同一量级（约 400 token），数字可直接对比。
     短提示 = "Reply with one word: hello."
     长提示 = "A local language model runs on a single GPU. " * 40

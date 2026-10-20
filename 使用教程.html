@@ -421,7 +421,7 @@
       <h3>4.2 企业知识库问答</h3>
       <p>切到「知识库问答」标签后，顶部会显示服务是否连上、连的是哪个地址、库里有几份文档几块内容。</p>
       <p><b>怎么把服务起起来：</b>到作品一目录下运行它的启动器（它会一并把检索用的重排服务也带起来）：</p>
-      <pre><code>cd "D:/Ivan-File/7-AI-Code/RAG-Embedding"
+      <pre><code>cd "D:/workspace/7-AI-Code/RAG-Embedding"
 python scripts/启动-服务.py</code></pre>
       <p class="footnote">只想单独起知识库服务本身，也可以用 <code>python scripts/知识库服务.py</code>。</p>
 
@@ -442,7 +442,7 @@ python scripts/启动-服务.py</code></pre>
         </tbody>
       </table>
       <p><b>怎么把服务起起来：</b>到作品二目录下运行：</p>
-      <pre><code>cd "D:/Ivan-File/7-AI-Code/ChatBI"
+      <pre><code>cd "D:/workspace/7-AI-Code/ChatBI"
 python scripts/启动-服务.py</code></pre>
       <p>它的「知识问答」链路会转发给作品一，所以那条链路要求 <b>8092 也开着</b>。界面会逐条显示三条链路的可达情况，缺哪条会直接点名。</p>
 
@@ -453,7 +453,7 @@ python scripts/启动-服务.py</code></pre>
 
       <h3>4.4 想一次把全部服务起齐</h3>
       <p>三个仓库的交叉演示有一条命令（先手动启动本软件的 AI 服务，再跑它）：</p>
-      <pre><code>cd "D:/Ivan-File/7-AI-Code/AI大模型应用开发实战训练营/整合演示"
+      <pre><code>cd "D:/workspace/7-AI-Code/AI大模型应用开发实战训练营/整合演示"
 python 一键启动.py            # 体检 → 起缺的服务 → 全链路自证
 python 一键启动.py --状态      # 只看现状，不动现场
 python 一键启动.py --停        # 停掉两条支线（不动本软件的引擎）</code></pre>
@@ -626,11 +626,11 @@ python 一键启动.py --停        # 停掉两条支线（不动本软件的引
       <table class="tbl">
         <thead><tr><th>东西</th><th>位置</th></tr></thead>
         <tbody>
-          <tr><td>本软件源码</td><td><code>D:\Ivan-File\7-AI-Code\Local-AI</code></td></tr>
+          <tr><td>本软件源码</td><td><code>D:\workspace\7-AI-Code\Local-AI</code></td></tr>
           <tr><td>安装包</td><td><code>…\Local-AI\src-tauri\target\release\bundle\nsis\</code></td></tr>
-          <tr><td>模型与引擎（默认）</td><td>安装时选定的保存位置，例如 <code>D:\Ivan-File\10-LocalAI-Installer</code></td></tr>
-          <tr><td>作品一 · 知识库</td><td><code>D:\Ivan-File\7-AI-Code\RAG-Embedding</code></td></tr>
-          <tr><td>作品二 · 智能问数</td><td><code>D:\Ivan-File\7-AI-Code\ChatBI</code></td></tr>
+          <tr><td>模型与引擎（默认）</td><td>安装时选定的保存位置，例如 <code>D:\workspace\10-LocalAI-Installer</code></td></tr>
+          <tr><td>作品一 · 知识库</td><td><code>D:\workspace\7-AI-Code\RAG-Embedding</code></td></tr>
+          <tr><td>作品二 · 智能问数</td><td><code>D:\workspace\7-AI-Code\ChatBI</code></td></tr>
           <tr><td>跨仓库整合演示</td><td><code>…\AI大模型应用开发实战训练营\整合演示</code></td></tr>
           <tr><td>日志</td><td>数据目录下的 <code>logs\</code>，文件名带日期后缀</td></tr>
         </tbody>

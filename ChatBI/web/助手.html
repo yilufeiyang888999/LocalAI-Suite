@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>制造业经营分析助手 · 一个入口三条链路</title>
+<style>
+  /* 🔴 视觉语言与作品一的问答页（RAG-Embedding/web/index.html）保持一致：
+     同一套色板 / 居中 hero + 状态徽标 / 大输入框（chips 内嵌 + 圆形发送键）/ 居中结果卡 / 页脚。
+     只换皮，不换功能 —— 角色选择、403 越权红框、执行轨迹、产出单据、底层应答一个都不能丢。 */
+  :root{
+    --bg:#f4f6f9; --panel:#ffffff; --line:#e4e9f0; --text:#16202c; --muted:#66748a;
+    --accent:#1d4ed8; --accent-soft:#eef3ff;
+    --ok:#0f766e; --ok-soft:#e7f6f3;
+    --warn:#8a6100; --warn-soft:#fff8e6; --warn-line:#f0c14b;
+    --err:#b42318; --err-soft:#fef3f2; --err-line:#f3c3bf;
+    /* 三条链路各自的色（沿用原页面的三色，只调到与上方色板同调） */
+    --l1:#7a4fd6; --l1bg:#f2ecfe;
+    --l2:#0f8b8d; --l2bg:#e6f6f6;
+    --l3:#c2410c; --l3bg:#fdefe6;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font:15px/1.7 "Microsoft YaHei","PingFang SC","Hiragino Sans GB",system-ui,-apple-system,"Segoe UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:960px;margin:0 auto;padding:0 20px 72px}
+
+  /* ---------- 居中标题区（对照 8092 问答页） ---------- */
+  .hero{text-align:center;padding:72px 12px 30px}
+  .hero h1{font-size:40px;margin:0 0 12px;font-weight:700;letter-spacing:2px;color:#1c2431}
+  .hero .sub{margin:0;color:var(--muted);font-size:14.5px;letter-spacing:.5px}
+  .badge{
+    display:inline-flex;align-items:center;gap:7px;padding:6px 14px;border-radius:999px;
+    font-size:12.5px;background:#eef1f5;color:var(--muted);border:1px solid transparent;
+    margin-top:20px;white-space:nowrap;
+  }
+  .badge .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+  .badge.ok{background:var(--ok-soft);color:var(--ok)}
+  .badge.bad{background:var(--err-soft);color:var(--err)}
+  .badge small{color:inherit;opacity:.75}
+
+  /* ---------- 角色行（本页特有，嵌在 hero 与输入框之间，样式随色板） ---------- */
+  .rolebar{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap;margin:16px auto 0}
+  .rolebar .rlabel{font-size:12.5px;color:var(--muted)}
+  #role{
+    border:1px solid var(--line);background:#fbfcfe;color:var(--text);
+    padding:5px 10px;border-radius:8px;font-size:12.5px;cursor:pointer;font-family:inherit;
+    transition:border-color .15s,box-shadow .15s;
+  }
+  #role:hover{border-color:#b9c9ef}
+  #role:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .rolehint{font-size:12px;color:var(--muted)}
+  .rolehint b{color:var(--text)}
+
+  /* ---------- 大输入框（chips 内嵌 + 右下发送键） ---------- */
+  .askbox{
+    max-width:780px;margin:18px auto 0;background:var(--panel);
+    border:1px solid #c9d6f0;border-radius:16px;padding:14px 16px 12px;
+    box-shadow:0 6px 22px rgba(29,78,216,.07);transition:border-color .15s,box-shadow .15s;
+  }
+  .askbox:focus-within{border-color:var(--accent);box-shadow:0 6px 26px rgba(29,78,216,.13)}
+  textarea{
+    display:block;width:100%;border:0;outline:0;resize:none;background:transparent;color:inherit;
+    font:15.5px/1.7 inherit;font-family:inherit;min-height:58px;max-height:180px;padding:2px 2px 0;
+  }
+  textarea::placeholder{color:#9aa6b8}
+  .boxbar{display:flex;align-items:center;gap:10px;margin-top:6px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;flex:1;min-width:0}
+  .chip{
+    border:1px solid var(--line);background:#fbfcfe;color:var(--muted);
+    padding:4px 11px;border-radius:8px;font-size:12px;cursor:pointer;transition:all .15s;
+    max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    display:inline-flex;align-items:center;gap:6px;
+  }
+  .chip:hover{border-color:#b9c9ef;color:var(--accent);background:var(--accent-soft)}
+  .chip .dot{width:6px;height:6px;border-radius:50%;flex:none}
+  button.send{
+    flex:none;width:44px;height:44px;border:0;border-radius:12px;cursor:pointer;
+    background:var(--accent);color:#fff;font-size:18px;line-height:1;display:grid;place-items:center;
+    transition:opacity .15s,transform .1s;
+  }
+  button.send:hover:not(:disabled){opacity:.9}
+  button.send:active:not(:disabled){transform:scale(.96)}
+  button.send:disabled{opacity:.45;cursor:not-allowed}
+
+  /* ---------- 结果区 ---------- */
+  #result{max-width:900px;margin:34px auto 0}
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:20px 22px;box-shadow:0 1px 2px rgba(20,30,50,.04);
+  }
+  .card + .card{margin-top:14px}
+  .q-line{
+    font-size:13px;color:var(--muted);margin:0 0 12px;padding-left:11px;
+    border-left:3px solid #d7e0ef;
+  }
+  .q-line b{color:var(--text);font-weight:600}
+  .ans{font-size:16px;line-height:1.85;margin:0;white-space:pre-wrap;word-break:break-word}
+
+  /* 链路 / 依据 / 角色 徽标 */
+  .lane{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 13px}
+  .pill{padding:3px 11px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+  .p-l1{background:var(--l1bg);color:var(--l1)}
+  .p-l2{background:var(--l2bg);color:var(--l2)}
+  .p-l3{background:var(--l3bg);color:var(--l3)}
+  .p-ok{background:var(--ok-soft);color:var(--ok)}
+  .p-warn{background:var(--warn-soft);color:var(--warn)}
+  .p-bad{background:var(--err-soft);color:var(--err)}
+  .p-plain{background:#f0f2f6;color:var(--muted)}
+
+  /* 越权：单独一块红框、放在答案之前（与 8092 的拒答块同理） */
+  .deny{
+    display:flex;gap:11px;align-items:flex-start;background:var(--err-soft);
+    border:1px solid var(--err-line);border-radius:10px;padding:13px 15px;margin:0 0 14px;
+  }
+  .deny .t{font-weight:600;color:var(--err);margin:0 0 3px;font-size:14px}
+  .deny .d{margin:0;font-size:13px;color:#7c3f39;line-height:1.65}
+
+  /* 改判：与越权框同形、换琥珀色。
+     为什么要单独一块：改判意味着「用户没说清楚，我们替他猜成了动作」——
+     猜对了也该让他知道，否则下一次他会以为原话就够了。 */
+  .notice{
+    display:flex;gap:11px;align-items:flex-start;background:#fdf6e6;
+    border:1px solid #ebd9a8;border-radius:10px;padding:13px 15px;margin:0 0 14px;
+  }
+  .notice .t{font-weight:600;color:#8a6212;margin:0 0 3px;font-size:14px}
+  .notice .d{margin:0;font-size:13px;color:#7a5f22;line-height:1.65}
+
+  /* 路由解释：沿用 8092 的「虚线分隔 + 小字」家族 */
+  .why{
+    margin-top:15px;padding-top:12px;border-top:1px dashed var(--line);
+    font-size:12.5px;color:var(--muted);line-height:1.78;
+  }
+  .why b{color:var(--text)}
+
+  .card h2{margin:0 0 10px;font-size:13px;font-weight:600;color:var(--muted);letter-spacing:.5px}
+  .step{border-left:2px solid var(--line);padding:2px 0 2px 12px;margin:10px 0}
+  .step .h{font-size:12.5px;font-weight:600;color:var(--text)}
+  .step .o{font-size:12.5px;color:var(--muted);margin-top:3px;word-break:break-all;line-height:1.72}
+
+  /* 产出单据 */
+  .out{
+    padding:11px 13px;border-radius:8px;background:var(--ok-soft);border:1px solid #cfe9e2;
+    font-size:13px;line-height:1.72;color:#0b5c56;word-break:break-all;
+  }
+  .out code{font-family:ui-monospace,Consolas,monospace}
+
+  table{border-collapse:collapse;width:100%;font-size:13px;margin-top:6px}
+  th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;white-space:nowrap}
+  th{background:#f2f4f8;font-weight:600;color:var(--muted)}
+  tbody tr:nth-child(even){background:#fafbfd}
+
+  details{margin-top:2px}
+  summary{cursor:pointer;color:var(--accent);font-size:12.5px;user-select:none}
+  pre{
+    margin:10px 0 0;padding:12px;background:#f7f9fc;border:1px solid var(--line);border-radius:8px;
+    overflow:auto;font:12.5px/1.6 ui-monospace,Consolas,monospace;color:#40506a;
+    white-space:pre-wrap;word-break:break-all;
+  }
+
+  /* 加载 / 错误 */
+  .loading{display:flex;align-items:center;gap:11px;color:var(--muted);font-size:14px;padding:8px 2px}
+  .spinner{
+    width:16px;height:16px;border:2px solid #d5deeb;border-top-color:var(--accent);
+    border-radius:50%;animation:spin .7s linear infinite;flex:none;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .errbox{
+    display:flex;gap:11px;align-items:flex-start;background:var(--err-soft);
+    border:1px solid var(--err-line);border-radius:10px;padding:13px 15px;
+  }
+  .errbox .t{font-weight:600;color:var(--err);margin:0 0 3px;font-size:14px}
+  .errbox .d{margin:0;font-size:13px;color:#7c3f39;line-height:1.65;word-break:break-word}
+
+  footer{
+    max-width:900px;margin:44px auto 0;padding-top:16px;border-top:1px solid var(--line);
+    font-size:12.5px;color:var(--muted);line-height:1.95;
+  }
+  footer b{color:var(--text)}
+  footer code{font-family:ui-monospace,Consolas,monospace;color:#6b7a91}
+  footer .fh{font-size:13px;color:#8b97a9;font-weight:600;letter-spacing:.5px;margin:0 0 8px}
+  footer p{margin:0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="hero">
+    <h1>制造业经营分析助手</h1>
+    <p class="sub">一个入口 · 三条链路 —— 问制度（知识问答）｜ 问数字（数据问数）｜ 要单据（动作执行）</p>
+    <div class="badge" id="badge"><span class="dot"></span><span id="badgeText">检查服务…</span></div>
+  </div>
+
+  <div class="rolebar">
+    <span class="rlabel">以角色提问</span>
+    <select id="role" title="权限白名单决定这个角色能做什么">
+      <option value="操作员" selected>操作员</option>
+      <option value="主管">主管</option>
+      <option value="管理员">管理员</option>
+    </select>
+    <span class="rolehint" id="rolehint"></span>
+  </div>
+
+  <div class="askbox">
+    <textarea id="q" rows="1" placeholder="例如：给东莞精诚出一份质量整改通知"></textarea>
+    <div class="boxbar">
+      <div class="chips" id="chips"></div>
+      <button class="send" id="go" type="button" title="提问（Enter 发送，Shift+Enter 换行）">➤</button>
+    </div>
+  </div>
+
+  <section id="result"></section>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+"use strict";
+
+/* 示例问题：按三条链路分组，每条前的圆点用链路色标识；
+   动作执行那三条切换到「操作员」会被拒 —— 正好演示权限边界。 */
+const 示例 = [
+  ["知识问答", "采购流程怎么规定的？"],
+  ["知识问答", "不合格批次怎么处理？"],
+  ["数据问数", "上月哪家供应商不良率最高？"],
+  ["数据问数", "低于安全库存的物料有哪些？"],
+  ["数据问数", "这个月怎么样？"],
+  ["动作执行", "给东莞精诚出一份质量整改通知"],
+  ["动作执行", "帮我起草一份补货申请"],
+  ["动作执行", "把本月的不合格明细导出成台账"],
+];
+const 链名 = {知识问答: "l1", 数据问数: "l2", 动作执行: "l3"};
+const 链色 = {知识问答: "var(--l1)", 数据问数: "var(--l2)", 动作执行: "var(--l3)"};
+const 角色说明 = {
+  "操作员": "只读留痕 —— 可导出异常台账；发整改通知会被拒（需要管理员）",
+  "主管":   "内部处置 —— 可导台账、可提补货申请；对外发整改通知会被拒",
+  "管理员": "对外发文 —— 三个动作全部允许，含发给供应商的整改通知",
+};
+
+const $ = (id) => document.getElementById(id);
+const 问 = $("q"), 键 = $("go"), 结果 = $("result"), 徽标 = $("badge"),
+      徽标文字 = $("badgeText"), 底部 = $("foot"), 角色 = $("role"), 角色提示 = $("rolehint");
+
+function 转义(s){ return String(s == null ? "" : s)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+/* 状态徽标：三态（检查中 / 正常 / 异常），异常时给可操作提示，不静默 */
+function 设徽标(态, 文字){
+  徽标.className = "badge" + (态 === "ok" ? " ok" : 态 === "bad" ? " bad" : "");
+  徽标文字.textContent = 文字;
+}
+
+function 刷新角色提示(){
+  角色提示.innerHTML = "当前角色：<b>" + 角色.value + "</b> —— " + 角色说明[角色.value];
+}
+
+/* ---------- 示例 chips ---------- */
+const 容器 = $("chips");
+示例.forEach(function ([链, 文]){
+  const b = document.createElement("span");
+  b.className = "chip";
+  b.title = "预期链路：" + 链
+          + (链 === "动作执行" ? "（切换角色试试：操作员会被拒）" : "");
+  const d = document.createElement("i");
+  d.className = "dot";
+  d.style.background = 链色[链];
+  b.appendChild(d);
+  b.appendChild(document.createTextNode(文));
+  b.addEventListener("click", function (){ 问.value = 文; 问.focus(); 提问(); });
+  容器.appendChild(b);
+});
+
+/* ---------- 服务健康检查 ---------- */
+async function 查健康(){
+  try{
+    const r = await fetch("/health", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const h = await r.json();
+    const 链 = h.链路 || {};
+    const 键集 = Object.keys(链);
+    const 可达 = 键集.filter(function (k){ return 链[k] && 链[k].可达; }).length;
+    const 审 = h.审计 || {};
+    设徽标("ok", "v" + h.版本 + " · 三条链路 " + 可达 + "/" + 键集.length
+           + " 可达 · 审计 " + 审.总条数 + " 条（被拒 " + 审.被拒数 + "）");
+    底部渲染(h);
+    return true;
+  }catch(e){
+    设徽标("bad", "服务异常");
+    底部.innerHTML = '<p style="color:var(--err)">无法读取 /health：' + 转义(e.message)
+      + '。请确认编排服务（8096）已启动。</p>';
+    return false;
+  }
+}
+
+/* 页脚：说明「这个入口在做什么」+ 实时健康明细（对照 8092 页脚的写法） */
+function 底部渲染(h){
+  const 链 = h.链路 || {}, 词 = h.路由确定性 || {};
+  const 键集 = Object.keys(链);
+  const 可达 = 键集.filter(function (k){ return 链[k] && 链[k].可达; }).length;
+  let s = '<p class="fh">这个入口在做什么</p>';
+  s += '· <b>知识问答</b>：答「制度 / 流程 / 规定怎么写的」，依据是公司制度文档（检索 + 重排 + 拒答）。<br>';
+  s += '· <b>数据问数</b>：答「某个数字是多少」，依据是供应链与生产数据库；<b>模型不写 SQL</b>，'
+     + '只把中文问句转成槽位，SQL 由语义层确定性拼出。<br>';
+  s += '· <b>动作执行</b>：把分析结果落成业务单据草稿（整改通知 / 补货申请 / 异常台账）。'
+     + '<b>单据里的数字必须来自真实查询</b>，所以会先取数、再成文 —— 这就是多步（ReAct）存在的原因。<br>';
+  s += '· 路由<b>确定性优先</b>：关键词与规则先判；判不出才交模型，并在「路由依据」里标明是哪种。<br>';
+  s += '· <b>权限白名单</b>：动作执行按<b>角色</b>分档 —— 操作员只能导台账、主管可提补货申请、'
+     + '管理员才能对外发整改通知。<b>越权是硬拒（HTTP 403）：不生成任何单据</b>，而不是悄悄降级成一次查询。<br>';
+  s += '· <b>审计留痕</b>：每次动作调用（<b>含被拒的</b>）都写一行 JSONL —— '
+     + '白名单只防「不许做的事」，留痕才防「做了但做错的事」。';
+  s += '<p style="margin:12px 0 0">服务 v' + h.版本 + ' · 端口 ' + h.端口
+     + ' ｜ 链路 ' + 可达 + '/' + 键集.length + ' 可达'
+     + ' ｜ 路由词表：制度词 ' + 词.制度词 + ' · 时间词 ' + 词.时间词
+     + ' · 动作动词 ' + 词.动作动词 + ' ｜ 可执行动作 ' + (h.动作 || []).length + ' 个</p>';
+  底部.innerHTML = s;
+}
+
+/* ---------- 提问 ---------- */
+async function 提问(){
+  const 问题 = 问.value.trim();
+  if (!问题) return;
+
+  /* 🔴 发问即清空输入框（沿用作品一 2026-10-10 的同一条修复）：清空动作放在请求**之前**，
+     无论成功 / 失败 / 超时都不残留；问句本身已显示在结果卡的 q-line 里。 */
+  问.value = "";
+  问.style.height = "auto";
+
+  键.disabled = true;
+  结果.innerHTML = '<div class="loading"><div class="spinner"></div>正在路由并执行…'
+                 + '（动作链路要走取数 + 成文两步，约 5–10 秒）</div>';
+  const 起 = performance.now();
+  try{
+    const r = await fetch("/ask", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 问题: 问题, 角色: 角色.value })
+    });
+    const d = await r.json();
+    /* 🔴 403 是「越权」这一**业务结论**，不是请求失败 —— 它同样带完整应答
+       （路由 / 轨迹 / 拒绝理由），必须照常渲染。
+       把它当异常弹掉，页面就丢掉了最关键的信息：谁、想做什么、为什么不行。 */
+    if (r.status === 403){ 结果.innerHTML = ""; 渲染(问题, d, performance.now() - 起); return; }
+    if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+    结果.innerHTML = "";
+    渲染(问题, d, performance.now() - 起);
+  }catch(e){
+    结果.innerHTML = "";
+    结果.appendChild(错误卡("请求失败", "服务返回：" + e.message
+      + "　—— 若为下游相关错误，请确认 8092 知识库 / 8095 问数 / 8000 生成端均已启动。"));
+  }finally{
+    键.disabled = false;
+    问.focus();
+  }
+}
+
+function 错误卡(标题, 说明){
+  const 盒 = document.createElement("div");
+  盒.className = "errbox";
+  const 图 = document.createElement("div");
+  图.style.flex = "none"; 图.style.fontSize = "17px"; 图.style.lineHeight = "1.4";
+  图.textContent = "⛔";
+  const 文 = document.createElement("div");
+  const h = document.createElement("p"); h.className = "t"; h.textContent = 标题;
+  const p = document.createElement("p"); p.className = "d"; p.textContent = 说明;
+  文.appendChild(h); 文.appendChild(p);
+  盒.appendChild(图); 盒.appendChild(文);
+  return 盒;
+}
+
+/* ---------- 渲染结果 ---------- */
+function 渲染(问题, d, 毫秒){
+  const 路 = d.路由 || {};
+  const 类 = 链名[d.类型] || "";
+  const 依 = 路.依据 || "?";
+  /* 「确定性-动作嫌疑」是**猜出来的**，不能和真规则一样标绿 ——
+     否则「改判」在界面上看起来跟「规则直接判对」一模一样。 */
+  const 依类 = (依.indexOf("确定性") === 0 && 依 !== "确定性-动作嫌疑")
+    ? "p-ok" : (依 === "强制" ? "p-plain" : "p-warn");
+  const 权 = d.权限 || {};
+  let h = '<div class="card">';
+  h += '<p class="q-line"><b>' + 转义(问题) + '</b></p>';
+  h += '<div class="lane">'
+     + '<span class="pill p-' + 类 + '">' + 转义(d.类型) + '</span>'
+     + '<span class="pill ' + 依类 + '">路由依据：' + 转义(依) + '</span>'
+     + '<span class="pill ' + (d.被拒 ? 'p-bad' : 'p-plain') + '">角色：'
+     + 转义(权.角色 || 角色.value) + (d.被拒 ? ' · 越权' : '') + '</span>'
+     + '<span class="pill p-plain">' + (毫秒 / 1000).toFixed(2) + ' s</span>'
+     + '</div>';
+  /* 🔴 越权**单独一块红框、放在答案之前** —— 与「依据不切题」同理：
+     这类问题的特点是「表面上没有任何异常」，混在正文里就没人会注意到。 */
+  if (d.被拒){
+    h += '<div class="deny"><div style="flex:none;font-size:17px;line-height:1.4">🚫</div><div>'
+       + '<p class="t">权限不足，未生成任何单据。</p>'
+       + '<p class="d">' + 转义(权.拒绝理由 || "—")
+       + '<br>（换一个有此权限的角色再试，或改走只读链路先查数据。HTTP 403 —— 这次调用已进审计。）</p>'
+       + '</div></div>';
+  }
+  /* 改判（疑似动作）：同样放在答案之前。
+     这类问题的特点是「改判前后都看不出来」—— 改对了，用户以为原话就够了；
+     改错了，用户以为查到了数。两种都得让他看见这一块。 */
+  if (路.改判){
+    const 嫌 = 路.动作嫌疑 || {};
+    h += '<div class="notice"><div style="flex:none;font-size:17px;line-height:1.4">↪</div><div>'
+       + '<p class="t">已按「动作执行」处理（原判只会返回数据）</p>'
+       + '<p class="d">这句里没有「出一份 / 起草」这类明确说法，但提到了动作类词汇「'
+       + 转义((嫌.证据 || []).join("、"))
+       + '」。原判「' + 转义(路.改判.原链路 || "?") + '（' + 转义(路.改判.原依据 || "?")
+       + '）」只会给出一个数字、不生成单据。<br>'
+       + '（如果你只想查数，请改用「…是多少」的问法。）</p>'
+       + '</div></div>';
+  }
+  h += '<p class="ans">' + 转义(d.回答) + '</p>';
+  h += '<div class="why"><b>为什么走这条链路：</b>' + 转义(路.理由 || "—");
+  const 命 = 路.命中 || {};
+  const 片 = [];
+  ["动作动词", "动作名词", "制度词", "时间词"].forEach(function (k){
+    if ((命[k] || []).length) 片.push(k + "「" + 命[k].join("、") + "」");
+  });
+  if (命["元问题短语"]) 片.push("元问题短语「" + 命["元问题短语"] + "」");
+  if ((命["数据词"] || []).length) 片.push("数据词「" + 命["数据词"].slice(0, 6).join("、") + "」");
+  if (片.length) h += '<br><b>命中的词：</b>' + 转义(片.join("；"));
+  h += '</div>';
+  h += '</div>';
+
+  /* 执行轨迹（动作链路才有） */
+  if ((d.步骤 || []).length){
+    h += '<div class="card"><h2>执行轨迹（' + d.步骤.length + ' 步 · 手写 ReAct）</h2>';
+    d.步骤.forEach(function (s){
+      h += '<div class="step"><div class="h">第 ' + s.步 + ' 步 · ' + 转义(s.动作)
+         + (s.编排层补步 ? ' <span class="pill p-warn">编排层补的一步</span>' : '')
+         + (s.被拒 ? ' <span class="pill p-bad">越权被拒</span>' : '')
+         + (s.退回重查 ? ' <span class="pill p-warn">依据不切题 · 退回重查</span>' : '')
+         + '</div>'
+         + '<div class="o">参数：' + 转义(JSON.stringify(s.参数 || {})) + '</div>'
+         + '<div class="o">观察：' + 转义(s.观察) + '</div>'
+         + (s.思考 ? '<div class="o">思考：' + 转义(s.思考) + '</div>' : '')
+         + '</div>';
+    });
+    h += '</div>';
+  }
+
+  /* 产出单据 */
+  if (d.产物){
+    h += '<div class="card"><h2>产出单据</h2><div class="out">'
+       + 转义(d.产物.摘要) + '<br>文件：<code>' + 转义(d.产物.路径) + '</code></div></div>';
+  }
+
+  /* 底层链路的原始应答（折叠） */
+  const 底 = d.依据;
+  if (底){
+    h += '<div class="card"><details><summary>底层链路的原始应答（' + 转义(d.类型) + '）</summary>'
+       + '<pre>' + 转义(JSON.stringify(底, null, 1)) + '</pre></details></div>';
+  }
+  if (d.错误){
+    h += '<div class="card"><span class="pill p-bad">链路错误</span> '
+       + '<span style="color:var(--muted)">' + 转义(d.错误) + '</span></div>';
+  }
+  结果.innerHTML = h;
+}
+
+/* ---------- 交互绑定 ---------- */
+角色.addEventListener("change", 刷新角色提示);
+刷新角色提示();
+
+键.addEventListener("click", 提问);
+问.addEventListener("keydown", function (e){
+  if (e.key === "Enter" && !e.shiftKey){ e.preventDefault(); 提问(); }
+});
+问.addEventListener("input", function (){
+  问.style.height = "auto";
+  问.style.height = Math.min(问.scrollHeight, 180) + "px";
+});
+
+问.focus();
+查健康();
+</script>
+</body>
+</html>

@@ -436,7 +436,7 @@ def 生成报告(结果集, 输出路径):
 
 def 主函数():
     参数 = sys.argv[1:]
-    默认目录 = r"D:\Ivan-File\10-LocalAI-Installer\models"
+    默认目录 = r"D:\workspace\10-LocalAI-Installer\models"
 
     目标文件 = []
     if 参数:

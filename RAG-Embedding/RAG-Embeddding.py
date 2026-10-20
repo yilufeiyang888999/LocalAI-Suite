@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RAG Embedding 知识地图 SVG 生成器
+生成包含 Embedding、向量数据库、RAG流程等知识的可视化图表
+"""
+
+import os
+import sys
+
+
+def generate_svg():
+    """生成SVG内容"""
+    return '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1800" width="1000" height="1800">
+  <defs>
+    <!-- 阴影滤镜 -->
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+      <feDropShadow dx="2" dy="3" stdDeviation="3" flood-opacity="0.15"/>
+    </filter>
+    <!-- 箭头标记 -->
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+    </marker>
+    <!-- 渐变背景 -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#f8fafc;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#f1f5f9;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- 背景 -->
+  <rect width="1000" height="1800" fill="url(#bgGrad)"/>
+
+  <!-- ========== 标题 ========== -->
+  <text x="500" y="50" font-family="system-ui, -apple-system, sans-serif" font-size="32" font-weight="bold" text-anchor="middle" fill="#1e293b">
+    Embedding 与向量数据库 · 完整知识地图
+  </text>
+  <text x="500" y="80" font-family="system-ui, -apple-system, sans-serif" font-size="16" text-anchor="middle" fill="#64748b">
+    从文本到语义检索的 RAG 全流程
+  </text>
+
+  <!-- ========== 第一模块：Embedding 是什么 ========== -->
+  <g transform="translate(0, 110)">
+    <!-- 模块标题 -->
+    <rect x="50" y="0" width="900" height="40" rx="8" fill="#3b82f6" filter="url(#shadow)"/>
+    <text x="500" y="28" font-family="system-ui" font-size="18" font-weight="bold" text-anchor="middle" fill="white">① Embedding（嵌入）—— 语义的"翻译官"</text>
+
+    <!-- 输入卡片 -->
+    <rect x="80" y="70" width="200" height="100" rx="12" fill="#dbeafe" stroke="#3b82f6" stroke-width="2" filter="url(#shadow)"/>
+    <text x="180" y="100" font-family="system-ui" font-size="16" font-weight="bold" text-anchor="middle" fill="#1e40af">非结构化数据</text>
+    <text x="180" y="125" font-family="system-ui" font-size="13" text-anchor="middle" fill="#3b82f6">文本 / 图片 / 视频</text>
+    <text x="180" y="145" font-family="system-ui" font-size="13" text-anchor="middle" fill="#3b82f6">音频 / 代码</text>
+
+    <!-- 箭头：输入 → 模型 -->
+    <line x1="280" y1="120" x2="370" y2="120" stroke="#64748b" stroke-width="3" marker-end="url(#arrowhead)"/>
+    <text x="325" y="112" font-family="system-ui" font-size="12" text-anchor="middle" fill="#64748b">送入</text>
+
+    <!-- 模型卡片 -->
+    <rect x="380" y="70" width="240" height="100" rx="12" fill="#eff6ff" stroke="#3b82f6" stroke-width="2" filter="url(#shadow)"/>
+    <text x="500" y="100" font-family="system-ui" font-size="16" font-weight="bold" text-anchor="middle" fill="#1e40af">Embedding 模型</text>
+    <text x="500" y="125" font-family="system-ui" font-size="13" text-anchor="middle" fill="#3b82f6">BGE-m3 / OpenAI</text>
+    <text x="500" y="145" font-family="system-ui" font-size="13" text-anchor="middle" fill="#3b82f6">text-embedding-3</text>
+
+    <!-- 箭头：模型 → 向量 -->
+    <line x1="620" y1="120" x2="710" y2="120" stroke="#64748b" stroke-width="3" marker-end="url(#arrowhead)"/>
+    <text x="665" y="112" font-family="system-ui" font-size="12" text-anchor="middle" fill="#64748b">编码为</text>
+
+    <!-- 输出卡片 -->
+    <rect x="720" y="70" width="200" height="100" rx="12" fill="#dbeafe" stroke="#3b82f6" stroke-width="2" filter="url(#shadow)"/>
+    <text x="820" y="100" font-family="system-ui" font-size="16" font-weight="bold" text-anchor="middle" fill="#1e40af">高维向量</text>
+    <text x="820" y="125" font-family="system-ui" font-size="13" text-anchor="middle" fill="#3b82f6">768维 / 1024维</text>
+    <text x="820" y="145" font-family="system-ui" font-size="13" text-anchor="middle" fill="#3b82f6">1536维 浮点数</text>
+
+    <!-- 核心结论 -->
+    <rect x="150" y="190" width="700" height="40" rx="8" fill="#eff6ff" stroke="#bfdbfe" stroke-width="1"/>
+    <text x="500" y="215" font-family="system-ui" font-size="15" text-anchor="middle" fill="#1e40af">
+      💡 核心作用：把「语义」翻译成「数字坐标」，语义相近 = 向量方向相近
+    </text>
+  </g>
+
+  <!-- ========== 第二模块：相似度计算 ========== -->
+  <g transform="translate(0, 380)">
+    <!-- 模块标题 -->
+    <rect x="50" y="0" width="900" height="40" rx="8" fill="#8b5cf6" filter="url(#shadow)"/>
+    <text x="500" y="28" font-family="system-ui" font-size="18" font-weight="bold" text-anchor="middle" fill="white">② 相似度计算—— 余弦相似度 vs 欧几里得距离</text>
+
+    <!-- 余弦相似度卡片 -->
+    <rect x="80" y="60" width="380" height="130" rx="12" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2" filter="url(#shadow)"/>
+    <text x="270" y="88" font-family="system-ui" font-size="17" font-weight="bold" text-anchor="middle" fill="#5b21b6">✅ 余弦相似度 Cosine Similarity</text>
+    <text x="270" y="115" font-family="system-ui" font-size="14" text-anchor="middle" fill="#7c3aed">公式：cos(θ) = (A·B) / (||A|| × ||B||)</text>
+    <text x="270" y="140" font-family="system-ui" font-size="14" text-anchor="middle" fill="#7c3aed">只关心「方向」是否一致</text>
+    <text x="270" y="165" font-family="system-ui" font-size="14" text-anchor="middle" fill="#5b21b6" font-weight="bold">→ 适合语义搜索！</text>
+
+    <!-- 欧几里得距离卡片 -->
+    <rect x="520" y="60" width="380" height="130" rx="12" fill="#fef2f2" stroke="#ef4444" stroke-width="2" filter="url(#shadow)"/>
+    <text x="710" y="88" font-family="system-ui" font-size="17" font-weight="bold" text-anchor="middle" fill="#991b1b">❌ 欧几里得距离 Euclidean</text>
+    <text x="710" y="115" font-family="system-ui" font-size="14" text-anchor="middle" fill="#dc2626">公式：√Σ(Ai - Bi)²</text>
+    <text x="710" y="140" font-family="system-ui" font-size="14" text-anchor="middle" fill="#dc2626">关心「绝对距离」远近</text>
+    <text x="710" y="165" font-family="system-ui" font-size="14" text-anchor="middle" fill="#991b1b" font-weight="bold">→ 受文本长度影响大</text>
+
+    <!-- 对比说明 -->
+    <rect x="150" y="210" width="700" height="45" rx="8" fill="#faf5ff" stroke="#ddd6fe" stroke-width="1"/>
+    <text x="500" y="238" font-family="system-ui" font-size="15" text-anchor="middle" fill="#5b21b6">
+      🎯 语义搜索选余弦：100字摘要 和 1000字报告 可能说的是同一件事，方向一致即可
+    </text>
+  </g>
+
+  <!-- ========== 第三模块：存储层组合拳 ========== -->
+  <g transform="translate(0, 660)">
+    <!-- 模块标题 -->
+    <rect x="50" y="0" width="900" height="40" rx="8" fill="#f59e0b" filter="url(#shadow)"/>
+    <text x="500" y="28" font-family="system-ui" font-size="18" font-weight="bold" text-anchor="middle" fill="white">③ 存储层组合拳 —— 关系数据库 + 向量数据库</text>
+
+    <!-- 关系数据库 -->
+    <rect x="80" y="60" width="360" height="140" rx="12" fill="#fffbeb" stroke="#f59e0b" stroke-width="2" filter="url(#shadow)"/>
+    <text x="260" y="88" font-family="system-ui" font-size="17" font-weight="bold" text-anchor="middle" fill="#92400e">🗄️ 关系数据库（如MySQL/PostgreSQL）</text>
+    <text x="260" y="115" font-family="system-ui" font-size="14" text-anchor="middle" fill="#b45309">• 精确条件过滤（WHERE）</text>
+    <text x="260" y="138" font-family="system-ui" font-size="14" text-anchor="middle" fill="#b45309">• 存储元数据：标题/时间/级别</text>
+    <text x="260" y="161" font-family="system-ui" font-size="14" text-anchor="middle" fill="#b45309">• B+树索引加速精确查询</text>
+    <text x="260" y="184" font-family="system-ui" font-size="14" text-anchor="middle" fill="#92400e" font-weight="bold">→ 运维成熟，技术债最小</text>
+
+    <!-- 加号 -->
+    <circle cx="500" cy="130" r="22" fill="#f3f4f6" stroke="#9ca3af" stroke-width="2"/>
+    <text x="500" y="138" font-family="system-ui" font-size="24" font-weight="bold" text-anchor="middle" fill="#4b5563">+</text>
+
+    <!-- 向量数据库 -->
+    <rect x="560" y="60" width="360" height="140" rx="12" fill="#ecfdf5" stroke="#10b981" stroke-width="2" filter="url(#shadow)"/>
+    <text x="740" y="88" font-family="system-ui" font-size="17" font-weight="bold" text-anchor="middle" fill="#065f46">🔍 向量数据库（Milvus/Qdrant）</text>
+    <text x="740" y="115" font-family="system-ui" font-size="14" text-anchor="middle" fill="#059669">• 高维向量存储（768/1536维）</text>
+    <text x="740" y="138" font-family="system-ui" font-size="14" text-anchor="middle" fill="#059669">• ANN近似最近邻搜索</text>
+    <text x="740" y="161" font-family="system-ui" font-size="14" text-anchor="middle" fill="#059669">• HNSW / IVF 索引加速</text>
+    <text x="740" y="184" font-family="system-ui" font-size="14" text-anchor="middle" fill="#065f46" font-weight="bold">→ 语义检索，海量秒查</text>
+
+    <!-- 配合流程 -->
+    <rect x="150" y="220" width="700" height="45" rx="8" fill="#f0fdf4" stroke="#bbf7d0" stroke-width="1"/>
+    <text x="500" y="248" font-family="system-ui" font-size="15" text-anchor="middle" fill="#065f46">
+      🔗 配合公式：关系数据库先精确过滤（如"2024年P0级"）→ 向量库在子集里搜语义
+    </text>
+  </g>
+
+  <!-- ========== 第四模块：RAG 完整流程 ========== -->
+  <g transform="translate(0, 960)">
+    <!-- 模块标题 -->
+    <rect x="50" y="0" width="900" height="40" rx="8" fill="#10b981" filter="url(#shadow)"/>
+    <text x="500" y="28" font-family="system-ui" font-size="18" font-weight="bold" text-anchor="middle" fill="white">④ RAG 完整流程 —— 检索增强生成</text>
+
+    <!-- 流程节点：横向排列 -->
+    <!-- 节点1：用户查询 -->
+    <rect x="60" y="60" width="130" height="70" rx="10" fill="#fee2e2" stroke="#ef4444" stroke-width="2" filter="url(#shadow)"/>
+    <text x="125" y="85" font-family="system-ui" font-size="14" font-weight="bold" text-anchor="middle" fill="#991b1b">用户提问</text>
+    <text x="125" y="110" font-family="system-ui" font-size="12" text-anchor="middle" fill="#dc2626">"数据库连不上"</text>
+
+    <line x1="190" y1="95" x2="230" y2="95" stroke="#64748b" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+    <!-- 节点2：Embedding -->
+    <rect x="240" y="60" width="130" height="70" rx="10" fill="#dbeafe" stroke="#3b82f6" stroke-width="2" filter="url(#shadow)"/>
+    <text x="305" y="85" font-family="system-ui" font-size="14" font-weight="bold" text-anchor="middle" fill="#1e40af">Embedding</text>
+    <text x="305" y="110" font-family="system-ui" font-size="12" text-anchor="middle" fill="#3b82f6">编码为向量</text>
+
+    <line x1="370" y1="95" x2="410" y2="95" stroke="#64748b" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+    <!-- 节点3：向量检索 -->
+    <rect x="420" y="60" width="130" height="70" rx="10" fill="#ecfdf5" stroke="#10b981" stroke-width="2" filter="url(#shadow)"/>
+    <text x="485" y="85" font-family="system-ui" font-size="14" font-weight="bold" text-anchor="middle" fill="#065f46">向量数据库</text>
+    <text x="485" y="110" font-family="system-ui" font-size="12" text-anchor="middle" fill="#059669">ANN 搜索 TopK</text>
+
+    <line x1="550" y1="95" x2="590" y2="95" stroke="#64748b" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+    <!-- 节点4：回查元数据 -->
+    <rect x="600" y="60" width="130" height="70" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="2" filter="url(#shadow)"/>
+    <text x="665" y="85" font-family="system-ui" font-size="14" font-weight="bold" text-anchor="middle" fill="#92400e">关系数据库</text>
+    <text x="665" y="110" font-family="system-ui" font-size="12" text-anchor="middle" fill="#b45309">ID回查元数据</text>
+
+    <line x1="730" y1="95" x2="770" y2="95" stroke="#64748b" stroke-width="2" marker-end="url(#arrowhead)"/>
+
+    <!-- 节点5：LLM生成 -->
+    <rect x="780" y="60" width="130" height="70" rx="10" fill="#f5f3ff" stroke="#8b5cf6" stroke-width="2" filter="url(#shadow)"/>
+    <text x="845" y="85" font-family="system-ui" font-size="14" font-weight="bold" text-anchor="middle" fill="#5b21b6">LLM大模型</text>
+    <text x="845" y="110" font-family="system-ui" font-size="12" text-anchor="middle" fill="#7c3aed">生成最终回答</text>
+
+    <!-- 流程说明文字 -->
+    <text x="125" y="155" font-family="system-ui" font-size="12" text-anchor="middle" fill="#64748b">① 输入问题</text>
+    <text x="305" y="155" font-family="system-ui" font-size="12" text-anchor="middle" fill="#64748b">② 语义编码</text>
+    <text x="485" y="155" font-family="system-ui" font-size="12" text-anchor="middle" fill="#64748b">③ 相似度检索</text>
+    <text x="665" y="155" font-family="system-ui" font-size="12" text-anchor="middle" fill="#64748b">④ 补全信息</text>
+    <text x="845" y="155" font-family="system-ui" font-size="12" text-anchor="middle" fill="#64748b">⑤ 生成答案</text>
+  </g>
+
+  <!-- ========== 第五模块：HNSW 索引原理 ========== -->
+  <g transform="translate(0, 1160)">
+    <!-- 模块标题 -->
+    <rect x="50" y="0" width="900" height="40" rx="8" fill="#0ea5e9" filter="url(#shadow)"/>
+    <text x="500" y="28" font-family="system-ui" font-size="18" font-weight="bold" text-anchor="middle" fill="white">⑤ HNSW 索引原理 —— "分层导航，先跳后走"</text>
+
+    <!-- 三层示意图 -->
+    <!-- 第0层（顶层，最稀疏） -->
+    <rect x="100" y="60" width="800" height="50" rx="8" fill="#e0f2fe" stroke="#0ea5e9" stroke-width="1"/>
+    <text x="140" y="75" font-family="system-ui" font-size="14" font-weight="bold" fill="#0369a1">第0层（顶层）</text>
+    <text x="140" y="95" font-family="system-ui" font-size="12" fill="#0284c7">只放少量"地标"节点，一跳跨越整个数据空间</text>
+    <!-- 地标点 -->
+    <circle cx="300" cy="85" r="8" fill="#0ea5e9"/>
+    <circle cx="500" cy="85" r="8" fill="#0ea5e9"/>
+    <circle cx="700" cy="85" r="8" fill="#0ea5e9"/>
+    <circle cx="850" cy="85" r="8" fill="#0ea5e9"/>
+    <line x1="300" y1="85" x2="500" y2="85" stroke="#0ea5e9" stroke-width="2" stroke-dasharray="5,3"/>
+    <line x1="500" y1="85" x2="700" y2="85" stroke="#0ea5e9" stroke-width="2" stroke-dasharray="5,3"/>
+    <line x1="700" y1="85" x2="850" y2="85" stroke="#0ea5e9" stroke-width="2" stroke-dasharray="5,3"/>
+
+    <!-- 向下箭头 -->
+    <line x1="500" y1="110" x2="500" y2="130" stroke="#64748b" stroke-width="2" marker-end="url(#arrowhead)"/>
+    <text x="515" y="125" font-family="system-ui" font-size="12" fill="#64748b">找到最近地标</text>
+
+    <!-- 第1层（中层） -->
+    <rect x="100" y="140" width="800" height="50" rx="8" fill="#bae6fd" stroke="#0ea5e9" stroke-width="1"/>
+    <text x="140" y="155" font-family="system-ui" font-size="14" font-weight="bold" fill="#0369a1">第1层（中层）</text>
+    <text x="140" y="175" font-family="system-ui" font-size="12" fill="#0284c7">每个地标下挂更多节点，缩小范围</text>
+    <!-- 更多点 -->
+    <circle cx="350" cy="165" r="6" fill="#38bdf8"/>
+    <circle cx="420" cy="165" r="6" fill="#38bdf8"/>
+    <circle cx="480" cy="165" r="6" fill="#38bdf8"/>
+    <circle cx="550" cy="165" r="6" fill="#38bdf8"/>
+    <circle cx="620" cy="165" r="6" fill="#38bdf8"/>
+    <line x1="350" y1="165" x2="420" y2="165" stroke="#38bdf8" stroke-width="1"/>
+    <line x1="420" y1="165" x2="480" y2="165" stroke="#38bdf8" stroke-width="1"/>
+    <line x1="480" y1="165" x2="550" y2="165" stroke="#38bdf8" stroke-width="1"/>
+    <line x1="550" y1="165" x2="620" y2="165" stroke="#38bdf8" stroke-width="1"/>
+
+    <!-- 向下箭头 -->
+    <line x1="500" y1="190" x2="500" y2="210" stroke="#64748b" stroke-width="2" marker-end="url(#arrowhead)"/>
+    <text x="515" y="205" font-family="system-ui" font-size="12" fill="#64748b">逐层下沉</text>
+
+    <!-- 第2层（底层，最密集） -->
+    <rect x="100" y="220" width="800" height="50" rx="8" fill="#7dd3fc" stroke="#0ea5e9" stroke-width="1"/>
+    <text x="140" y="235" font-family="system-ui" font-size="14" font-weight="bold" fill="#0369a1">第2层（底层）</text>
+    <text x="140" y="255" font-family="system-ui" font-size="12" fill="#0369a1">全部节点，精细搜索最终目标</text>
+    <!-- 密集点 -->
+    <circle cx="380" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="400" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="420" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="440" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="460" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="480" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="500" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="520" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="540" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="560" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="580" cy="245" r="4" fill="#0284c7"/>
+    <circle cx="600" cy="245" r="4" fill="#0284c7"/>
+
+    <!-- 核心结论 -->
+    <rect x="150" y="290" width="700" height="40" rx="8" fill="#f0f9ff" stroke="#bae6fd" stroke-width="1"/>
+    <text x="500" y="315" font-family="system-ui" font-size="15" text-anchor="middle" fill="#0369a1">
+      🚀 效果：搜索复杂度从 O(n) 降到 O(log n)，亿级向量也能毫秒级响应
+    </text>
+  </g>
+
+  <!-- ========== 底部：助记符汇总 ========== -->
+  <g transform="translate(0, 1530)">
+    <rect x="50" y="0" width="900" height="220" rx="12" fill="#f8fafc" stroke="#e2e8f0" stroke-width="2" filter="url(#shadow)"/>
+    <text x="500" y="35" font-family="system-ui" font-size="20" font-weight="bold" text-anchor="middle" fill="#1e293b">🧠 助记符汇总（建议截图保存）</text>
+
+    <text x="80" y="70" font-family="system-ui" font-size="16" fill="#1e293b">1️⃣</text>
+    <text x="110" y="70" font-family="system-ui" font-size="15" fill="#334155">Embedding 做翻译，把语义变数字</text>
+
+    <text x="80" y="100" font-family="system-ui" font-size="16" fill="#1e293b">2️⃣</text>
+    <text x="110" y="100" font-family="system-ui" font-size="15" fill="#334155">余弦看方向，欧几里得看距离（语义搜索选余弦）</text>
+
+    <text x="80" y="130" font-family="system-ui" font-size="16" fill="#1e293b">3️⃣</text>
+    <text x="110" y="130" font-family="system-ui" font-size="15" fill="#334155">关系数据库筛条件，向量库 HNSW 秒级导航</text>
+
+    <text x="80" y="160" font-family="system-ui" font-size="16" fill="#1e293b">4️⃣</text>
+    <text x="110" y="160" font-family="system-ui" font-size="15" fill="#334155">RAG 五步走：提问 → Embedding → 向量检索 → 元数据回查 → LLM生成</text>
+
+    <text x="80" y="190" font-family="system-ui" font-size="16" fill="#1e293b">5️⃣</text>
+    <text x="110" y="190" font-family="system-ui" font-size="15" fill="#334155">HNSW 像地图导航：先上高速（顶层地标）→ 再下街道（底层精细）</text>
+  </g>
+
+  <!-- 页脚 -->
+  <text x="500" y="1780" font-family="system-ui" font-size="13" text-anchor="middle" fill="#94a3b8">
+    Embedding &amp; Vector DB 知识地图 · 适合打印或设为桌面参考
+  </text>
+</svg>'''
+
+
+def save_svg(svg_content, output_filename='embedding_vector_db_flowchart.svg'):
+    """保存SVG文件"""
+    try:
+        # 获取脚本所在目录
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        output_path = os.path.join(script_dir, output_filename)
+        
+        # 确保目录存在
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # 写入文件
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(svg_content)
+        
+        return output_path
+    except Exception as e:
+        print(f"❌ 保存文件失败: {e}")
+        sys.exit(1)
+
+
+def main():
+    """主函数"""
+    # 生成SVG内容
+    svg_content = generate_svg()
+    
+    # 保存文件
+    output_path = save_svg(svg_content)
+    
+    # 输出信息
+    print(f"✅ SVG流程图已生成！")
+    print(f"📁 文件路径: {output_path}")
+    print(f"📊 尺寸: 1000 x 1800 像素")
+    print(f"\n流程图包含以下模块:")
+    print("   ① Embedding 语义翻译层")
+    print("   ② 余弦相似度 vs 欧几里得距离对比")
+    print("   ③ 关系数据库 + 向量数据库组合拳")
+    print("   ④ RAG 完整五步走流程")
+    print("   ⑤ HNSW 分层导航原理图")
+    print("   ⑥ 底部助记符汇总（可截图保存）")
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>企业知识库问答 · 制造业质量与工艺文档</title>
+<style>
+  :root{
+    --bg:#f4f6f9; --panel:#ffffff; --line:#e4e9f0; --text:#16202c; --muted:#66748a;
+    --accent:#1d4ed8; --accent-soft:#eef3ff;
+    --ok:#0f766e; --ok-soft:#e7f6f3;
+    --warn:#8a6100; --warn-soft:#fff8e6; --warn-line:#f0c14b;
+    --err:#b42318; --err-soft:#fef3f2; --err-line:#f3c3bf;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font:15px/1.7 "Microsoft YaHei","PingFang SC","Hiragino Sans GB",system-ui,-apple-system,"Segoe UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:960px;margin:0 auto;padding:0 20px 72px}
+
+  /* ---------- 居中标题区（对照 2026-10-10 截图样式） ---------- */
+  .hero{
+    text-align:center;padding:72px 12px 34px;
+  }
+  .hero h1{
+    font-size:40px;margin:0 0 12px;font-weight:700;letter-spacing:2px;color:#1c2431;
+  }
+  .hero .sub{margin:0;color:var(--muted);font-size:14.5px;letter-spacing:.5px}
+
+  /* 状态徽标：三态（检查中 / 正常 / 异常），异常时给可操作提示，不静默 */
+  .badge{
+    display:inline-flex;align-items:center;gap:7px;padding:6px 14px;border-radius:999px;
+    font-size:12.5px;background:#eef1f5;color:var(--muted);border:1px solid transparent;
+    margin-top:20px;white-space:nowrap;
+  }
+  .badge .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+  .badge.ok{background:var(--ok-soft);color:var(--ok)}
+  .badge.bad{background:var(--err-soft);color:var(--err)}
+  .badge small{color:inherit;opacity:.75}
+
+  /* ---------- 大输入框（chips 内嵌 + 右下发送键） ---------- */
+  .askbox{
+    max-width:780px;margin:6px auto 0;background:var(--panel);
+    border:1px solid #c9d6f0;border-radius:16px;padding:14px 16px 12px;
+    box-shadow:0 6px 22px rgba(29,78,216,.07);transition:border-color .15s,box-shadow .15s;
+  }
+  .askbox:focus-within{border-color:var(--accent);box-shadow:0 6px 26px rgba(29,78,216,.13)}
+  textarea{
+    display:block;width:100%;border:0;outline:0;resize:none;background:transparent;color:inherit;
+    font:15.5px/1.7 inherit;font-family:inherit;min-height:58px;max-height:180px;padding:2px 2px 0;
+  }
+  textarea::placeholder{color:#9aa6b8}
+  .boxbar{display:flex;align-items:center;gap:10px;margin-top:6px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;flex:1;min-width:0}
+  .chip{
+    border:1px solid var(--line);background:#fbfcfe;color:var(--muted);
+    padding:4px 11px;border-radius:8px;font-size:12px;cursor:pointer;
+    transition:all .15s;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .chip:hover{border-color:#b9c9ef;color:var(--accent);background:var(--accent-soft)}
+  .chip.kw{border-color:#cdd9f2;color:var(--accent);background:var(--accent-soft)}
+  button.send{
+    flex:none;width:44px;height:44px;border:0;border-radius:12px;cursor:pointer;
+    background:var(--accent);color:#fff;font-size:18px;line-height:1;
+    display:grid;place-items:center;transition:opacity .15s,transform .1s;
+  }
+  button.send:hover:not(:disabled){opacity:.9}
+  button.send:active:not(:disabled){transform:scale(.96)}
+  button.send:disabled{opacity:.45;cursor:not-allowed}
+
+  /* ---------- 结果区 ---------- */
+  #result{max-width:900px;margin:34px auto 0}
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:20px 22px;box-shadow:0 1px 2px rgba(20,30,50,.04);
+  }
+  .card + .card{margin-top:14px}
+  .q-line{
+    font-size:13px;color:var(--muted);margin:0 0 12px;padding-left:11px;
+    border-left:3px solid #d7e0ef;
+  }
+  .q-line b{color:var(--text);font-weight:600}
+  .answer{font-size:16px;line-height:1.85;margin:0;white-space:pre-wrap;word-break:break-word}
+  .meta{
+    margin:14px 0 0;padding-top:12px;border-top:1px dashed var(--line);
+    font-size:12.5px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap;
+  }
+  .meta .k{color:#93a0b3}
+
+  /* 拒答态 */
+  .refusal{
+    display:flex;gap:11px;align-items:flex-start;background:var(--warn-soft);
+    border:1px solid var(--warn-line);border-radius:10px;padding:13px 15px;
+  }
+  .refusal .icon{flex:none;font-size:17px;line-height:1.4}
+  .refusal .t{font-weight:600;color:var(--warn);margin:0 0 3px;font-size:14px}
+  .refusal .d{margin:0;font-size:13px;color:#6b5a2a;line-height:1.65}
+  .refusal .note{
+    margin:12px 0 0;font-size:14.5px;color:var(--text);
+    padding-left:11px;border-left:3px solid var(--warn-line);white-space:pre-wrap;
+  }
+  .tagline{font-size:12px;color:var(--muted);margin:10px 0 0;font-family:ui-monospace,Consolas,monospace}
+
+  /* 引用卡片 */
+  .cites-title{
+    font-size:13px;color:var(--muted);margin:22px 0 10px;letter-spacing:.5px;
+    display:flex;align-items:center;gap:8px;
+  }
+  .cites-title::after{content:"";flex:1;height:1px;background:var(--line)}
+  .cites{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  @media(max-width:720px){.cites{grid-template-columns:1fr}}
+  .cite{
+    background:var(--panel);border:1px solid var(--line);border-left:3px solid #c3d2ec;
+    border-radius:9px;padding:13px 14px;display:flex;flex-direction:column;gap:7px;
+  }
+  .cite .top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .cite .rn{
+    font-size:11px;font-weight:700;color:#fff;background:#94a6c4;
+    width:18px;height:18px;border-radius:50%;display:grid;place-items:center;flex:none;
+  }
+  .cite .no{
+    font-family:ui-monospace,Consolas,monospace;font-size:12.5px;color:var(--accent);
+    font-weight:600;letter-spacing:.2px;word-break:break-all;
+  }
+  .cite .sc{font-size:11.5px;color:var(--muted);font-family:ui-monospace,Consolas,monospace;flex:none}
+  .cite .sec{font-size:12.5px;color:#40506a;font-weight:600;line-height:1.5}
+  .cite .ex{
+    font-size:11.5px;color:var(--muted);line-height:1.7;margin:0;
+    display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden;
+  }
+
+  /* 加载 / 错误 */
+  .loading{display:flex;align-items:center;gap:11px;color:var(--muted);font-size:14px;padding:8px 2px}
+  .spinner{
+    width:16px;height:16px;border:2px solid #d5deeb;border-top-color:var(--accent);
+    border-radius:50%;animation:spin .7s linear infinite;flex:none;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .errbox{
+    display:flex;gap:11px;align-items:flex-start;background:var(--err-soft);
+    border:1px solid var(--err-line);border-radius:10px;padding:13px 15px;
+  }
+  .errbox .t{font-weight:600;color:var(--err);margin:0 0 3px;font-size:14px}
+  .errbox .d{margin:0;font-size:13px;color:#7c3f39;line-height:1.65;word-break:break-word}
+
+  footer{
+    max-width:900px;margin:44px auto 0;padding-top:16px;border-top:1px solid var(--line);
+    font-size:12px;color:#8b97a9;line-height:1.9;
+  }
+  footer code{font-family:ui-monospace,Consolas,monospace;color:#6b7a91}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="hero">
+    <h1>企业知识库问答</h1>
+    <p class="sub">制造业质量与工艺文档 · 本地私有化部署 · 答案逐字取自库内资料</p>
+    <div class="badge" id="badge"><span class="dot"></span><span id="badgeText">检查服务…</span></div>
+  </div>
+
+  <div class="askbox">
+    <textarea id="q" rows="1" placeholder="输入你的问题"></textarea>
+    <div class="boxbar">
+      <div class="chips" id="chips"></div>
+      <button class="send" id="send" type="button" title="提问（Enter 发送，Shift+Enter 换行）">➤</button>
+    </div>
+  </div>
+
+  <section id="result"></section>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+"use strict";
+
+/* 示例问题：3 道库内（会正常作答）+ 1 道库外（会拒答，用于演示边界）。
+   最后一条加 kw 高亮样式（对应截图输入框里的蓝色小胶囊）。 */
+const 示例 = [
+  "东莞精诚五金的不良率是多少？",
+  "哪家供应商目前处于观察期？",
+  "记录写错了应该怎么改？",
+  "【库外示例】电镀废液应该怎么处理？"
+];
+
+const $ = (id) => document.getElementById(id);
+const 问题框 = $("q"), 按钮 = $("send"), 结果 = $("result"), 徽标 = $("badge"),
+      徽标文字 = $("badgeText"), 底部 = $("foot");
+
+/* 状态徽标：三态（检查中 / 正常 / 异常），异常时给可操作提示，不静默 */
+function 设徽标(态, 文字) {
+  徽标.className = "badge" + (态 === "ok" ? " ok" : 态 === "bad" ? " bad" : "");
+  徽标文字.textContent = 文字;
+}
+
+/* ---------- 服务健康检查 ---------- */
+async function 查健康() {
+  try {
+    const r = await fetch("/health", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const h = await r.json();
+    设徽标("ok", h.docs + " 份文档 · " + h.blocks + " 块");
+    底部.textContent = "";
+    底部.innerHTML = "";
+    const p = document.createElement("p");
+    p.style.margin = "0";
+    p.textContent = "检索链：" + h.chain + "　｜　三层拒答：分数阈值 " +
+      (h.score_threshold) + " · 引用链闭合" + (h.class2_enabled ? "（Top-" + h.class2_scope + "）" : "（已关）") +
+      " · 生成端兜底";
+    const p2 = document.createElement("p");
+    p2.style.margin = "4px 0 0";
+    p2.textContent = "依赖：重排 " + h.deps.rerank + "　生成端 " + h.deps.generate +
+      "（生成端地址应与 Local-AI APP 设置里的 service_port 一致）";
+    底部.appendChild(p); 底部.appendChild(p2);
+    return true;
+  } catch (e) {
+    设徽标("bad", "服务异常");
+    底部.textContent = "";
+    const p = document.createElement("p");
+    p.style.margin = "0";
+    p.textContent = "无法读取 /health：" + e.message + "。请确认知识库服务已启动。";
+    底部.appendChild(p);
+    return false;
+  }
+}
+
+/* ---------- 提问 ---------- */
+async function 提问() {
+  const 问句 = 问题框.value.trim();
+  if (!问句) return;
+
+  /* 🔴 发问即清空输入框（2026-10-10 修复：之前答案回来后问题仍留在框里，
+     连续追问得手工删除）。清空动作放在请求**之前**：
+     无论成功 / 失败 / 超时，框里都不残留；问句本身已显示在结果卡的 q-line 里。 */
+  问题框.value = "";
+  问题框.style.height = "auto";
+
+  按钮.disabled = true;
+  结果.innerHTML = "";
+  const 载入 = document.createElement("div");
+  载入.className = "loading";
+  const 转 = document.createElement("div");
+  转.className = "spinner";
+  载入.appendChild(转);
+  载入.appendChild(document.createTextNode("检索并生成中…（首次请求含模型预热，可能稍慢）"));
+  结果.appendChild(载入);
+
+  try {
+    const r = await fetch("/ask", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: 问句, top_k: 3 })
+    });
+    const 数据 = await r.json();
+    if (!r.ok) throw new Error(数据.error || ("HTTP " + r.status));
+    结果.innerHTML = "";
+    渲染(问句, 数据);
+  } catch (e) {
+    结果.innerHTML = "";
+    结果.appendChild(错误卡("请求失败", "服务返回：" + e.message +
+      "　—— 若为生成端相关错误，请确认 8000 端口的模型已在 APP 中启动。"));
+  } finally {
+    按钮.disabled = false;
+    问题框.focus();
+  }
+}
+
+function 错误卡(标题, 说明) {
+  const d = document.createElement("div");
+  d.className = "errbox";
+  const i = document.createElement("div");
+  i.className = "icon"; i.textContent = "⛔"; i.style.flex = "none";
+  const t = document.createElement("div");
+  const h = document.createElement("p"); h.className = "t"; h.textContent = 标题;
+  const p = document.createElement("p"); p.className = "d"; p.textContent = 说明;
+  t.appendChild(h); t.appendChild(p);
+  d.appendChild(i); d.appendChild(t);
+  return d;
+}
+
+/* ---------- 渲染结果 ---------- */
+function 渲染(问句, 数据) {
+  const 卡 = document.createElement("div");
+  卡.className = "card";
+
+  const q = document.createElement("p");
+  q.className = "q-line";
+  const qb = document.createElement("b");
+  qb.textContent = 问句;
+  q.appendChild(qb);
+  卡.appendChild(q);
+
+  const 答案文本 = (数据.answer || "").trim();
+
+  if (数据.refused) {
+    卡.appendChild(拒答块(数据, 答案文本));
+  } else {
+    const a = document.createElement("p");
+    a.className = "answer";
+    a.textContent = 答案文本;          /* textContent：模型输出一律当纯文本，防注入 */
+    卡.appendChild(a);
+  }
+
+  /* 耗时等元信息 */
+  const t = 数据.timings || {};
+  const m = document.createElement("p");
+  m.className = "meta";
+  const 项 = [];
+  if (t.retrieve != null) 项.push(["检索", t.retrieve + " s"]);
+  if (t.generate != null) 项.push(["生成", t.generate + " s"]);
+  if (t.total != null) 项.push(["合计", t.total + " s"]);
+  项.push(["最高分", (数据.top_score != null ? 数据.top_score : "—")]);
+  项.forEach(function (kv, i) {
+    if (i) m.appendChild(document.createTextNode(""));
+    const s = document.createElement("span");
+    const k = document.createElement("span"); k.className = "k"; k.textContent = kv[0] + " ";
+    s.appendChild(k); s.appendChild(document.createTextNode(kv[1]));
+    m.appendChild(s);
+  });
+  卡.appendChild(m);
+  结果.appendChild(卡);
+
+  /* 引用卡片 */
+  const 引 = 数据.citations || [];
+  if (引.length) {
+    const 标 = document.createElement("div");
+    标.className = "cites-title";
+    标.textContent = "依据 " + 引.length + " 条";
+    结果.appendChild(标);
+
+    const 网 = document.createElement("div");
+    网.className = "cites";
+    引.forEach(function (c) { 网.appendChild(引用卡(c)); });
+    结果.appendChild(网);
+  }
+}
+
+/* 拒答态：说清「为什么拒」，并在生成端给出补充说明时一并显示 */
+function 拒答块(数据, 答案文本) {
+  const 盒 = document.createElement("div");
+  盒.className = "refusal";
+
+  const i = document.createElement("div");
+  i.className = "icon"; i.textContent = "⚠";
+
+  const t = document.createElement("div");
+  const h = document.createElement("p"); h.className = "t";
+  h.textContent = "资料不足 · 本知识库无法回答这个问题";
+
+  const 类型 = 数据.refusal_type;
+  let 说明 = 数据.refusal_reason || "";
+  if (!说明) {
+    说明 = 数据.model_refused
+      ? "生成端判定：检索到的资料不足以支撑回答。"
+      : "检索结果与问题不匹配。";
+  }
+  const p = document.createElement("p"); p.className = "d"; p.textContent = 说明;
+  t.appendChild(h); t.appendChild(p);
+
+  /* 类2/类3 会给出「缺的是哪份文档」——这对用户是可行动的线索，必须显示 */
+  const 库外 = 数据.off_library_refs || [];
+  if (库外.length) {
+    const n = document.createElement("p"); n.className = "tagline";
+    n.textContent = "资料中提到的库外文档：" + 库外.join("、") + "（未收录）";
+    t.appendChild(n);
+  }
+
+  if (答案文本 && 答案文本.replace(/\s/g, "") !== "资料不足" && 答案文本 !== "资料不足。") {
+    const note = document.createElement("p"); note.className = "note";
+    note.textContent = 答案文本;
+    t.appendChild(note);
+  }
+
+  盒.appendChild(i); 盒.appendChild(t);
+  return 盒;
+}
+
+function 引用卡(c) {
+  const d = document.createElement("div");
+  d.className = "cite";
+
+  const top = document.createElement("div");
+  top.className = "top";
+  const rn = document.createElement("span"); rn.className = "rn"; rn.textContent = c.rank;
+  const no = document.createElement("span"); no.className = "no"; no.textContent = c.doc_no || "—";
+  const sc = document.createElement("span"); sc.className = "sc";
+  sc.textContent = (typeof c.score === "number" && c.score > 0 ? "+" : "") + c.score;
+  top.appendChild(rn); top.appendChild(no); top.appendChild(sc);
+
+  const sec = document.createElement("div"); sec.className = "sec"; sec.textContent = c.section || "";
+  const ex = document.createElement("p"); ex.className = "ex"; ex.textContent = c.excerpt || "";
+
+  d.appendChild(top); d.appendChild(sec); d.appendChild(ex);
+  return d;
+}
+
+/* ---------- 交互绑定 ---------- */
+按钮.addEventListener("click", 提问);
+问题框.addEventListener("keydown", function (e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); 提问(); }
+});
+问题框.addEventListener("input", function () {
+  问题框.style.height = "auto";
+  问题框.style.height = Math.min(问题框.scrollHeight, 180) + "px";
+});
+
+/* 示例问题 chips（内嵌在输入框下沿，对照截图样式） */
+const 容器 = $("chips");
+示例.forEach(function (text, i) {
+  const b = document.createElement("button");
+  b.className = "chip" + (i === 示例.length - 1 ? " kw" : "");
+  b.type = "button";
+  b.textContent = text;
+  b.title = text;
+  b.addEventListener("click", function () { 问题框.value = text; 问题框.focus(); 提问(); });
+  容器.appendChild(b);
+});
+
+问题框.focus();
+查健康();
+</script>
+</body>
+</html>

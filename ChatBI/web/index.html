@@ -1,0 +1,1177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>制造业经营数据问答 · 供应链与生产数据</title>
+<style>
+  :root{
+    --bg:#f4f6f9; --panel:#ffffff; --line:#e4e9f0; --text:#16202c; --muted:#66748a;
+    --accent:#1d4ed8; --accent-soft:#eef3ff;
+    --ok:#0f766e; --ok-soft:#e7f6f3;
+    --warn:#8a6100; --warn-soft:#fff8e6; --warn-line:#f0c14b;
+    --err:#b42318; --err-soft:#fef3f2; --err-line:#f3c3bf;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font:15px/1.7 "Microsoft YaHei","PingFang SC","Hiragino Sans GB",system-ui,-apple-system,"Segoe UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:960px;margin:0 auto;padding:0 20px 72px}
+
+  /* ---------- 居中标题区 ---------- */
+  .hero{
+    text-align:center;padding:72px 12px 34px;
+  }
+  .hero h1{
+    font-size:40px;margin:0 0 12px;font-weight:700;letter-spacing:2px;color:#1c2431;
+  }
+  .hero .sub{margin:0;color:var(--muted);font-size:14.5px;letter-spacing:.5px}
+
+  /* 状态徽标：三态（检查中 / 正常 / 异常），异常时给可操作提示，不静默 */
+  .badge{
+    display:inline-flex;align-items:center;gap:7px;padding:6px 14px;border-radius:999px;
+    font-size:12.5px;background:#eef1f5;color:var(--muted);border:1px solid transparent;
+    margin-top:20px;white-space:nowrap;
+  }
+  .badge .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+  .badge.ok{background:var(--ok-soft);color:var(--ok)}
+  .badge.bad{background:var(--err-soft);color:var(--err)}
+  .badge small{color:inherit;opacity:.75}
+
+  /* ---------- 大输入框（chips 内嵌 + 右下发送键） ---------- */
+  .askbox{
+    max-width:780px;margin:6px auto 0;background:var(--panel);
+    border:1px solid #c9d6f0;border-radius:16px;padding:14px 16px 12px;
+    box-shadow:0 6px 22px rgba(29,78,216,.07);transition:border-color .15s,box-shadow .15s;
+  }
+  .askbox:focus-within{border-color:var(--accent);box-shadow:0 6px 26px rgba(29,78,216,.13)}
+  textarea{
+    display:block;width:100%;border:0;outline:0;resize:none;background:transparent;color:inherit;
+    font:15.5px/1.7 inherit;font-family:inherit;min-height:58px;max-height:180px;padding:2px 2px 0;
+  }
+  textarea::placeholder{color:#9aa6b8}
+  .boxbar{display:flex;align-items:center;gap:10px;margin-top:6px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;flex:1;min-width:0}
+  .chip{
+    border:1px solid var(--line);background:#fbfcfe;color:var(--muted);
+    padding:4px 11px;border-radius:8px;font-size:12px;cursor:pointer;
+    transition:all .15s;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .chip:hover{border-color:#b9c9ef;color:var(--accent);background:var(--accent-soft)}
+  .chip.kw{border-color:#cdd9f2;color:var(--accent);background:var(--accent-soft)}
+  .chip.dash{border-style:dashed}
+
+  /* 「只生成 SQL」是一个**开关**，不是一个 chip —— 它改变的是「这次问要不要执行」。
+     做成 chip 旁的小 toggle，位置贴近发送键（同一组动作）。 */
+  .toggle{
+    display:flex;align-items:center;gap:6px;flex:none;cursor:pointer;
+    padding:5px 11px;border:1px solid var(--line);border-radius:8px;background:#fbfcfe;
+    font-size:12px;color:var(--muted);white-space:nowrap;transition:all .15s;user-select:none;
+    height:44px;
+  }
+  .toggle:hover{border-color:#b9c9ef;color:var(--accent)}
+  .toggle.on{border-color:#cdd9f2;color:var(--accent);background:var(--accent-soft)}
+  .toggle input{margin:0;cursor:pointer;accent-color:var(--accent)}
+
+  button.send{
+    flex:none;width:44px;height:44px;border:0;border-radius:12px;cursor:pointer;
+    background:var(--accent);color:#fff;font-size:18px;line-height:1;
+    display:grid;place-items:center;transition:opacity .15s,transform .1s;
+  }
+  button.send:hover:not(:disabled){opacity:.9}
+  button.send:active:not(:disabled){transform:scale(.96)}
+  button.send:disabled{opacity:.45;cursor:not-allowed}
+
+  /* ---------- 结果区 ---------- */
+  #result{max-width:900px;margin:34px auto 0}
+  .card{
+    background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:20px 22px;box-shadow:0 1px 2px rgba(20,30,50,.04);
+  }
+  .card + .card{margin-top:14px}
+  .q-line{
+    font-size:13px;color:var(--muted);margin:0 0 12px;padding-left:11px;
+    border-left:3px solid #d7e0ef;
+  }
+  .q-line b{color:var(--text);font-weight:600}
+
+  /* 口径行：**永远在结果上方**（定义里的「呈现」护栏）—— 先给口径再给数字 */
+  .spec{
+    margin:0 0 12px;font-size:12.5px;color:var(--muted);
+    display:flex;gap:14px;flex-wrap:wrap;line-height:1.7;
+  }
+  .spec b{color:var(--text);font-weight:600}
+
+  /* 一句话解读（A-2）：口径之后、图与表之前 —— 正好是「先看结论再抠数」的位置。
+     左边一道竖条把它和口径区分开：口径是「这次按什么算的」，解读是「所以呢」。 */
+  .insight{
+    margin:0 0 12px;padding:9px 13px;font-size:14.5px;line-height:1.75;
+    background:var(--accent-soft);border-left:3px solid var(--accent);
+    border-radius:0 8px 8px 0;color:var(--text);
+  }
+
+  .answer{font-size:16px;line-height:1.85;margin:0;word-break:break-word}
+
+  /* 结果表：宽表可横向滚动，别撑破卡片 */
+  .tblwrap{margin:2px 0 0;overflow:auto;border:1px solid var(--line);border-radius:10px}
+  table{border-collapse:collapse;width:100%;font-size:13.5px}
+  th,td{padding:8px 12px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}
+  th{background:#f2f4f8;font-weight:600;color:var(--muted);font-size:12.5px}
+  tbody tr:last-child td{border-bottom:0}
+  tbody tr:nth-child(even){background:#fafbfd}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .rowfoot{margin:8px 0 0;font-size:12.5px;color:var(--muted)}
+  .rowfoot b{color:var(--text);font-weight:600}
+
+  /* 系统做过的事（归一提示 / 说明）：诚实展示，不静默 */
+  .note{
+    margin:12px 0 0;padding:11px 13px;border-radius:10px;
+    font-size:13px;line-height:1.7;
+  }
+  .note.ok{background:var(--ok-soft);color:#0b5a53;border-left:3px solid var(--ok)}
+  .note.warn{background:var(--warn-soft);color:#6b5a2a;border-left:3px solid var(--warn-line)}
+
+  /* 四种「不是一张表」的结局：澄清（补一句就行）/
+     拒答（怎么补都答不了）/ 护栏拒绝（语句被拦下）/ 出错。
+     **澄清与拒答必须长得不一样** —— 混着显示，用户会一直换问法而系统永远答不出。 */
+  .blockbox{
+    display:flex;gap:11px;align-items:flex-start;border-radius:10px;padding:13px 15px;
+  }
+  .blockbox.warn{background:var(--warn-soft);border:1px solid var(--warn-line)}
+  .blockbox.err{background:var(--err-soft);border:1px solid var(--err-line)}
+  .blockbox .icon{flex:none;font-size:17px;line-height:1.4}
+  .blockbox .bt{margin:0 0 4px;font-weight:600;font-size:14px}
+  .blockbox.warn .bt{color:var(--warn)}
+  .blockbox.err .bt{color:var(--err)}
+  .blockbox .bd{
+    margin:0;font-size:13px;line-height:1.7;word-break:break-word;
+  }
+  .blockbox.warn .bd{color:#6b5a2a}
+  .blockbox.err .bd{color:#7c3f39}
+  .blockbox .bd b{font-weight:600}
+
+  .tag{
+    display:inline-block;padding:2px 10px;border-radius:999px;font-size:11.5px;
+    margin:0 0 10px;
+  }
+  .tag.ok{background:var(--ok-soft);color:var(--ok)}
+  .tag.warn{background:var(--warn-soft);color:var(--warn)}
+  .tag.bad{background:var(--err-soft);color:var(--err)}
+  .tagline{font-size:12px;color:var(--muted);margin:10px 0 0;
+           font-family:ui-monospace,Consolas,monospace;word-break:break-all}
+
+  /* 底层链路（意图 / SQL / 模型原文 / 护栏）：折叠，但随时可查 */
+  details{margin-top:11px}
+  summary{cursor:pointer;color:var(--accent);font-size:12.5px;user-select:none}
+  summary:hover{text-decoration:underline}
+  pre{
+    margin:8px 0 0;padding:11px 13px;background:#20242e;color:#dfe4ee;border-radius:8px;
+    overflow:auto;font:12.5px/1.55 Consolas,"Courier New",monospace;
+  }
+  pre.sql{white-space:pre;}
+
+  .meta{
+    margin:14px 0 0;padding-top:12px;border-top:1px dashed var(--line);
+    font-size:12.5px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap;
+  }
+  .meta .k{color:#93a0b3}
+
+  /* 加载 / 错误 */
+  .loading{display:flex;align-items:center;gap:11px;color:var(--muted);font-size:14px;padding:8px 2px}
+  .spinner{
+    width:16px;height:16px;border:2px solid #d5deeb;border-top-color:var(--accent);
+    border-radius:50%;animation:spin .7s linear infinite;flex:none;
+  }
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  footer{
+    max-width:900px;margin:44px auto 0;padding-top:16px;border-top:1px solid var(--line);
+    font-size:12px;color:#8b97a9;line-height:1.9;
+  }
+  footer code{font-family:ui-monospace,Consolas,monospace;color:#6b7a91}
+
+  /* 图表区：与结果表同宽同边框，**排在表的上方**。
+     顺序是刻意的：先看趋势与对比，再逐行抠数字 —— 反过来就成了「在一堆数字里找趋势」。
+     口径行仍在图表与表的**上面**（「口径先于结果」这条不因为多了张图就松掉）。 */
+  .chartbox{
+    margin:0 0 14px;border:1px solid var(--line);border-radius:10px;
+    background:#fff;overflow:hidden;
+  }
+  .chart{width:100%;height:300px}
+  .chartbar{
+    display:flex;gap:6px;align-items:center;flex-wrap:wrap;
+    padding:8px 11px;border-top:1px solid var(--line);background:#fafbfd;
+  }
+  .chartbar .lb{font-size:12px;color:var(--muted);margin-right:2px}
+  .chartbar button{
+    font:inherit;font-size:12px;padding:3px 11px;border-radius:999px;cursor:pointer;
+    border:1px solid var(--line);background:#fff;color:var(--muted);
+  }
+  .chartbar button:hover:not(:disabled){border-color:#c3d0e4;color:var(--text)}
+  .chartbar button.on{
+    background:var(--accent-soft);border-color:#c3d3f5;color:var(--accent);font-weight:600;
+  }
+  /* 不适用时按钮**留在原地但置灰**：直接消失会让人以为「这功能没有」，
+     留着并给出理由（title）才知道是「这类结果画不了饼」。 */
+  .chartbar button:disabled{opacity:.45;cursor:not-allowed}
+  .chartbar .hint{font-size:11.5px;color:#93a0b3;margin-left:auto}
+  /* B-1：自动选图的**理由**。刻意单独一行，不塞进按钮行 ——
+     理由是一句话，挤在按钮中间会被当成装饰；单独一行才有人读。 */
+  .chartbox .why{
+    padding:7px 11px;border-top:1px solid var(--line);background:#fff;
+    font-size:12px;color:var(--muted);line-height:1.6;
+  }
+  .chartbox .why .k{color:var(--accent);font-weight:600;margin-right:6px}
+  .chartbox .why .tip{color:#93a0b3;font-size:11.5px;margin-left:8px}
+
+  /* A-1：「新对话」逃生口。追问靠上文，切了话题就得能一键甩掉上文 ——
+     否则上一轮的指标会**悄悄**跟着走（传承是好事，悄悄传承是事故）。 */
+  .boxbar .ghostbtn{
+    font:inherit;font-size:12px;padding:4px 10px;border-radius:999px;cursor:pointer;
+    border:1px solid var(--line);background:#fff;color:var(--muted);flex:0 0 auto;
+  }
+  .boxbar .ghostbtn:hover{border-color:#c3d0e4;color:var(--text)}
+  /* 会话承接提示：与「系统做了这些归一」同一形态 —— 都是「系统替你做了什么」 */
+  .note.承接{border-left:3px solid #c3d3f5;background:var(--accent-soft)}
+
+  /* 评价条（A-3）：反馈是数据飞轮的**唯一入口** —— 没有它，「越用越准」只是句口号。
+     放在**结果卡最底下**（不跟口径抢位置），且与结果卡同一张卡内 ——
+     用户评价的是「这一次问答」，脱离就会变成评价「这个系统」。 */
+  .fb{
+    display:flex;gap:6px;align-items:center;flex-wrap:wrap;
+    margin-top:12px;padding-top:10px;border-top:1px dashed var(--line);
+  }
+  .fb .lb{font-size:12px;color:var(--muted);margin-right:2px}
+  .fb button{
+    font:inherit;font-size:12px;padding:3px 12px;border-radius:999px;cursor:pointer;
+    border:1px solid var(--line);background:#fff;color:var(--muted);
+  }
+  .fb button:hover:not(:disabled){border-color:#c3d0e4;color:var(--text)}
+  .fb button.on{background:var(--accent-soft);border-color:#c3d3f5;color:var(--accent);font-weight:600}
+  .fb button.ok.on{background:#e7f5ef;border-color:#bfe3d4;color:var(--ok)}
+  .fb .done{font-size:12px;color:var(--ok)}
+  .fb .bad-done{color:var(--err)}
+  .fbfix{margin-top:8px}
+  .fbfix textarea{
+    width:100%;box-sizing:border-box;min-height:52px;resize:vertical;
+    font:inherit;font-size:13px;padding:8px 10px;border-radius:8px;
+    border:1px solid var(--line);background:#fff;color:var(--text);
+  }
+  .fbfix textarea:focus{outline:none;border-color:#c3d3f5}
+  .fbfix .row{display:flex;gap:6px;align-items:center;margin-top:6px}
+  .fbfix .row button{
+    font:inherit;font-size:12px;padding:4px 14px;border-radius:999px;cursor:pointer;
+    border:1px solid var(--line);background:#fff;color:var(--muted);
+  }
+  .fbfix .row button.go{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+  .fbfix .row .hint{font-size:11.5px;color:#93a0b3}
+
+  /* ---------- 身份行（B-4）：角色 + 令牌 ---------- */
+  /* 这一行的意义不在「多一个下拉框」—— 它让 B-4 / B-3 / B-5 从「后端能力」
+     变成「界面上看得见的事」：换一个角色，回来的行数与列数真的会变。
+     样式照 8096 助手页那行角色栏抄，两页共用同一套视觉语言。 */
+  .idbar{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;margin:14px auto 0}
+  .idbar .rlabel{font-size:12.5px;color:var(--muted)}
+  #role{
+    border:1px solid var(--line);background:#fbfcfe;color:var(--text);
+    padding:5px 10px;border-radius:8px;font-size:12.5px;cursor:pointer;font-family:inherit;
+    transition:border-color .15s,box-shadow .15s;
+  }
+  #role:hover{border-color:#b9c9ef}
+  #role:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  #token{
+    border:1px solid var(--line);background:#fbfcfe;color:var(--text);
+    padding:5px 10px;border-radius:8px;font-size:11.5px;width:230px;
+    font-family:ui-monospace,Consolas,"Courier New",monospace;
+    transition:border-color .15s,box-shadow .15s;
+  }
+  #token:hover{border-color:#b9c9ef}
+  #token:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .idhint{font-size:12px;color:var(--muted)}
+  .idhint b{color:var(--text)}
+  .idhint.bad{color:var(--err)}
+
+  /* 身份徽标（结果卡顶部）：这一问是「以谁的身份」跑出来的 */
+  .idtag{
+    display:inline-block;font-size:11.5px;padding:2px 9px;border-radius:999px;
+    border:1px solid var(--line);background:#fbfcfe;color:var(--muted);margin-left:6px;
+  }
+  .idtag.claimed{border-color:var(--warn-line);background:var(--warn-soft);color:var(--warn)}
+  .idtag.verified{border-color:#bfe3dc;background:var(--ok-soft);color:var(--ok)}
+
+  /* 页脚的权限说明：默认收起，不抢视线 */
+  .perm{max-width:780px;margin:12px auto 0;text-align:left}
+  .perm summary{cursor:pointer;font-size:12.5px;color:var(--muted);outline:none;list-style:none}
+  .perm summary::-webkit-details-marker{display:none}
+  .perm summary:hover{color:var(--accent)}
+  .perm .pbody{margin-top:8px;border:1px solid var(--line);border-radius:10px;background:#fbfcfe;padding:10px 13px}
+  .perm h4{margin:10px 0 5px;font-size:12px;color:var(--muted);font-weight:600}
+  .perm h4:first-child{margin-top:0}
+  .perm table{border-collapse:collapse;font-size:12px;width:100%}
+  .perm td,.perm th{border-bottom:1px solid #eef2f9;padding:3px 7px;text-align:left;vertical-align:top}
+  .perm tr:last-child td{border-bottom:0}
+  .perm th{color:#93a0b3;font-weight:600}
+  .perm code{font-size:11.5px;background:#eef2f9;padding:1px 4px;border-radius:4px}
+  .perm .no{color:#93a0b3}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="hero">
+    <h1>制造业经营数据问答</h1>
+    <p class="sub">供应链与生产数据 · 本地私有化部署 · 问一句出数出图，每个答案都能展开看它真正跑过的语句</p>
+    <div class="badge" id="badge"><span class="dot"></span><span id="badgeText">检查服务…</span></div>
+  </div>
+
+  <div class="idbar">
+    <span class="rlabel">以谁的身份提问</span>
+    <select id="role" title="角色决定能看到哪些行、哪些列。这些限制在**服务端**执行（SQL 层遮蔽 + 结果层摘列），不是前端藏起来">
+      <option value="操作员" selected>操作员</option>
+      <option value="主管">主管</option>
+      <option value="管理员">管理员</option>
+    </select>
+    <input id="token" type="text" spellcheck="false"
+      placeholder="令牌（可选，粘贴即生效）"
+      title="填了令牌 → 服务端按**令牌签名**里的角色走，上面的下拉被忽略（这才是真实身份）；留空 → 用下拉的角色，服务端会标「自称身份（未验证）」">
+    <span class="idhint" id="idhint"></span>
+  </div>
+
+  <div class="askbox">
+    <textarea id="q" rows="1" placeholder="例如：上月哪家供应商不良率最高？"></textarea>
+    <div class="boxbar">
+      <div class="chips" id="chips"></div>
+      <button class="ghostbtn" id="newsession" type="button"
+        title="清掉对话上文。追问靠上文，切话题时点它 —— 否则上一轮的指标会跟着走">新对话</button>
+      <label class="toggle" id="onlysql-box" title="只让模型出意图、拼出 SQL 给你看，不连库执行">
+        <input type="checkbox" id="onlysql">只生成 SQL
+      </label>
+      <button class="send" id="send" type="button" title="提问（Enter 发送，Shift+Enter 换行）">➤</button>
+    </div>
+  </div>
+
+  <section id="result"></section>
+
+  <footer id="foot"></footer>
+</div>
+
+<!-- ECharts 走本地文件，不引 CDN：内网 / 断网都得能画图。
+     服务端有一条白名单路由发这个文件，路由少了页面会「静默不出图」。 -->
+<script src="vendor/echarts.min.js"></script>
+<script>
+"use strict";
+
+/* 页面可挂到别的端口上（`?api=http://127.0.0.1:8095`）—— 留空 = 同源。 */
+const API = new URLSearchParams(location.search).get("api") || "";
+
+const $ = (id) => document.getElementById(id);
+const 问题框 = $("q"), 按钮 = $("send"), 结果 = $("result"), 徽标 = $("badge"),
+      徽标文字 = $("badgeText"), 底部 = $("foot"), SQL开关 = $("onlysql"),
+      SQL开关盒 = $("onlysql-box");
+/* B-4：身份三件套。令牌**只存在本机 localStorage**，只发给本机的问数服务；
+   它是带签名的凭据，服务端验签之后才认（见 scripts/身份.py）。 */
+const 角色框 = $("role"), 令牌框 = $("token"), 身份提示 = $("idhint");
+const 身份键 = "chatbi.身份";
+
+function 读存身份() {
+  try {
+    const s = JSON.parse(localStorage.getItem(身份键) || "{}");
+    if (s.角色) 角色框.value = s.角色;
+    if (s.令牌) 令牌框.value = s.令牌;
+  } catch (e) { /* 存坏了就当没存过 —— 身份问题不该拦住提问 */ }
+}
+function 存身份() {
+  try {
+    localStorage.setItem(身份键, JSON.stringify({
+      角色: 角色框.value, 令牌: 令牌框.value.trim()
+    }));
+  } catch (e) { /* 隐私模式下 localStorage 会抛 —— 忽略，本次会话照常可用 */ }
+}
+
+/* 下拉与令牌是**两条不同的路径**，必须当场说清是哪一条在生效 ——
+   否则用户填了令牌、又改了下拉，会以为下拉生效了（实测最容易混的一处）。 */
+function 刷新身份提示() {
+  const t = 令牌框.value.trim();
+  if (t) {
+    身份提示.className = "idhint";
+    身份提示.innerHTML = "已填令牌 —— 服务端按<b>签名里的角色</b>走，上面的下拉<b>不生效</b>";
+  } else {
+    身份提示.className = "idhint";
+    身份提示.innerHTML = "未填令牌 —— 用下拉的<b>「" + esc(角色框.value)
+      + "」</b>（自称身份，服务端会标「未验证」）";
+  }
+}
+/* 从应答里回填**服务端实际认定的身份** —— 前端的说法只是预告，实认以服务端为准 */
+function 回填实际身份(身份) {
+  if (!身份 || !身份.来源) return;
+  身份提示.className = "idhint";
+  身份提示.innerHTML = "服务端实认：<b>" + esc(身份.角色) + "</b> ｜ 来源："
+    + esc(身份.来源) + (身份.主体 ? "（" + esc(身份.主体) + "）" : "");
+  存身份();
+}
+
+/* ---------- B-4 / B-3 / B-5：谁能看到什么（页脚折叠区）----------
+   三份清单都从 `/catalog` 取（服务端各自模块直接读），**前端不手抄** ——
+   手抄一份的下场：后端加了一列敏感列、或改了一个角色的数据域，界面还显示旧的那份，
+   而且不报错。这跟「唯一事实来源」是同一条纪律。 */
+function 渲染权限清单(目录) {
+  const 角 = 目录.角色 || [], 敏 = 目录.敏感列 || [], 行 = 目录.行级 || [];
+  if (!角.length && !敏.length && !行.length) return null;
+
+  const det = document.createElement("details");
+  det.className = "perm";
+  const sum = document.createElement("summary");
+  sum.textContent = "▸ 谁能看到什么（数据范围 · 敏感列 · 角色动作）—— 三样都在服务端生效";
+  det.appendChild(sum);
+
+  const body = document.createElement("div");
+  body.className = "pbody";
+  let h = "";
+
+  h += "<h4>数据范围（行级权限 · 加在 SQL 层：聚合与排名也只算这些行）</h4>";
+  h += '<table><tr><th style="width:76px">角色</th><th>限定</th></tr>';
+  行.forEach(function (x) {
+    const 遮 = (x.遮蔽 || []).map(function (y) {
+      return "<code>" + esc(y.表) + "." + esc(y.字段) + "</code> ∈ "
+        + esc((y.值 || []).join(" / "));
+    });
+    h += "<tr><td>" + esc(x.角色) + "</td><td>"
+      + (遮.length ? 遮.join("；") : '<span class="no">不限制（全量）</span>')
+      + '<br><span class="no">' + esc(x.说明 || "") + "</span></td></tr>";
+  });
+  h += "</table>";
+
+  h += "<h4>敏感列（在服务端摘列，喂模型之前）</h4>";
+  h += '<table><tr><th style="width:96px">列</th>'
+    + '<th style="width:132px">可见角色</th><th>为什么要藏</th></tr>';
+  敏.forEach(function (x) {
+    h += "<tr><td><code>" + esc(x.列) + "</code></td><td>"
+      + esc((x.可见角色 || []).join("、")) + '</td><td><span class="no">'
+      + esc(x.说明 || "") + "</span></td></tr>";
+  });
+  h += "</table>";
+
+  h += "<h4>角色与动作（动作链路的权限白名单）</h4>";
+  h += '<table><tr><th style="width:76px">角色</th><th>能做什么</th></tr>';
+  角.forEach(function (x) {
+    h += "<tr><td>" + esc(x.角色) + "</td><td>" + esc(x.说明 || "")
+      + '<br><span class="no">动作：' + esc((x.动作 || []).join("、")) + "</span></td></tr>";
+  });
+  h += "</table>";
+
+  h += '<p class="no" style="font-size:11.5px;margin:10px 0 0">'
+    + "三份清单由 <code>/catalog</code> 从各模块直接读取（前端不手抄）—— "
+    + "后端改了策略，这里跟着变。</p>";
+  body.innerHTML = h;
+  det.appendChild(body);
+  return det;
+}
+
+const esc = (s) => String(s == null ? "" : s)
+  .replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+/* 服务端给的拒答 / 元问题文本是多行 Markdown-ish（`**粗体**` + 换行）。
+   直接塞进 HTML 会挤成一坨；先转义再还原粗体与换行 —— 顺序不能反，否则等于开了注入口。 */
+const 多行 = (s) => esc(s)
+  .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+  .replace(/\n/g, "<br>");
+
+/* 状态徽标：三态（检查中 / 正常 / 异常），异常时给可操作提示，不静默 */
+function 设徽标(态, 文字, 提示) {
+  徽标.className = "badge" + (态 === "ok" ? " ok" : 态 === "bad" ? " bad" : "");
+  徽标文字.textContent = 文字;
+  徽标.title = 提示 || "";
+}
+
+/* ---------- 服务健康检查：返回 health 体（徽标与页脚共用，只请求一次）---------- */
+async function 查健康() {
+  try {
+    const r = await fetch(API + "/health", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const h = await r.json();
+    const 行 = Object.values(h.表行数 || {}).reduce((a, b) => a + b, 0);
+    if (h.db_可读 === false) {
+      设徽标("bad", "数据不可读", h.db || "");
+      底部.innerHTML = '<p style="margin:0">数据库不可读：<code>' + esc(h.db || "")
+        + '</code>　—— 服务在跑，但查询一定失败。请检查演示库路径（<code>CHATBI_*</code> 环境变量或默认位置）。</p>';
+      return null;
+    }
+    设徽标("ok",
+      "v" + h.版本 + " · " + Object.keys(h.表行数 || {}).length + " 表 " + 行 + " 行 · 时间锚点 " + h.时间锚点,
+      "库：" + h.db + "　日志：" + h.log_file);
+    return h;
+  } catch (e) {
+    设徽标("bad", "服务异常", "无法读取 /health：" + e.message);
+    底部.innerHTML = '<p style="margin:0">无法读取 <code>/health</code>：' + esc(e.message)
+      + '　—— 请确认问数服务已启动（<code>python scripts/问数服务.py</code>）。</p>';
+    return null;
+  }
+}
+
+/* ---------- 图表：结果集 → ECharts ---------- */
+/* 服务端只给「列名 + 二维行」，**不给列类型** —— 哪列能画、能不能画，全在这里判。
+   「怎么判」必须只有一份：出图与否、默认图型、饼图可否，都调用下面这几个函数，
+   三处各写一遍迟早不一致（改了一处另两处不报错，只给错图）。 */
+const 是数 = (v) => typeof v === "number" && isFinite(v);
+const 空值 = (v) => v === null || v === undefined || v === "";
+
+function 分列(列, 行) {
+  const 度量 = [], 维度 = [];
+  列.forEach((_, i) => {
+    const 值 = 行.map((r) => r[i]).filter((v) => !空值(v));
+    /* 整列非空值都是数字 → 度量列；否则维度列（含「数字但语义是编号」的情况，
+       那种列当类目画反而对）。空列归维度：没数据画不出任何东西。 */
+    (值.length && 值.every(是数) ? 度量 : 维度).push(i);
+  });
+  return { 度量, 维度 };
+}
+
+/* 饼图的前提是「一个整体拆成几块」。判不了就**说清为什么**，
+   页面把这句话放到按钮的 title 上，比让按钮无声消失强。 */
+function 饼图不行的理由(列, 行, 分) {
+  if (!分.维度.length) return "没有类目列，画不出占比";
+  if (分.度量.length === 0) return "没有数值列";
+  if (分.度量.length > 1) return "有 " + 分.度量.length + " 个数值列，饼图一次只能画一个";
+  if (行.length < 2) return "只有 " + 行.length + " 行，凑不出占比";
+  if (行.length > 8) return 行.length + " 个类目，饼图会碎成一圈细条（上限 8）";
+  const i = 分.度量[0];
+  if (行.some((r) => 是数(r[i]) && r[i] < 0)) return "含负数，占比无从解释";
+  return "";
+}
+
+/* ---------- 图型推荐（B-1）：可证伪的形态判断 ---------- */
+/* 原来是「**不猜语义**，类别多就折线」。那其实不叫判断，叫显示偏好：
+   12 家供应商的采购额会被画成一条折线，看上去像趋势，其实一个趋势都没有 ——
+   它不报错，只是让人看出一个不存在的走势。
+
+   现在改成形态判断，但守住两条，做不到就退回柱状：
+     ① **只看值，不看列名**。列名是渲染器起的（「月份」「供应商」），随时会变；
+        值是结果集里真实的东西。
+     ② 判断**必须说得出理由**，理由显示在图表下方。说不出理由的判断等于没判断。
+   判错是可发现的：`像时间值` 的正例与反例都在 `探针-问数页.js` 里
+   （关键反例：`1001/1002/1003` 这种编号列**不许**被判成时间轴）。 */
+const 时间形态 = [
+  /^\d{4}\s*[-/.]\s*\d{1,2}(\s*[-/.]\s*\d{1,2})?$/,        // 2026-08 / 2026/8 / 2026-08-01
+  /^\d{4}\s*年(\s*\d{1,2}\s*月)?(\s*\d{1,2}\s*日)?$/,        // 2026年 / 2026年8月 / 2026年8月1日
+  /^\d{1,2}\s*月$/,                                          // 8月
+];
+
+function 像时间值(v) {
+  if (空值(v)) return false;
+  const s = String(v).trim();
+  return 时间形态.some((r) => r.test(s));
+}
+
+/* 把时间刻度折成可比较的数值（→ YYYYMMDD 量级）。折不出来返回 null。
+   为什么需要它：字符串比较会把「2026年10月」排在「2026年8月」前面
+   （`'1' < '8'`），于是「已排序」的判断整个反过来 —— 而那**不会报错**，
+   只会让折线该画的时候没画、不该画的时候画了。 */
+function 时间数值(v) {
+  const s = String(空值(v) ? "" : v).trim();
+  let m = s.match(/^(\d{4})\s*[-/.]\s*(\d{1,2})(?:\s*[-/.]\s*(\d{1,2}))?$/);
+  if (m) return +m[1] * 10000 + +m[2] * 100 + (+(m[3] || 1));
+  m = s.match(/^(\d{4})\s*年(?:\s*(\d{1,2})\s*月)?(?:\s*(\d{1,2})\s*日)?$/);
+  if (m) return +m[1] * 10000 + (+(m[2] || 1)) * 100 + (+(m[3] || 1));
+  m = s.match(/^(\d{1,2})\s*月$/);
+  if (m) return +m[1] * 100;                        // 只有月份：跨年无从比较，按 1..12 排
+  m = s.match(/^(\d{4})$/);
+  if (m && +m[1] >= 1900 && +m[1] <= 2100) return +m[1] * 10000;
+  return null;
+}
+
+/* 整列是不是时间轴。⚠️ **单值不判** ——「8月」单独一个可能只是碰巧；
+   要求 ≥80% 的行都像时间，且 ≥3 行（两点连不成趋势）。 */
+function 像时间轴(列, 行, i) {
+  if (行.length < 3) return false;
+  const 值 = 行.map((r) => r[i]);
+  if (值.filter(像时间值).length >= 行.length * 0.8) return true;
+  /* 纯四位年份单列一条通路。`2019/2020/2021` 像时间，但 `1001/1002/1003`（编号）
+     同样「像」—— 所以加**年份区间**这道闸把编号列挡在外面。
+     ⚠️ 这是本函数唯一可能误判的通路，探针里专门有它的反例。 */
+  const 年 = 值.map((v) => (空值(v) ? NaN : Number(String(v).trim())));
+  return 年.length > 0 && 年.every((n) => Number.isFinite(n) && n >= 1900 && n <= 2100);
+}
+
+/* 时间轴的先后。**没排序的折线是画错的**：8月 → 10月 → 9月 连起来会凭空多出
+   两个「拐点」，那不是数据在波动，是横轴乱了。这时退回柱状并说明。
+   返回 1 升序 / -1 降序 / 0 乱序（或折不出来）。 */
+function 时间有序(行, i) {
+  const 数 = 行.map((r) => 时间数值(r[i]));
+  if (数.some((n) => n === null)) return 0;
+  let 升 = true, 降 = true;
+  for (let k = 1; k < 数.length; k++) {
+    if (数[k] < 数[k - 1]) 升 = false;
+    if (数[k] > 数[k - 1]) 降 = false;
+  }
+  return 升 ? 1 : 降 ? -1 : 0;
+}
+
+/* 推荐：{ 类型, 理由 }。**理由是一等公民** —— 界面把它显示出来，
+   用户才能拿它跟自己的预期对照（判错了看得见，才谈得上可证伪）。 */
+function 推荐图型(列, 行, 分) {
+  if (行.length < 3) {
+    return { 类型: "bar", 理由: "只有 " + 行.length + " 行 —— 柱状比折线看得清" };
+  }
+  const 有维 = 分.维度.length, 有量 = 分.度量.length;
+  if (有维 && 有量 && 像时间轴(列, 行, 分.维度[0])) {
+    const 序 = 时间有序(行, 分.维度[0]);
+    if (序 !== 0) {
+      return { 类型: "line", 理由: "横轴是时间（" + 行.length + " 个刻度，已按时间"
+        + (序 > 0 ? "升序" : "降序") + "）—— 趋势看得出来" };
+    }
+    return { 类型: "bar", 理由: "横轴像时间，但**刻度没有排序** —— "
+      + "折线会把月份连乱、凭空多出拐点，先用柱状看" };
+  }
+  return { 类型: "bar", 理由: "离散类目对比，不是时间序列 —— 折线会让人看出不存在的趋势" };
+}
+
+/* 图型选择 = **手动优先，自动兜底**。用户点过就以用户为准
+   （判断可以错，但不能把用户的纠正再改回去）。饼图不自动推：占比要判
+   「这几块构成一个整体」，判不准 —— 保留手动入口 + 置灰理由（见 饼图不行的理由）。 */
+function 选图型(列, 行, 分, 要) {
+  if (要 === "pie") return 饼图不行的理由(列, 行, 分) ? "" : "pie";
+  if (要 === "bar" || 要 === "line") return 要;
+  return 推荐图型(列, 行, 分).类型;
+}
+
+/* 图表配色：前 3 个取自页面主色（--accent / --ok / --err），后 2 个是序列补充色。
+   页面色板本来就是「复制而非共享」，这里又硬编码了一份 → 必须有东西盯着它，
+   否则改了主色、图还停在旧色上（探针第八节会回来对 [0] [1] [4]）。 */
+const 图表色 = ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#b42318"];
+const 轴色 = "#66748a", 格线色 = "#eef2f7", 轴线色 = "#e4e9f0";
+
+function 图表配置(列, 行, 分, 图型) {
+  const 维 = 分.维度[0];
+  const 类目 = 行.map((r) => (空值(r[维]) ? "—" : String(r[维])));
+  const 度量 = 分.度量.map((i) => ({ 名: 列[i], 值: 行.map((r) => (是数(r[i]) ? r[i] : null)) }));
+
+  if (图型 === "pie") {
+    const m = 度量[0];
+    return {
+      color: 图表色,
+      tooltip: { trigger: "item" },
+      series: [{
+        type: "pie", radius: ["44%", "70%"], center: ["50%", "52%"],
+        itemStyle: { borderColor: "#fff", borderWidth: 2 },
+        label: { color: 轴色, fontSize: 11 },
+        name: m.名,
+        data: 类目.map((n, i) => ({ name: n, value: m.值[i] })),
+      }],
+    };
+  }
+  return {
+    color: 图表色,
+    grid: { left: 6, right: 18, top: 度量.length > 1 ? 34 : 16, bottom: 4, containLabel: true },
+    tooltip: { trigger: "axis", axisPointer: { type: 图型 === "bar" ? "shadow" : "line" } },
+    legend: 度量.length > 1
+      ? { top: 0, right: 0, icon: "roundRect", itemWidth: 10, itemHeight: 10,
+          textStyle: { color: 轴色, fontSize: 12 } }
+      : undefined,
+    xAxis: {
+      type: "category", data: 类目,
+      axisLine: { lineStyle: { color: 轴线色 } },
+      axisTick: { show: false },
+      /* 类目名长或挤时斜排 —— 横排重叠比倾斜更难读 */
+      axisLabel: {
+        color: 轴色, fontSize: 11, hideOverlap: true,
+        rotate: (类目.some((c) => c.length > 4) || 类目.length > 8) ? 30 : 0,
+      },
+    },
+    yAxis: {
+      type: "value", axisLine: { show: false },
+      splitLine: { lineStyle: { color: 格线色 } },
+      axisLabel: { color: 轴色, fontSize: 11 },
+    },
+    series: 度量.map((m) => ({
+      name: m.名, type: 图型, data: m.值,
+      barMaxWidth: 44, smooth: 图型 === "line", symbolSize: 6,
+      lineStyle: 图型 === "line" ? { width: 2.2 } : undefined,
+      itemStyle: 图型 === "bar" ? { borderRadius: [4, 4, 0, 0] } : undefined,
+    })),
+    animationDuration: 320,
+  };
+}
+
+/* 实例挂在模块作用域：一次提问只该有一个图。不清掉旧的会在同一容器上重复 init，
+   ECharts 会告警，且旧实例仍在监听 resize —— 看起来只是「图有点怪」，实际在漏。 */
+let 图表实例 = null;
+let 当前图表 = null;                     // { 列, 行, 分 }
+
+function 销毁图表() {
+  if (图表实例 && !图表实例.isDisposed()) 图表实例.dispose();
+  图表实例 = null;
+  当前图表 = null;
+}
+
+function 画图(要) {
+  const 盒 = $("chart");
+  const 选 = (typeof echarts !== "undefined" && 当前图表)
+    ? 选图型(当前图表.列, 当前图表.行, 当前图表.分, 要) : "";
+  if (!盒 || !选) return "";
+  if (!图表实例) 图表实例 = echarts.init(盒);
+  图表实例.setOption(图表配置(当前图表.列, 当前图表.行, 当前图表.分, 选), true);
+  当前图表.用 = 选;
+  document.querySelectorAll(".chartbar button").forEach((b) => {
+    /* 桩环境里 dataset 可能缺 —— 缺了就当它不是当前图型，不炸 */
+    if (b.dataset) b.classList.toggle("on", b.dataset.kind === 选);
+  });
+  return 选;
+}
+
+/* 图型按钮是每次渲染动态生成的 → 在容器上委托。
+   逐个绑就得每次渲染重绑一遍，迟早漏一处，而且漏了不报错（点了没反应）。 */
+结果.addEventListener("click", (e) => {
+  const 节点 = e.target;
+  const 钮 = 节点 && 节点.closest ? 节点.closest(".chartbar button") : null;
+  if (!钮 || 钮.disabled || !当前图表) return;
+  画图(钮.dataset ? 钮.dataset.kind : "");
+});
+
+window.addEventListener("resize", () => {
+  if (图表实例 && !图表实例.isDisposed()) 图表实例.resize();
+});
+
+/* ---------- 评价（A-3）：数据飞轮的唯一入口 ---------- */
+/* 评价必须**带证据**（这一问的归一意图 + SQL + 类型）——
+   只记一句「不对」事后无法复现，也判断不了是模型错、语义层错还是题目本身有歧义。
+   会话 id 也一起带上：将来做多轮时，评价能定位到具体哪一轮。 */
+let 当前问句 = "";
+let 当前应答 = null;
+/* 会话 id（A-1）：一次浏览器会话里保持不变 —— 追问要能带着上下文回到服务端。
+   放在 localStorage 而不是内存：刷新页面不该把上下文丢掉（用户会连着问几句）。
+   但**必须给得出逃生口** —— 见下面的「新对话」按钮：切了话题还留着上文，
+   上一轮的指标会悄悄跟过来（传承是好事，悄悄传承是事故）。 */
+function 新会话id() {
+  return "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+let 当前会话 = (function () {
+  try {
+    const 旧 = localStorage.getItem("chatbi_会话");
+    if (旧) return 旧;
+    const 新 = 新会话id();
+    localStorage.setItem("chatbi_会话", 新);
+    return 新;
+  } catch (e) { return null; }
+})();
+
+/* 「新对话」：服务端清掉这个会话的上文，本地换一个新 id。
+   两件事都要做 —— 只换本地 id 的话服务端还留着一份（将来按 id 复用会串味）；
+   只清服务端的话本地 id 复用同一个键，下次照样能捞到旧轮次。 */
+async function 开新对话() {
+  const 旧 = 当前会话;
+  当前会话 = 新会话id();
+  try { localStorage.setItem("chatbi_会话", 当前会话); } catch (e) { /* 存不了也只是刷新后丢上下文 */ }
+  结果.innerHTML = "";
+  try {
+    await fetch(API + "/session", {
+      method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 会话: 旧 }),
+    });
+  } catch (e) { /* 清不掉不是错误：会话本身会自然过期 */ }
+  问题框.value = "";
+  问题框.focus();
+}
+
+async function 送反馈(卡, 评价, 纠正) {
+  const 条 = 卡 ? 卡.querySelector(".fb") : null;
+  const 提示 = 条 ? 条.querySelector(".done") : null;
+  const 应 = 当前应答 || {};
+  const 体 = {
+    问题: 当前问句, 评价: 评价, 纠正: 纠正 || "",
+    类型: 应.类型, 意图: 应.意图 || null, SQL: 应.SQL || null,
+    行数: 应.行数 != null ? 应.行数 : null,
+    会话: 当前会话,
+  };
+  try {
+    const r = await fetch(API + "/feedback", {
+      method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(体),
+    });
+    const 果 = await r.json();
+    if (!r.ok) throw new Error(果.error || ("HTTP " + r.status));
+    if (提示) { 提示.hidden = false; 提示.textContent = "已记录，谢谢 —— 它会进复核队列"; 提示.className = "done"; }
+    if (条) 条.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+    const 修 = 卡 ? 卡.querySelector(".fbfix") : null;
+    if (修) 修.hidden = true;
+  } catch (err) {
+    if (提示) { 提示.hidden = false; 提示.textContent = "没记上：" + err.message; 提示.className = "done bad-done"; }
+  }
+}
+
+/* 评价条上的点击在**容器上委托**（与图型按钮同一处置）：
+   逐个绑就要每次渲染重绑，迟早漏一处，而漏了不报错（点了没反应）。 */
+结果.addEventListener("click", (e) => {
+  const 钮 = e.target && e.target.closest ? e.target.closest("[data-fb]") : null;
+  if (!钮) return;
+  const 卡 = 钮.closest(".card");
+  if (!卡) return;
+  const 修 = 卡.querySelector(".fbfix");
+  const 动作 = 钮.dataset.fb;
+  if (动作 === "ok") { 送反馈(卡, "好评", ""); return; }
+  if (动作 === "bad") { if (修) { 修.hidden = false; const t = 修.querySelector("textarea"); if (t) t.focus(); } return; }
+  if (动作 === "cancel") { if (修) 修.hidden = true; return; }
+  if (动作 === "send") {
+    const t = 修 ? 修.querySelector("textarea") : null;
+    送反馈(卡, "差评", t ? t.value.trim() : "");
+  }
+});
+
+/* ---------- 提问 ---------- */
+async function 提问(问题) {
+  if (!问题) return;
+  /* 发问即清空输入框（与 8092 同一处置）：无论成功 / 失败 / 超时，框里都不残留；
+     问句本身已显示在结果卡的 q-line 里。 */
+  问题框.value = "";
+  问题框.style.height = "auto";
+  按钮.disabled = true;
+  销毁图表();
+  结果.innerHTML = "";
+  const 载入 = document.createElement("div");
+  载入.className = "card";
+  const 行 = document.createElement("div");
+  行.className = "loading";
+  const 转 = document.createElement("div");
+  转.className = "spinner";
+  行.appendChild(转);
+  行.appendChild(document.createTextNode("正在把问题转成查询意图…（首次请求含模型预热，可能稍慢）"));
+  载入.appendChild(行);
+  结果.appendChild(载入);
+
+  try {
+    const r = await fetch(API + "/ask", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 问题: 问题, 执行: !SQL开关.checked, 会话: 当前会话,
+                             角色: 角色框.value,
+                             令牌: 令牌框.value.trim() || null })
+    });
+    const 应 = await r.json();
+    if (!r.ok) throw new Error(应.error || 应.错误 || ("HTTP " + r.status));
+    /* 实认身份以**服务端**为准：前端的预告（下拉 / 令牌框）只是我们以为的，
+       401 或令牌过期时两边的说法会不一致 —— 不一致时不能靠前端自己说。 */
+    回填实际身份(应.身份);
+    结果.innerHTML = "";
+    渲染(问题, 应);
+  } catch (e) {
+    结果.innerHTML = "";
+    const 卡 = document.createElement("div");
+    卡.className = "card";
+    卡.innerHTML = '<p class="q-line"><b>' + esc(问题) + '</b></p>'
+      + '<div class="blockbox err"><div class="icon">⛔</div><div>'
+      + '<p class="bt">请求失败</p><p class="bd">' + esc(e.message)
+      + '<br>请确认服务在 127.0.0.1:8095（<code>python scripts/问数服务.py</code>），'
+      + '且生成端 8000 已在 APP 中启动。</p></div></div>';
+    结果.appendChild(卡);
+  } finally {
+    按钮.disabled = false;
+    问题框.focus();
+  }
+}
+
+/* ---------- 渲染结果 ---------- */
+function 渲染(问句, 应) {
+  const 头 = [];
+  /* 评价要评价的是「这一问」，所以把当前问句与应答留在模块作用域 ——
+     评价按钮的点击事件里读不到这两个值（事件在渲染之后才发生）。 */
+  当前问句 = 问句;
+  当前应答 = 应;
+  /* 图表要等节点真的挂进文档才能 init（ECharts 要量容器尺寸）——
+     所以这里只决定「要不要画、画什么」，真正的绘制推迟到 appendChild 之后。 */
+  let 待绘图表 = null;
+  头.push('<p class="q-line"><b>' + esc(问句) + '</b></p>');
+
+  /* ---- B-4：这一问是「以谁的身份」跑出来的 ----
+     ⚠️ 徽标必须区分「令牌验过」与「自称」：两者在界面上长得一样的话，
+        权限这件事就变成了「用户以为自己是谁」。 */
+  if (应.身份 && 应.身份.来源) {
+    const 验过 = 应.身份.来源 === "令牌";
+    头.push('<span class="idtag ' + (验过 ? "verified" : "claimed") + '" title="'
+      + esc("服务端实认：" + 应.身份.角色 + " ｜ 来源：" + 应.身份.来源
+            + (验过 ? "（签名校验通过）"
+                    : "（裸标签没有签名，只能当提示，不能当权限依据）"))
+      + '">' + (验过 ? "🔐 " : "👤 ") + esc(应.身份.角色)
+      + (验过 ? "" : " · 未验证") + '</span>');
+  }
+
+  /* ---- B-5：数据范围被限定了就明说 ----
+     不说的话，用户看到「操作员只有 1 个仓库」会以为**库里就只有这些数据**
+     （把权限的边界误读成数据的边界 —— 这是权限做对了反而更容易造成的误解）。 */
+  const 级 = 应.行级 || {};
+  if (级.受限 && (级.已遮蔽 || []).length) {
+    const 条 = 级.已遮蔽.map((x) => "<code>" + esc(x.表) + "." + esc(x.字段)
+      + "</code> ∈ " + esc((x.值 || []).join(" / ")));
+    头.push('<div class="note warn"><b>你只能看到这些行：</b>'
+      + 条.join("；")
+      + '<br>限定加在 <b>SQL 层</b>（临时视图遮蔽）—— 聚合、排名、总数都只算这些行，'
+      + '不是查完再筛。换「管理员」可看全量。</div>');
+  }
+
+  /* ---- B-3：摘掉了哪些列也要说 ----
+     隐藏列是**在服务端摘掉的**（既不进结果、也没喂给模型），
+     用户看不到它，但得知道「这里本来有几列」。 */
+  const 隐藏 = 应.隐藏列 || [];
+  if (隐藏.length) {
+    头.push('<div class="note warn"><b>敏感列已隐藏：</b>'
+      + 隐藏.map((x) => "<code>" + esc(x) + "</code>").join("、")
+      + '<br>这些列在服务端就被摘掉了（没进结果、也没喂给解读模型）；'
+      + '换更高权限的角色可看。</div>');
+  }
+
+  const 类型 = 应.类型;
+
+  if (类型 === "澄清") {
+    头.push('<span class="tag warn">需要你先说清楚</span>');
+    头.push('<div class="blockbox warn"><div class="icon">❓</div><div>'
+      + '<p class="bt">这个问法还有歧义</p>'
+      + '<p class="bd">' + 多行(应.澄清 || "") + '</p></div></div>');
+  } else if (类型 === "拒答") {
+    头.push('<span class="tag bad">超出范围</span>');
+    头.push('<div class="blockbox warn"><div class="icon">⚠</div><div>'
+      + '<p class="bt">这个问题超出本库范围了</p>'
+      + '<p class="bd">' + 多行(应.拒答 || "") + '</p></div></div>');
+    头.push('<p class="tagline">命中：「' + esc((应.命中词 || []).join("」「")) + '」'
+      + ((应.命中主题 || []).length ? ' ｜ 主题：' + esc((应.命中主题 || []).join("、")) : "")
+      + '</p>');
+  } else if (类型 === "元问题") {
+    头.push('<span class="tag ok">关于数据本身</span>');
+    头.push('<p class="answer">' + 多行(应.回答 || "") + '</p>');
+  } else if (类型 === "拒绝") {
+    头.push('<span class="tag bad">被护栏拒绝</span>');
+    头.push('<div class="blockbox err"><div class="icon">⛔</div><div>'
+      + '<p class="bt">这条语句被只读护栏拦下了</p>'
+      + '<p class="bd">' + 多行(应.拒绝 || "") + '</p></div></div>');
+  } else if (类型 === "错误") {
+    头.push('<div class="blockbox err"><div class="icon">⛔</div><div>'
+      + '<p class="bt">出错了</p>'
+      + '<p class="bd">' + 多行(应.错误 || "") + '</p></div></div>');
+  }
+  /* 数据题（`类型 === "SQL"`）**故意没有专门分支** —— 它的正文就是下面这段
+     「口径行 + 结果表」，走默认路径即可。给它加一个空分支反而会让人以为哪里被漏掉了。 */
+
+  /* ---- 口径说明：**永远放在结果上方**（定义里的「呈现」护栏）---- */
+  const 口径 = [];
+  if (应.口径) 口径.push('<b>口径</b> ' + esc(应.口径));
+  if (应.时间) 口径.push('<b>时间</b> ' + esc(应.时间));
+  if (应.单位) 口径.push('<b>单位</b> ' + esc(应.单位));
+  if (应.指标) 口径.push('<b>对象</b> ' + esc(应.指标));
+  if (口径.length) 头.push('<div class="spec">' + 口径.join("") + '</div>');
+
+  /* ---- 系统替你改了什么：诚实展示，不静默 ---- */
+  const 提示 = 应.提示 || [];
+  if (提示.length) {
+    头.push('<div class="note ok"><b>系统做了这些归一：</b><br>· ' + 提示.map(esc).join("<br>· ") + '</div>');
+  }
+  const 说明 = 应.说明 || [];
+  if (说明.length) {
+    头.push('<div class="note warn">' + 说明.map((x) => esc(x) + "").join("<br>") + '</div>');
+  }
+
+  /* ---- 会话承接（A-1）：这次追问沿用了上一轮的什么，**必须说出来** ----
+     静默继承与「用户没提这个条件」在结果里长得一模一样，而两者含义完全不同
+     （前者=限定在那个范围，后者=全区间）。所以承接要说，且说清楚沿用了几项。 */
+  const 会话信息 = 应.会话 || {};
+  if (会话信息.沿用说明) {
+    头.push('<div class="note ok 承接"><b>这是一次追问：</b><br>'
+      + esc(会话信息.沿用说明) + '</div>');
+  }
+
+  /* ---- 一句话解读（A-2）----
+     位置是刻意的：口径（怎么算的）→ 解读（所以呢）→ 图 → 表（自己抠数）。
+     没有解读时**不占位**；但若服务端说明了为什么没给（例如被防编造拦下），
+     就把它摊开 —— 「没给解读」和「解读被丢弃」在界面上不该长得一样。 */
+  if (应.解读) {
+    头.push('<p class="insight">' + esc(应.解读) + '</p>');
+  } else if (应.解读说明) {
+    头.push('<p class="meta"><span class="k">未给解读　</span>' + esc(应.解读说明) + '</p>');
+  }
+
+  /* ---- 图表：放在表**上方**（先看趋势，再抠明细）---- */
+  const 图行 = 应.行 || [];
+  if (应.列 && 应.列.length && 图行.length >= 2) {
+    const 分 = 分列(应.列, 图行);
+    /* 没有数值列（纯文本结果）或没有类目列（全是度量）→ 老老实实只出表。
+       硬画一张出来只会是张看不懂的图，比没有更糟。 */
+    if (分.度量.length && 分.维度.length) {
+      待绘图表 = { 列: 应.列, 行: 图行, 分, 用: "" };
+      const 理由 = 饼图不行的理由(应.列, 图行, 分);
+      /* B-1：默认图型来自**形态判断**，并且把判断理由摊在下面 ——
+         用户能拿它跟自己的预期对照。判错了看得见，才谈得上可证伪。 */
+      const 推 = 推荐图型(应.列, 图行, 分);
+      const 默认 = 推.类型;
+      const 画的是 = 分.度量.map((i) => esc(应.列[i])).join("、");
+      头.push('<div class="chartbox">'
+        + '<div class="chart" id="chart"></div>'
+        + '<div class="chartbar"><span class="lb">图型</span>'
+        + [["bar", "柱状"], ["line", "折线"], ["pie", "饼图"]].map(([k, 名]) => {
+            const 禁 = (k === "pie" && 理由) ? ' disabled title="' + esc(理由) + '"' : "";
+            const 提 = (k === 默认) ? esc("自动选中：" + 推.理由) : "";
+            return '<button type="button" data-kind="' + k + '"' + 禁
+              + (提 ? ' title="' + 提 + '"' : "")
+              + ' class="' + (k === 默认 ? "on" : "") + '">' + 名 + '</button>';
+          }).join("")
+        + '<span class="hint">' + 图行.length + ' 个类目 · 画的是「' + 画的是 + '」</span>'
+        + '</div>'
+        + '<div class="why"><span class="k">自动选图</span>' + esc(推.理由)
+        + '<span class="tip">判断只看值、不看列名；点上面的按钮可以改成别的</span></div>'
+        + '</div>');
+    }
+  }
+
+  /* ---- 结果表 ---- */
+  if (应.列 && 应.列.length) {
+    const 数据行 = 应.行 || [];
+    if (!数据行.length) {
+      头.push('<div class="note warn"><b>0 行结果</b>　条件可能筛空了 —— 可以放宽时间或去掉过滤再试。</div>');
+    } else {
+      let t = '<div class="tblwrap"><table><thead><tr>'
+        + 应.列.map((c) => '<th>' + esc(c) + '</th>').join("") + '</tr></thead><tbody>';
+      for (const r of 数据行) {
+        t += '<tr>' + r.map((v) => {
+          const 数 = typeof v === "number";
+          return '<td class="' + (数 ? "num" : "") + '">' + esc(v) + '</td>';
+        }).join("") + '</tr>';
+      }
+      t += '</tbody></table></div>';
+      头.push(t);
+      头.push('<p class="rowfoot">共 <b>' + 应.行数 + '</b> 行'
+        + (应.截断 ? '（已截断，条件可再收窄）' : '') + '</p>');
+    }
+  }
+
+  /* ---- 底层链路：意图 / SQL / 模型原文 / 护栏 / 元信息（折叠，随时可查）---- */
+  const 明细 = [];
+  if (应.意图) 明细.push('<details><summary>结构化意图（模型只负责到这一步）</summary><pre>'
+    + esc(JSON.stringify(应.意图, null, 2)) + '</pre></details>');
+  if (应.SQL) 明细.push('<details><summary>实际执行的 SQL（语义层确定性拼出）</summary><pre class="sql">'
+    + esc(应.SQL) + '</pre></details>');
+  if (应.模型原文) 明细.push('<details><summary>模型原始输出</summary><pre>'
+    + esc(应.模型原文) + '</pre></details>');
+  if (应.护栏) 明细.push('<details><summary>只读护栏（语句检查 / 结果上限）</summary><pre>'
+    + esc(JSON.stringify(应.护栏, null, 2)) + '</pre></details>');
+  if (应.元信息) 明细.push('<details><summary>元信息（拒答 / 元问题都不调模型，答案直接来自定义文件与库）</summary><pre>'
+    + esc(JSON.stringify(应.元信息, null, 2)) + '</pre></details>');
+  if (应.耗时) 明细.push('<p class="meta">' + 耗时文本(应.耗时)
+    + '<span><span class="k">总耗时 </span>' + (应.总耗时秒 != null ? 应.总耗时秒 : "?") + ' s</span></p>');
+  头.push(明细.join(""));
+
+  /* ---- 评价条（A-3）：放在**最底下** —— 不跟口径抢位置。
+     没有这一段，「用户觉得这次答得对不对」这个信号就永远收不到，
+     数据飞轮（把确认过的问法沉淀成 few-shot）也就没有入口。 ---- */
+  头.push('<div class="fb">'
+    + '<span class="lb">这条答得对不对？</span>'
+    + '<button type="button" data-fb="ok">👍 有用</button>'
+    + '<button type="button" data-fb="bad">👎 有问题</button>'
+    + '<span class="done" hidden></span>'
+    + '</div>'
+    + '<div class="fbfix" hidden>'
+    + '<textarea rows="2" placeholder="应该是什么？例如：我要看的是「按供应商类别分组」，不是按供应商"></textarea>'
+    + '<div class="row"><button type="button" class="go" data-fb="send">提交</button>'
+    + '<button type="button" data-fb="cancel">取消</button>'
+    + '<span class="hint">会连同结构意图与 SQL 一起留痕，供复核</span></div></div>');
+
+  const 卡 = document.createElement("div");
+  卡.className = "card";
+  卡.innerHTML = 头.join("");
+  结果.appendChild(卡);
+
+  /* 节点进了文档，容器才量得到尺寸 —— init 必须在这一步之后。 */
+  if (待绘图表) { 当前图表 = 待绘图表; 画图(); }
+}
+
+function 耗时文本(t) {
+  const 段 = [];
+  if (t.意图 != null) 段.push('<span><span class="k">意图解析 </span>' + t.意图 + ' s</span>');
+  if (t.查询 != null) 段.push('<span><span class="k">SQL 执行 </span>' + t.查询 + ' s</span>');
+  if (t.渲染 != null) 段.push('<span><span class="k">渲染 </span>' + t.渲染 + ' s</span>');
+  return 段.join("");
+}
+
+/* ---------- 交互绑定 ---------- */
+/* label 关联 input，点 label 会触发 input 的 change —— 只在这一个事件里同步外观类，
+   不在 label 上再绑一个 click（两处各写一遍 = 迟早不同步）。 */
+SQL开关.addEventListener("change", () => SQL开关盒.classList.toggle("on", SQL开关.checked));
+$("newsession").addEventListener("click", 开新对话);
+
+按钮.addEventListener("click", () => 提问(问题框.value.trim()));
+问题框.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); 提问(问题框.value.trim()); }
+});
+问题框.addEventListener("input", () => {
+  问题框.style.height = "auto";
+  问题框.style.height = Math.min(问题框.scrollHeight, 180) + "px";
+});
+
+/* ---------- B-4 身份行：初始化与绑定 ---------- */
+读存身份();
+刷新身份提示();
+角色框.addEventListener("change", () => { 刷新身份提示(); 存身份(); });
+令牌框.addEventListener("input", () => { 刷新身份提示(); 存身份(); });
+
+/* ---------- 就绪：目录（示例问题 + 可答范围）+ 健康 ---------- */
+(async function 就绪() {
+  let 目录 = null;
+  try {
+    const r = await fetch(API + "/catalog", { cache: "no-store" });
+    if (r.ok) 目录 = await r.json();
+  } catch (e) { /* 目录拿不到不影响提问 */ }
+
+  /* 徽标与页脚都要 health 体 —— 只取一次，顺着传下去，不各请求一遍。 */
+  const h = await 查健康();
+  问题框.focus();
+  if (!目录 || !h) return;
+
+  /* 示例 chips：A/B 档取 6 条（会正常作答）+ 2 条边界演示（一条拒答、一条元问题）。
+     放边界是因为「拒答」如果从没在界面上出现过一次，用户会以为系统坏了。 */
+  const 例 = (目录.示例问题 || []).filter((x) => x.档 === "B" || x.档 === "A").slice(0, 6);
+  const 边界 = ["数据准不准？", "上个月员工工资总额是多少？"];
+  const 网 = $("chips");
+  例.forEach((x) => {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.type = "button";
+    b.textContent = x.问题;
+    b.title = x.编号 + " · " + x.档 + " 档";
+    b.addEventListener("click", () => { 问题框.value = x.问题; 提问(x.问题); });
+    网.appendChild(b);
+  });
+  边界.forEach((q) => {
+    const b = document.createElement("button");
+    b.className = "chip dash";
+    b.type = "button";
+    b.textContent = q;
+    b.title = "边界演示";
+    b.addEventListener("click", () => { 问题框.value = q; 提问(q); });
+    网.appendChild(b);
+  });
+
+  /* 页脚：与 8092 的「依赖」行对称 —— 说明数据边界与口径的唯一来源 */
+  const 覆盖 = (目录.可答范围 && 目录.可答范围.覆盖) || [];
+  const 一句话 = (目录.可答范围 && 目录.可答范围.一句话) || "";
+  const 锚点 = (目录.数据源 && 目录.数据源.时间锚点) || "";
+  const 表行数 = h.表行数 || {};
+  const 行数 = Object.values(表行数).reduce((a, b) => a + b, 0);
+  const p1 = document.createElement("p");
+  p1.style.margin = "0";
+  p1.innerHTML = "数据：<code>制造业Demo.db</code>"
+    + " · " + Object.keys(表行数).length + " 表 " + 行数 + " 行"
+    + (锚点 ? " · 时间锚点 " + esc(锚点) : "")
+    + "　｜　口径唯一来源：<code>eval/指标口径定义-v1.0.yaml</code>";
+  const p2 = document.createElement("p");
+  p2.style.margin = "4px 0 0";
+  p2.textContent = 一句话 + (覆盖.length ? "　可答：" + 覆盖.join(" / ") : "");
+  const p3 = document.createElement("p");
+  p3.style.margin = "4px 0 0";
+  p3.innerHTML = "依赖：生成端 8000（模型只出意图，SQL 由语义层拼）　｜　"
+    + "只读三道锁：<code>mode=ro</code> · 语句白名单 · <code>query_only</code> + 超时";
+  底部.appendChild(p1); 底部.appendChild(p2); 底部.appendChild(p3);
+  const 权限区 = 渲染权限清单(目录);
+  if (权限区) 底部.appendChild(权限区);
+})();
+</script>
+</body>
+</html>

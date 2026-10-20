@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>知识库管理 · 新增文档与影子预检</title>
+<style>
+  :root{
+    --bg:#f4f6f9; --panel:#ffffff; --line:#e4e9f0; --text:#16202c; --muted:#66748a;
+    --accent:#1d4ed8; --accent-soft:#eef3ff;
+    --ok:#0f766e; --ok-soft:#e7f6f3;
+    --warn:#8a6100; --warn-soft:#fff8e6; --warn-line:#f0c14b;
+    --err:#b42318; --err-soft:#fef3f2; --err-line:#f3c3bf;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font:15px/1.7 "Microsoft YaHei","PingFang SC","Hiragino Sans GB",system-ui,-apple-system,"Segoe UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1020px;margin:0 auto;padding:0 20px 72px}
+  .hero{text-align:center;padding:48px 12px 24px}
+  .hero h1{font-size:34px;margin:0 0 10px;font-weight:700;letter-spacing:2px;color:#1c2431}
+  .hero .sub{margin:0;color:var(--muted);font-size:14.5px}
+  .hero .nav{margin-top:14px;font-size:13px}
+  .hero .nav a{color:var(--accent);text-decoration:none;border-bottom:1px solid #c9d6f0}
+  .badge{display:inline-flex;align-items:center;gap:7px;padding:6px 14px;border-radius:999px;
+    font-size:12.5px;background:#eef1f5;color:var(--muted);border:1px solid transparent;margin-top:16px}
+  .badge .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex:none}
+  .badge.ok{background:var(--ok-soft);color:var(--ok)}
+  .badge.bad{background:var(--err-soft);color:var(--err)}
+  .badge.warn{background:var(--warn-soft);color:var(--warn)}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:20px 22px;box-shadow:0 1px 2px rgba(20,30,50,.04);margin-top:16px}
+  .card h2{font-size:17px;margin:0 0 4px;font-weight:600}
+  .card .hint{color:var(--muted);font-size:13px;margin:0 0 14px}
+  .grid{display:flex;gap:26px;flex-wrap:wrap}
+  .stat{min-width:92px}
+  .stat b{display:block;font-size:22px;font-weight:700;line-height:1.3}
+  .stat span{color:var(--muted);font-size:12.5px}
+
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}
+  th{color:var(--muted);font-weight:500;background:#fbfcfe}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tr:last-child td{border-bottom:0}
+
+  .drop{border:1.5px dashed #c9d6f0;border-radius:12px;padding:26px;text-align:center;
+    color:var(--muted);background:#fbfcfe;transition:all .15s;cursor:pointer}
+  .drop.hot{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+  .drop b{color:var(--text)}
+  .tipes{font-size:12.5px;color:var(--muted);margin-top:8px}
+
+  .item{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-top:10px}
+  .item .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .item .name{font-weight:600;font-size:14px}
+  .fields{display:flex;gap:10px;flex-wrap:wrap;margin-top:9px}
+  .fields label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--muted)}
+  .fields input{border:1px solid var(--line);border-radius:7px;padding:5px 9px;font:13px inherit;
+    color:var(--text);background:#fff;min-width:170px}
+  .fields input:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+
+  .checks{margin-top:10px;border-top:1px dashed var(--line);padding-top:9px}
+  .chk{display:flex;gap:9px;font-size:13px;padding:3px 0;align-items:flex-start}
+  .chk .mk{flex:none;width:18px;text-align:center}
+  .chk .k{flex:none;width:88px;color:var(--muted)}
+  .chk.ok .mk{color:var(--ok)}
+  .chk.warn .mk{color:var(--warn)}
+  .chk.fail .mk{color:var(--err)}
+  .chk.skip .mk{color:#a9b3c2}
+  .chk.skip .t{color:#98a3b3}
+  .chk.fail .t{color:var(--err)}
+
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px}
+  .pill.ok{background:var(--ok-soft);color:var(--ok)}
+  .pill.warn{background:var(--warn-soft);color:var(--warn)}
+  .pill.fail{background:var(--err-soft);color:var(--err)}
+  .pill.skip{background:#eef1f5;color:var(--muted)}
+
+  .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}
+  button{font:14px inherit;border-radius:9px;padding:9px 18px;cursor:pointer;border:1px solid transparent;
+    transition:opacity .15s}
+  button.primary{background:var(--accent);color:#fff}
+  button.ghost{background:#fff;border-color:var(--line);color:var(--text)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button:not(:disabled):hover{opacity:.9}
+
+  .note{border-radius:10px;padding:11px 14px;font-size:13px;margin-top:12px}
+  .note.ok{background:var(--ok-soft);color:var(--ok)}
+  .note.warn{background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn-line)}
+  .note.fail{background:var(--err-soft);color:var(--err);border:1px solid var(--err-line)}
+  .note.info{background:var(--accent-soft);color:var(--accent)}
+  code{font:12.5px ui-monospace,Consolas,"Courier New",monospace;background:#f1f4f9;
+    padding:1px 5px;border-radius:5px;color:#324156}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid #c9d6f0;border-top-color:var(--accent);
+    border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>知识库管理</h1>
+    <p class="sub">新增语料 · 入库前影子预检 · 热重建（不用重启服务）</p>
+    <div class="nav"><a href="/">← 回到问答页</a></div>
+    <div class="badge" id="badge"><span class="dot"></span>正在读取服务状态…</div>
+  </div>
+
+  <div class="card">
+    <h2>现有语料</h2>
+    <p class="hint">统计口径与 <code>/health</code> 一致：<code>docs</code> / <code>blocks</code> 是唯一能区分新旧基座的字段。</p>
+    <div class="grid" id="stats"></div>
+    <div id="corpusBox" style="margin-top:16px"></div>
+  </div>
+
+  <div class="card">
+    <h2>新增文档</h2>
+    <p class="hint">
+      支持 <b>md / txt / csv / docx / xlsx / pdf</b>。流程是
+      <b>上传 → 影子预检 → 人工确认 → 入库并热重建</b>。
+      <br>刻意**不做「上传即入库」** —— 文号与标题层级是语义，自动猜必错，而猜错的后果是「检索悄悄变差」，界面上看不到任何异常。
+      <br>扫描件 PDF 无文本层，需先用 OCR 转出文字再入库。
+    </p>
+    <div class="drop" id="drop">
+      <b>把文件拖到这里，或点击选择</b><br>
+      <span style="font-size:13px">可多选。文件只发到本机 127.0.0.1 的服务，不出网。</span>
+    </div>
+    <input type="file" id="file" multiple style="display:none">
+    <div class="tipes" id="deps"></div>
+    <div id="items"></div>
+    <div class="bar">
+      <button class="primary" id="btnCheck" disabled>执行影子预检</button>
+      <button class="ghost" id="btnClear" disabled>清空</button>
+      <span id="checkTip" style="font-size:13px;color:var(--muted)"></span>
+    </div>
+  </div>
+
+  <div id="report"></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const 标记 = {ok:'✅', warn:'⚠️', fail:'🔴', skip:'—'};
+const 项名 = ['编码','标题','文号','留白冲突','库外引用','类2误判'];
+
+let 待入库 = [];        // {原始名, 名, b64, 文本, 文号, 标题, 原标题}
+let 当前报告 = null;
+let 依赖 = {};
+
+function b64编码(文本){
+  const 字节 = new TextEncoder().encode(文本);
+  let s = '';
+  for (const b of 字节) s += String.fromCharCode(b);
+  return btoa(s);
+}
+function 字节到B64(buf){
+  const 字节 = new Uint8Array(buf);
+  let s = '';
+  const 块 = 0x8000;
+  for (let i=0;i<字节.length;i+=块) s += String.fromCharCode.apply(null, 字节.subarray(i,i+块));
+  return btoa(s);
+}
+function 首标题(文本){
+  const m = (文本||'').match(/^#\s+(.*)$/m);
+  return m ? m[1].trim() : '';
+}
+function 现文号(文本){
+  const m = (文本||'').match(/\|\s*\*\*[^*\n]{0,8}编号\*\*\s*\|\s*([^|]+)\|/);
+  return m ? m[1].trim() : '';
+}
+function 从文件名猜(名){
+  const 干 = 名.replace(/\.[^.]+$/,'');
+  const m = 干.match(/([A-Z]{2,6}(?:-[A-Z]{2,6}){0,2}-[A-Za-z0-9\-]*\d[A-Za-z0-9\-]*)$/);
+  return m ? m[1] : '';
+}
+// 把用户填的 文号/标题 写回 Markdown —— 只改这两处，不动正文
+function 重写正文(项){
+  if (项.文本 === null) return null;          // 二进制格式交给服务端转换
+  let 文本 = 项.文本;
+  const 标题 = (项.标题||'').trim();
+  if (标题) 文本 = 文本.replace(/^#\s+.*$/m, '# ' + 标题);
+  const 号 = (项.文号||'').trim();
+  if (号){
+    if (/\|\s*\*\*[^*\n]{0,8}编号\*\*\s*\|/.test(文本)){
+      文本 = 文本.replace(/(\|\s*\*\*[^*\n]{0,8}编号\*\*\s*\|\s*)([^|]*)(\|)/, '$1 ' + 号 + ' $3');
+    } else {
+      const m = 文本.match(/^#\s+.*$/m);
+      const 表 = '\n\n| 项目 | 内容 |\n|---|---|\n| **文件编号** | ' + 号 + ' |';
+      if (m) 文本 = 文本.replace(m[0], m[0] + 表);
+      else 文本 = '# ' + (标题 || 项.原始名.replace(/\.[^.]+$/,'')) + 表 + '\n\n' + 文本;
+    }
+  }
+  return 文本;
+}
+function 载荷(项){
+  const 文本 = 重写正文(项);
+  return {名: 项.名, 内容: 文本 === null ? 项.b64 : b64编码(文本)};
+}
+
+async function 取清单(){
+  try{
+    const r = await fetch('/corpus/list');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    依赖 = d.可选依赖 || {};
+    渲染清单(d);
+    const 缺 = Object.entries(依赖).filter(([,v])=>!v).map(([k])=>k);
+    $('deps').innerHTML = '本机格式转换依赖：' +
+      Object.entries(依赖).map(([k,v]) => (v?'✅ ':'❌ ') + k).join('　') +
+      (缺.length ? '　—— 缺 <code>' + 缺.join('、') + '</code> 时，对应格式的入库会失败（服务端会明说）' : '');
+    徽标('ok', '服务正常 · 文档 ' + d.文档数 + ' 份 / 块 ' + d.块数 + ' 个');
+  }catch(e){
+    徽标('bad', '服务读不到：' + e.message);
+  }
+}
+function 徽标(kind, 文本){
+  const b = $('badge');
+  b.className = 'badge ' + (kind||'');
+  b.innerHTML = '<span class="dot"></span>' + 文本;
+}
+function 渲染清单(d){
+  $('stats').innerHTML =
+      '<div class="stat"><b>' + d.文档数 + '</b><span>文档</span></div>' +
+      '<div class="stat"><b>' + d.块数 + '</b><span>检索块</span></div>' +
+      '<div class="stat"><b>' + (d.库内文号||[]).length + '</b><span>库内文号</span></div>' +
+      '<div class="stat"><b style="color:var(--warn)">' + (d.悬空引用||[]).length + '</b><span>悬空引用</span></div>';
+  let h = '<table><thead><tr><th>文件</th><th>文号</th><th class="num">字符</th><th class="num">块</th></tr></thead><tbody>';
+  for (const x of d.每份) h += '<tr><td>' + esc(x.文件) + '</td><td><code>' + esc(x.文号) + '</code></td><td class="num">' + x.字符 + '</td><td class="num">' + x.块数 + '</td></tr>';
+  h += '</tbody></table>';
+  if ((d.悬空引用||[]).length){
+    h += '<div class="note warn"><b>悬空引用（被库内文档提到、但不在库里）：</b>' +
+         (d.悬空引用||[]).map(x=>'<code>'+esc(x)+'</code>').join('　') +
+         '<br>这些是「库外拒答题」的靶子。<b>不要为了补齐它们而入库</b> —— 补上就把 O03 / O03b 这类拒答题废掉了。</div>';
+  }
+  $('corpusBox').innerHTML = h;
+}
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function 渲染待入库(){
+  const box = $('items');
+  if (!待入库.length){ box.innerHTML = ''; $('btnCheck').disabled = true; $('btnClear').disabled = true; 提示(''); return; }
+  box.innerHTML = 待入库.map((x,i) => {
+    const 二进制 = x.文本 === null;
+    return '<div class="item">' +
+      '<div class="top"><span class="name">' + esc(x.原始名) + '</span>' +
+      '<span class="pill skip">' + (二进制 ? '需服务端转换' : 'Markdown / 纯文本') + '</span></div>' +
+      '<div class="fields">' +
+        '<label>入库文件名<input data-i="'+i+'" data-f="名" value="'+esc(x.名)+'"></label>' +
+        '<label>文号<input data-i="'+i+'" data-f="文号" placeholder="如 QW-SB-02" value="'+esc(x.文号)+'"></label>' +
+        '<label>文档标题<input data-i="'+i+'" data-f="标题" value="'+esc(x.标题)+'"></label>' +
+      '</div>' +
+      (二进制 ? '<div class="tipes">这个格式由服务端转换，<b>文号只能从文件名推</b> —— 请把文号写进上面的文件名里。</div>' : '') +
+      '</div>';
+  }).join('');
+  box.querySelectorAll('input').forEach(inp => {
+    inp.addEventListener('input', e => {
+      const i = +e.target.dataset.i, f = e.target.dataset.f;
+      待入库[i][f] = e.target.value;
+      当前报告 = null; 提示('改动后需要重新预检');
+      $('report').innerHTML = '';
+    });
+  });
+  $('btnCheck').disabled = false; $('btnClear').disabled = false;
+  $('checkTip').textContent = 待入库.length + ' 个文件待预检';
+}
+function 提示(t){ $('checkTip').textContent = t || ''; }
+
+$('drop').addEventListener('click', () => $('file').click());
+$('file').addEventListener('change', e => { 收文件(e.target.files); e.target.value=''; });
+['dragenter','dragover'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.add('hot'); }));
+['dragleave','drop'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.remove('hot'); }));
+$('drop').addEventListener('drop', e => 收文件(e.dataTransfer.files));
+
+async function 收文件(列表){
+  const 允许 = ['md','markdown','txt','csv','docx','xlsx','pdf'];
+  for (const f of 列表){
+    const 扩 = (f.name.split('.').pop()||'').toLowerCase();
+    if (!允许.includes(扩)){ alert('不支持的格式：' + f.name); continue; }
+    const buf = await f.arrayBuffer();
+    const b64 = 字节到B64(buf);
+    let 文本 = null;
+    if (扩 === 'md' || 扩 === 'markdown' || 扩 === 'txt' || 扩 === 'csv'){
+      try { 文本 = new TextDecoder('utf-8', {fatal:true}).decode(buf); }
+      catch(e) { 文本 = null; }        // 非 UTF-8：把原文交给服务端，让它如实报错
+    }
+    待入库.push({
+      原始名: f.name, 名: f.name, b64, 文本,
+      文号: 文本 ? 现文号(文本) || 从文件名猜(f.name) : '',
+      标题: 文本 ? 首标题(文本) : '',
+    });
+  }
+  当前报告 = null; $('report').innerHTML = '';
+  渲染待入库();
+}
+
+$('btnClear').addEventListener('click', () => { 待入库 = []; 当前报告 = null; $('report').innerHTML=''; 渲染待入库(); });
+
+$('btnCheck').addEventListener('click', 执行预检);
+async function 执行预检(){
+  if (!待入库.length) return;
+  $('btnCheck').disabled = true;
+  提示('正在预检…');
+  $('report').innerHTML = '<div class="card"><span class="spin"></span> 影子预检中（复制现有语料、把候选放进去、重算一遍）…</div>';
+  try{
+    const r = await fetch('/corpus/check', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({文件: 待入库.map(载荷)})});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    当前报告 = d;
+    渲染报告(d);
+  }catch(e){
+    $('report').innerHTML = '<div class="card"><div class="note fail">预检失败：' + esc(e.message) + '</div></div>';
+  }finally{
+    $('btnCheck').disabled = false;
+    提示('改动后需要重新预检');
+  }
+}
+
+function 渲染报告(d){
+  let h = '<div class="card"><h2>预检报告</h2>';
+  h += '<p class="hint">影子口径：文档 ' + d.现状.文档数 + ' → ' + d.影子.文档数 +
+       '　块 ' + d.现状.块数 + ' → ' + d.影子.块数 + '</p>';
+  h += '<div class="grid">' +
+       '<div class="stat"><b>' + d.阻断项 + '</b><span>阻断项</span></div>' +
+       '<div class="stat"><b>' + d.警告项 + '</b><span>警告项</span></div>' +
+       '<div class="stat"><b>' + (d.新增悬空||[]).length + '</b><span>新增悬空</span></div>' +
+       '<div class="stat"><b>' + (d.消除悬空||[]).length + '</b><span>消除悬空</span></div></div>';
+
+  if ((d.消除悬空||[]).length){
+    h += '<div class="note warn"><b>被补上的原有留白文号：</b>' +
+         (d.消除悬空||[]).map(x=>'<code>'+esc(x)+'</code>').join('　') +
+         '<br>这些号原来「被库内文档引用、但不在库里」，正是库外拒答题的靶子。补上之后，' +
+         '对应的题会从「该拒答」变成「该答」—— <b>66 题 / 100 题的拒答率口径已变，必须重跑并记账</b>。</div>';
+  }
+  if ((d.新增悬空||[]).length){
+    h += '<div class="note info">本次引入的新库外引用：' +
+         (d.新增悬空||[]).map(x=>'<code>'+esc(x)+'</code>').join('　') +
+         '（会成为新的拒答靶子，属正常，但要显式记账）</div>';
+  }
+
+  for (const c of d.候选){
+    const 名 = c.名 || (c.候选||'').split(/[\\/]/).pop();
+    const 级别 = 计级(c.检查);
+    h += '<div class="item"><div class="top"><span class="name">' + esc(名) + '</span>' +
+         '<span class="pill ' + 级别 + '">' + ({ok:'通过',warn:'通过（有警告）',fail:'未通过',skip:'未检查'}[级别] || 级别) + '</span>' +
+         (c.字符 !== undefined ? '<span class="pill skip">' + c.字符 + ' 字 → ' + (c.块数 === null ? '—' : c.块数) + ' 块</span>' : '') +
+         '</div><div class="checks">';
+    for (const k of 项名){
+      const v = c.检查[k];
+      if (!v) continue;
+      h += '<div class="chk ' + v.级别 + '"><span class="mk">' + 标记[v.级别] + '</span>' +
+           '<span class="k">' + k + '</span><span class="t">' + esc(v.说明) + '</span></div>';
+    }
+    h += '</div></div>';
+  }
+  h += '<div class="bar"><button class="primary" id="btnPut"' + (d.通过 ? '' : ' disabled') + '>确认入库并热重建</button>' +
+       (d.通过 ? '' : '<span style="font-size:13px;color:var(--err)">有阻断项，先按上面的说明修好再入库</span>') +
+       '</div>';
+  h += '<div class="note info">入库 = 写进 <code>corpus/raw/</code> + 立刻重建基座（约 0.05 s，<b>不重启服务</b>）。' +
+       '生效判据是下面显示的 <code>docs</code> / <code>blocks</code> 变化，<b>不是</b> <code>status: ok</code>（旧基座也是 ok）。</div>';
+  h += '</div>';
+  $('report').innerHTML = h;
+  const b = $('btnPut');
+  if (b) b.addEventListener('click', 执行入库);
+}
+function 计级(检查){
+  let 有警告 = false;
+  for (const k of 项名){
+    const v = 检查[k]; if (!v) continue;
+    if (v.级别 === 'fail') return 'fail';
+    if (v.级别 === 'warn') 有警告 = true;
+  }
+  return 有警告 ? 'warn' : 'ok';
+}
+function esc2(s){ return s; }
+
+async function 执行入库(){
+  if (!待入库.length) return;
+  const b = $('btnPut'); if (b){ b.disabled = true; b.textContent = '入库中…'; }
+  try{
+    const r = await fetch('/corpus/add', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({文件: 待入库.map(载荷)})});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    if (!d.已入库){
+      $('report').insertAdjacentHTML('afterbegin',
+        '<div class="card"><div class="note fail">未入库：' + esc(d.原因) + '</div></div>');
+      if (b){ b.disabled = false; b.textContent = '确认入库并热重建'; }
+      return;
+    }
+    const 前后 = d.重建前.文档数 + ' 份 / ' + d.重建前.块数 + ' 块　→　' + d.重建后.文档数 + ' 份 / ' + d.重建后.块数 + ' 块';
+    $('report').insertAdjacentHTML('afterbegin',
+      '<div class="card"><h2>已入库</h2>' +
+      '<div class="note ok"><b>写入：</b>' + d.写入.map(x=>'<code>'+esc(x)+'</code>').join('　') +
+      '<br><b>热重建：</b>' + 前后 + '<br>' + esc(d.生效判据) + '</div>' +
+      '<div class="note warn">' + esc(d.提醒) + '</div></div>');
+    待入库 = []; 当前报告 = null;
+    渲染待入库(); $('report').querySelectorAll('#btnPut').forEach(x => x.remove());
+    await 取清单();
+  }catch(e){
+    $('report').insertAdjacentHTML('afterbegin',
+      '<div class="card"><div class="note fail">入库失败：' + esc(e.message) + '</div></div>');
+    if (b){ b.disabled = false; b.textContent = '确认入库并热重建'; }
+  }
+}
+
+取清单();
+</script>
+</body>
+</html>

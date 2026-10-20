@@ -1,0 +1,293 @@
+{
+  "生成时间": "2026-10-12 16:18:42",
+  "模型": "Spark-X2.5-4B-Q6_K",
+  "服务": "http://127.0.0.1:8000/v1/chat/completions",
+  "题集": "20题-摸底版",
+  "本次批次": {
+    "档": [
+      "C",
+      "D"
+    ],
+    "题数": 10,
+    "通过": 6
+  },
+  "累计": {
+    "题数": 20,
+    "通过": 9
+  },
+  "累计按档": {
+    "A": {
+      "题数": 5,
+      "通过": 3
+    },
+    "B": {
+      "题数": 5,
+      "通过": 0
+    },
+    "C": {
+      "题数": 5,
+      "通过": 1
+    },
+    "D": {
+      "题数": 5,
+      "通过": 5
+    }
+  },
+  "记录": [
+    {
+      "编号": "A01",
+      "档": "A",
+      "问题": "一共有多少家供应商？",
+      "标准SQL": "SELECT COUNT(*) AS 供应商数 FROM 供应商",
+      "输出": "```sql\nSELECT COUNT(*) AS 供应商数量 FROM 供应商;\n```",
+      "用时秒": 1.0,
+      "tokens": 17,
+      "生成SQL": "SELECT COUNT(*) AS 供应商数量 FROM 供应商;",
+      "实测行数": 1,
+      "基准行数": 1,
+      "结果": "通过",
+      "说明": "结果集与标准答案一致"
+    },
+    {
+      "编号": "A02",
+      "档": "A",
+      "问题": "有哪些物料类别？",
+      "标准SQL": "SELECT DISTINCT 物料类别 FROM 物料 ORDER BY 物料类别",
+      "输出": "```sql\nSELECT 物料类别 FROM 物料;\n```",
+      "用时秒": 0.8,
+      "tokens": 14,
+      "生成SQL": "SELECT 物料类别 FROM 物料;",
+      "实测行数": 30,
+      "基准行数": 12,
+      "结果": "失败",
+      "说明": "结果不符：行数 30 vs 12"
+    },
+    {
+      "编号": "A03",
+      "档": "A",
+      "问题": "2026 年 8 月总共抽检了多少件？",
+      "标准SQL": "SELECT SUM(抽检数量) AS 抽检合计 FROM 到料检验 WHERE substr(到料日期,1,7)='2026-08'",
+      "输出": "```sql\nSELECT SUM(抽检数量) AS 总抽检数量\nFROM 到料检验\nWHERE 到料日期 BETWEEN '2026-08-01' AND '2026-08-31';\n```",
+      "用时秒": 2.3,
+      "tokens": 57,
+      "生成SQL": "SELECT SUM(抽检数量) AS 总抽检数量\nFROM 到料检验\nWHERE 到料日期 BETWEEN '2026-08-01' AND '2026-08-31';",
+      "实测行数": 1,
+      "基准行数": 1,
+      "结果": "通过",
+      "说明": "结果集与标准答案一致"
+    },
+    {
+      "编号": "A04",
+      "档": "A",
+      "问题": "库存低于安全库存的物料有哪些？",
+      "标准SQL": "SELECT m.物料编码, m.物料名称, SUM(k.库存数量) AS 库存合计, m.安全库存 FROM 库存 k JOIN 物料 m ON m.物料编码=k.物料编码 GROUP BY m.物料编码, m.物料名称, m.安全库存 HAVING SUM(k.库存数量) < m.安全库存 ORDER BY m.物料编码",
+      "输出": "```sql\nSELECT 物料编码, 物料名称, 单位, 安全库存, 库存数量\nFROM 物料\nWHERE 库存数量 < 安全库存;\n```",
+      "用时秒": 1.7,
+      "tokens": 39,
+      "生成SQL": "SELECT 物料编码, 物料名称, 单位, 安全库存, 库存数量\nFROM 物料\nWHERE 库存数量 < 安全库存;",
+      "结果": "失败",
+      "说明": "Schema 错：no such column: 库存数量"
+    },
+    {
+      "编号": "A05",
+      "档": "A",
+      "问题": "各仓库的库存总量分别是多少？",
+      "标准SQL": "SELECT 仓库名称, SUM(库存数量) AS 库存总量 FROM 库存 GROUP BY 仓库名称 ORDER BY 库存总量 DESC",
+      "输出": "```sql\nSELECT 仓库名称, SUM(库存数量) AS 库存总量\nFROM 库存\nGROUP BY 仓库名称;\n```",
+      "用时秒": 1.5,
+      "tokens": 32,
+      "生成SQL": "SELECT 仓库名称, SUM(库存数量) AS 库存总量\nFROM 库存\nGROUP BY 仓库名称;",
+      "实测行数": 3,
+      "基准行数": 3,
+      "结果": "通过",
+      "说明": "结果集与标准答案一致"
+    },
+    {
+      "编号": "B06",
+      "档": "B",
+      "问题": "上月哪家供应商不良率最高？",
+      "标准SQL": "SELECT s.供应商名称, ROUND(SUM(i.不良数量)*100.0/NULLIF(SUM(i.抽检数量),0),2) AS 不良率 FROM 到料检验 i JOIN 供应商 s ON s.供应商编码=i.供应商编码 WHERE substr(i.到料日期,1,7)='2026-08' GROUP BY s.供应商名称 ORDER BY 不良率 DESC LIMIT 1",
+      "输出": "```sql\nSELECT 供应商编码, 供应商名称, SUM(不良数量) / SUM(抽检数量) AS 不良率\nFROM 到料检验\nJOIN 供应商 ON 到料检验.供应商编码 = 供应商.供应商编码\nWHERE 到料日期 BETWEEN '2026-05-01' AND '2026-05-31'\nGROUP BY 供应商编码, 供应商名称\nORDER BY 不良率 DESC\nLIMIT 1;\n```",
+      "用时秒": 4.2,
+      "tokens": 114,
+      "生成SQL": "SELECT 供应商编码, 供应商名称, SUM(不良数量) / SUM(抽检数量) AS 不良率\nFROM 到料检验\nJOIN 供应商 ON 到料检验.供应商编码 = 供应商.供应商编码\nWHERE 到料日期 BETWEEN '2026-05-01' AND '2026-05-31'\nGROUP BY 供应商编码, 供应商名称\nORDER BY 不良率 DESC\nLIMIT 1;",
+      "结果": "失败",
+      "说明": "语法错：ambiguous column name: 供应商编码"
+    },
+    {
+      "编号": "B07",
+      "档": "B",
+      "问题": "东莞精诚近 6 个月的不良率趋势？",
+      "标准SQL": "SELECT substr(i.到料日期,1,7) AS 月份, ROUND(SUM(i.不良数量)*100.0/NULLIF(SUM(i.抽检数量),0),2) AS 不良率 FROM 到料检验 i JOIN 供应商 s ON s.供应商编码=i.供应商编码 WHERE s.供应商名称 LIKE '%东莞精诚%' GROUP BY 月份 ORDER BY 月份",
+      "输出": "```sql\nSELECT \n    substr(到料日期, 1, 7) AS 到料月份,\n    COUNT(*) AS 检验单数,\n    SUM(不良数量) AS 不良数量合计,\n    CASE \n        WHEN SUM(抽检数量) = 0 THEN 0\n        ELSE SUM(不良数量) * 1.0 / SUM(抽检数量)\n    END AS 不良率\nFROM 到料检验\nJOIN 供应商 ON 到料检验.供应商编码 = 供应商.供应商编码\nJOIN 物料 ON 到料检验.物料编码 = 物料.物料编码\nWHERE 供应商.供应商名称 = '东莞精诚'\n  AND 到料日期 BETWEEN '2026-03-01' AND '2026-09-22'\nGROUP BY substr(到料日期, 1, 7)\nORDER BY substr(到料日期, 1, 7);\n```",
+      "用时秒": 7.7,
+      "tokens": 216,
+      "生成SQL": "SELECT \n    substr(到料日期, 1, 7) AS 到料月份,\n    COUNT(*) AS 检验单数,\n    SUM(不良数量) AS 不良数量合计,\n    CASE \n        WHEN SUM(抽检数量) = 0 THEN 0\n        ELSE SUM(不良数量) * 1.0 / SUM(抽检数量)\n    END AS 不良率\nFROM 到料检验\nJOIN 供应商 ON 到料检验.供应商编码 = 供应商.供应商编码\nJOIN 物料 ON 到料检验.物料编码 = 物料.物料编码\nWHERE 供应商.供应商名称 = '东莞精诚'\n  AND 到料日期 BETWEEN '2026-03-01' AND '2026-09-22'\nGROUP BY substr(到料日期, 1, 7)\nORDER BY substr(到料日期, 1, 7);",
+      "实测行数": 0,
+      "基准行数": 6,
+      "结果": "失败",
+      "说明": "结果不符：列数 4 vs 2"
+    },
+    {
+      "编号": "B08",
+      "档": "B",
+      "问题": "2026 年 8 月不良率排名前 5 的供应商？",
+      "标准SQL": "SELECT s.供应商名称, ROUND(SUM(i.不良数量)*100.0/NULLIF(SUM(i.抽检数量),0),2) AS 不良率 FROM 到料检验 i JOIN 供应商 s ON s.供应商编码=i.供应商编码 WHERE substr(i.到料日期,1,7)='2026-08' GROUP BY s.供应商名称 ORDER BY 不良率 DESC LIMIT 5",
+      "输出": "```sql\nSELECT 供应商编码, 供应商名称, \n       SUM(CASE WHEN 检验判定 = '不良' THEN 1 ELSE 0 END) * 1.0 / SUM(抽检数量) AS 不良率\nFROM 到料检验\nJOIN 供应商 ON 到料检验.供应商编码 = 供应商.供应商编码\nWHERE 到料日期 BETWEEN '2026-08-01' AND '2026-08-31'\nGROUP BY 供应商编码, 供应商名称\nORDER BY 不良率 DESC\nLIMIT 5;\n```",
+      "用时秒": 5.0,
+      "tokens": 136,
+      "生成SQL": "SELECT 供应商编码, 供应商名称, \n       SUM(CASE WHEN 检验判定 = '不良' THEN 1 ELSE 0 END) * 1.0 / SUM(抽检数量) AS 不良率\nFROM 到料检验\nJOIN 供应商 ON 到料检验.供应商编码 = 供应商.供应商编码\nWHERE 到料日期 BETWEEN '2026-08-01' AND '2026-08-31'\nGROUP BY 供应商编码, 供应商名称\nORDER BY 不良率 DESC\nLIMIT 5;",
+      "结果": "失败",
+      "说明": "语法错：ambiguous column name: 供应商编码"
+    },
+    {
+      "编号": "B09",
+      "档": "B",
+      "问题": "宁波恒力精密铸造的准时交付率是多少？",
+      "标准SQL": "SELECT ROUND(SUM(CASE WHEN i.到料日期<=p.约定交期 THEN 1 ELSE 0 END)*100.0/COUNT(*),1) AS 准时率 FROM 采购订单 p JOIN 到料检验 i ON i.采购订单号=p.采购订单号 JOIN 供应商 s ON s.供应商编码=p.供应商编码 WHERE s.供应商名称 LIKE '%宁波恒力%'",
+      "输出": "```sql\nSELECT \n    COUNT(CASE WHEN p.约定交期 <= p.下单日期 THEN 1 END) * 1.0 / COUNT(*) AS 准时交付率\nFROM \n    采购订单 p\nJOIN \n    供应商 s ON p.供应商编码 = s.供应商编码\nWHERE \n    s.供应商名称 = '宁波恒力精密铸造';\n```",
+      "用时秒": 3.1,
+      "tokens": 77,
+      "生成SQL": "SELECT \n    COUNT(CASE WHEN p.约定交期 <= p.下单日期 THEN 1 END) * 1.0 / COUNT(*) AS 准时交付率\nFROM \n    采购订单 p\nJOIN \n    供应商 s ON p.供应商编码 = s.供应商编码\nWHERE \n    s.供应商名称 = '宁波恒力精密铸造';",
+      "实测行数": 1,
+      "基准行数": 1,
+      "结果": "失败",
+      "说明": "口径错（结构相同、数值不同）"
+    },
+    {
+      "编号": "B10",
+      "档": "B",
+      "问题": "各供应商的采购金额排名？",
+      "标准SQL": "SELECT s.供应商名称, ROUND(SUM(p.订单金额),2) AS 采购金额 FROM 采购订单 p JOIN 供应商 s ON s.供应商编码=p.供应商编码 GROUP BY s.供应商名称 ORDER BY 采购金额 DESC",
+      "输出": "```sql\nSELECT 供应商编码, 供应商名称, SUM(采购订单.订单金额) AS 采购金额, RANK() OVER (ORDER BY SUM(采购订单.订单金额) DESC) AS 采购金额排名\nFROM 采购订单\nJOIN 供应商 ON 采购订单.供应商编码 = 供应商.供应商编码\nGROUP BY 供应商编码, 供应商名称\nORDER BY 采购金额排名;\n```",
+      "用时秒": 3.6,
+      "tokens": 93,
+      "生成SQL": "SELECT 供应商编码, 供应商名称, SUM(采购订单.订单金额) AS 采购金额, RANK() OVER (ORDER BY SUM(采购订单.订单金额) DESC) AS 采购金额排名\nFROM 采购订单\nJOIN 供应商 ON 采购订单.供应商编码 = 供应商.供应商编码\nGROUP BY 供应商编码, 供应商名称\nORDER BY 采购金额排名;",
+      "结果": "失败",
+      "说明": "语法错：ambiguous column name: 供应商编码"
+    },
+    {
+      "编号": "C11",
+      "档": "C",
+      "问题": "2026 年 8 月，哪些物料的主要供应商不良率超过 5%？",
+      "标准SQL": "WITH 主供 AS (SELECT 物料编码, 供应商编码, ROW_NUMBER() OVER (PARTITION BY 物料编码 ORDER BY SUM(订单金额) DESC) AS 名次 FROM 采购订单 GROUP BY 物料编码, 供应商编码), 不良 AS (SELECT 供应商编码, SUM(不良数量)*100.0/NULLIF(SUM(抽检数量),0) AS 不良率 FROM 到料检验 WHERE substr(到料日期,1,7)='2026-08' GROUP BY 供应商编码) SELECT m.物料编码, m.物料名称, s.供应商名称, ROUND(b.不良率,2) AS 不良率 FROM 主供 z JOIN 物料 m ON m.物料编码=z.物料编码 JOIN 供应商 s ON s.供应商编码=z.供应商编码 JOIN 不良 b ON b.供应商编码=z.供应商编码 WHERE z.名次=1 AND b.不良率>5 ORDER BY m.物料编码",
+      "输出": "```sql\nSELECT DISTINCT m.物料编码, m.物料名称\nFROM 物料 m\nJOIN 采购订单 po ON m.物料编码 = po.物料编码\nJOIN 到料检验 d ON po.采购订单号 = d.采购订单号 AND m.物料编码 = d.物料编码\nJOIN 供应商 s ON po.供应商编码 = s.供应商编码\nWHERE d.到料日期 BETWEEN '2026-08-01' AND '2026-08-31'\n  AND s.供应商编码 IN (\n    SELECT 供应商编码\n    FROM 采购订单\n    WHERE 物料编码 = m.物料编码\n    GROUP BY 供应商编码\n    HAVING COUNT(DISTINCT 采购订单号) = (\n      SELECT COUNT(DISTINCT 采购订单号)\n      FROM 采购订单\n      WHERE 物料编码 = m.物料编码\n    )\n  )\n  AND (d.不良数量 * 1.0 / d.抽检数量) > 0.05\n```",
+      "用时秒": 8.4,
+      "tokens": 240,
+      "生成SQL": "SELECT DISTINCT m.物料编码, m.物料名称\nFROM 物料 m\nJOIN 采购订单 po ON m.物料编码 = po.物料编码\nJOIN 到料检验 d ON po.采购订单号 = d.采购订单号 AND m.物料编码 = d.物料编码\nJOIN 供应商 s ON po.供应商编码 = s.供应商编码\nWHERE d.到料日期 BETWEEN '2026-08-01' AND '2026-08-31'\n  AND s.供应商编码 IN (\n    SELECT 供应商编码\n    FROM 采购订单\n    WHERE 物料编码 = m.物料编码\n    GROUP BY 供应商编码\n    HAVING COUNT(DISTINCT 采购订单号) = (\n      SELECT COUNT(DISTINCT 采购订单号)\n      FROM 采购订单\n      WHERE 物料编码 = m.物料编码\n    )\n  )\n  AND (d.不良数量 * 1.0 / d.抽检数量) > 0.05",
+      "实测行数": 5,
+      "基准行数": 3,
+      "结果": "失败",
+      "说明": "结果不符：列数 2 vs 4"
+    },
+    {
+      "编号": "C12",
+      "档": "C",
+      "问题": "不良率最高的供应商主要供应哪些物料？",
+      "标准SQL": "WITH 最高 AS (SELECT i.供应商编码 FROM 到料检验 i WHERE substr(i.到料日期,1,7)='2026-08' GROUP BY i.供应商编码 ORDER BY SUM(i.不良数量)*100.0/NULLIF(SUM(i.抽检数量),0) DESC LIMIT 1) SELECT DISTINCT m.物料编码, m.物料名称, m.物料类别 FROM 最高 h JOIN 采购订单 p ON p.供应商编码=h.供应商编码 JOIN 物料 m ON m.物料编码=p.物料编码 ORDER BY m.物料编码",
+      "输出": "```sql\nSELECT \n    s.供应商编码, \n    s.供应商名称, \n    m.物料编码, \n    m.物料名称, \n    (t.不良数量 / t.抽检数量) AS 不良率\nFROM \n    供应商 s\nJOIN \n    采购订单 po ON s.供应商编码 = po.供应商编码\nJOIN \n    到料检验 t ON po.采购订单号 = t.采购订单号\nJOIN \n    物料 m ON po.物料编码 = m.物料编码\nWHERE \n    t.到料日期 BETWEEN '2026-04-01' AND '2026-09-22'\nORDER BY \n    不良率 DESC\nLIMIT 1;\n```",
+      "用时秒": 5.6,
+      "tokens": 155,
+      "生成SQL": "SELECT \n    s.供应商编码, \n    s.供应商名称, \n    m.物料编码, \n    m.物料名称, \n    (t.不良数量 / t.抽检数量) AS 不良率\nFROM \n    供应商 s\nJOIN \n    采购订单 po ON s.供应商编码 = po.供应商编码\nJOIN \n    到料检验 t ON po.采购订单号 = t.采购订单号\nJOIN \n    物料 m ON po.物料编码 = m.物料编码\nWHERE \n    t.到料日期 BETWEEN '2026-04-01' AND '2026-09-22'\nORDER BY \n    不良率 DESC\nLIMIT 1;",
+      "实测行数": 1,
+      "基准行数": 3,
+      "结果": "失败",
+      "说明": "结果不符：列数 5 vs 3"
+    },
+    {
+      "编号": "C13",
+      "档": "C",
+      "问题": "库存低于安全库存的物料，分别由哪家供应商供货？",
+      "标准SQL": "WITH 低库存 AS (SELECT m.物料编码 FROM 库存 k JOIN 物料 m ON m.物料编码=k.物料编码 GROUP BY m.物料编码 HAVING SUM(k.库存数量) < MAX(m.安全库存)) SELECT DISTINCT m.物料编码, m.物料名称, s.供应商名称 FROM 低库存 z JOIN 物料 m ON m.物料编码=z.物料编码 JOIN 采购订单 p ON p.物料编码=z.物料编码 JOIN 供应商 s ON s.供应商编码=p.供应商编码 ORDER BY m.物料编码, s.供应商名称",
+      "输出": "```sql\nSELECT DISTINCT p.供应商编码, p.供应商名称\nFROM 库存 i\nJOIN 物料 m ON i.物料编码 = m.物料编码\nJOIN 采购订单 po ON m.物料编码 = po.物料编码\nJOIN 供应商 p ON po.供应商编码 = p.供应商编码\nWHERE i.库存数量 < m.安全库存;\n```",
+      "用时秒": 3.4,
+      "tokens": 86,
+      "生成SQL": "SELECT DISTINCT p.供应商编码, p.供应商名称\nFROM 库存 i\nJOIN 物料 m ON i.物料编码 = m.物料编码\nJOIN 采购订单 po ON m.物料编码 = po.物料编码\nJOIN 供应商 p ON po.供应商编码 = p.供应商编码\nWHERE i.库存数量 < m.安全库存;",
+      "实测行数": 8,
+      "基准行数": 3,
+      "结果": "失败",
+      "说明": "结果不符：列数 2 vs 3"
+    },
+    {
+      "编号": "C14",
+      "档": "C",
+      "问题": "各物料类别的不良率对比？",
+      "标准SQL": "SELECT m.物料类别, ROUND(SUM(i.不良数量)*100.0/NULLIF(SUM(i.抽检数量),0),2) AS 不良率 FROM 到料检验 i JOIN 物料 m ON m.物料编码=i.物料编码 GROUP BY m.物料类别 ORDER BY 不良率 DESC",
+      "输出": "```sql\nSELECT \n    物料.物料类别, \n    ROUND(SUM(到料检验.不良数量) / SUM(到料检验.抽检数量) * 100, 2) AS 不良率\nFROM \n    物料\nJOIN \n    到料检验 ON 物料.物料编码 = 到料检验.物料编码\nGROUP BY \n    物料.物料类别\nORDER BY \n    不良率 DESC;\n```",
+      "用时秒": 3.6,
+      "tokens": 92,
+      "生成SQL": "SELECT \n    物料.物料类别, \n    ROUND(SUM(到料检验.不良数量) / SUM(到料检验.抽检数量) * 100, 2) AS 不良率\nFROM \n    物料\nJOIN \n    到料检验 ON 物料.物料编码 = 到料检验.物料编码\nGROUP BY \n    物料.物料类别\nORDER BY \n    不良率 DESC;",
+      "实测行数": 12,
+      "基准行数": 12,
+      "结果": "通过",
+      "说明": "结果集与标准答案一致"
+    },
+    {
+      "编号": "C15",
+      "档": "C",
+      "问题": "生产工单达成率最低的物料是哪个？",
+      "标准SQL": "SELECT m.物料编码, m.物料名称, ROUND(SUM(w.完工数量)*100.0/NULLIF(SUM(w.计划数量),0),1) AS 达成率 FROM 生产工单 w JOIN 物料 m ON m.物料编码=w.物料编码 GROUP BY m.物料编码, m.物料名称 ORDER BY 达成率 ASC LIMIT 1",
+      "输出": "```sql\nSELECT 物料编码, 物料名称, \n       SUM(完工数量) / SUM(计划数量) AS 达成率\nFROM 生产工单\nGROUP BY 物料编码, 物料名称\nORDER BY 达成率 ASC\nLIMIT 1;\n```",
+      "用时秒": 2.6,
+      "tokens": 62,
+      "生成SQL": "SELECT 物料编码, 物料名称, \n       SUM(完工数量) / SUM(计划数量) AS 达成率\nFROM 生产工单\nGROUP BY 物料编码, 物料名称\nORDER BY 达成率 ASC\nLIMIT 1;",
+      "结果": "失败",
+      "说明": "Schema 错：no such column: 物料名称"
+    },
+    {
+      "编号": "D16",
+      "档": "D",
+      "问题": "这个月怎么样？",
+      "标准SQL": null,
+      "输出": "抱歉，您的问题“这个月怎么样？”信息过于模糊，无法确定具体的查询方向，需要您补充更详细的信息，例如需要查询的维度（如供应商、物料、订单状态等）、时间范围（“这个月”具体指哪个月）等。",
+      "用时秒": 2.4,
+      "tokens": 55,
+      "结果": "通过",
+      "说明": "正确反问 / 说明，未硬答"
+    },
+    {
+      "编号": "D17",
+      "档": "D",
+      "问题": "帮我看看有没有问题",
+      "标准SQL": null,
+      "输出": "抱歉，您提出的问题“帮我看看有没有问题”表述过于模糊，缺少具体的查询方向或条件，无法确定具体的查询内容。请您补充需要排查的具体问题，例如：\n- 是否存在未准入的供应商？\n- 是否存在到料检验不合格的订单？\n- 是否存在库存不足的物料？\n- 是否存在未完工的生产工单？\n等等，以便我为您生成对应的 SQL 查询语句。",
+      "用时秒": 3.6,
+      "tokens": 90,
+      "结果": "通过",
+      "说明": "正确反问 / 说明，未硬答"
+    },
+    {
+      "编号": "D18",
+      "档": "D",
+      "问题": "为什么会这样？",
+      "标准SQL": null,
+      "输出": "抱歉，您提出的问题“为什么会这样？”缺乏具体的业务背景、数据或需要分析的具体情况，无法确定查询方向，请您补充相关信息，例如需要分析的具体指标、涉及的业务场景或数据条件等。",
+      "用时秒": 2.0,
+      "tokens": 45,
+      "结果": "通过",
+      "说明": "正确反问 / 说明，未硬答"
+    },
+    {
+      "编号": "D19",
+      "档": "D",
+      "问题": "那家供应商还行吗",
+      "标准SQL": null,
+      "输出": "无法确定您想查询的“那家供应商”具体是哪家，请补充供应商编码或供应商名称，以便为您生成对应的查询 SQL。",
+      "用时秒": 1.4,
+      "tokens": 31,
+      "结果": "通过",
+      "说明": "正确反问 / 说明，未硬答"
+    },
+    {
+      "编号": "D20",
+      "档": "D",
+      "问题": "数据准不准？",
+      "标准SQL": null,
+      "输出": "无法判断数据是否准确，需要补充具体的校验规则或数据校验需求，例如需要校验哪些字段、按照什么标准进行核对等，请补充相关信息。",
+      "用时秒": 1.6,
+      "tokens": 34,
+      "结果": "通过",
+      "说明": "正确反问 / 说明，未硬答"
+    }
+  ]
+}

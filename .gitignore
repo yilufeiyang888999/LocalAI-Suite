@@ -33,5 +33,18 @@ sha256.txt
 规划器输出.txt
 规划器-*.txt
 
-# 仓库根目录的临时截图（正式留档请放 30天学习计划/资产-本地模型部署/）
+# 仓库根目录的临时截图
 /*.png
+
+# 两个 Python 作品的运行产物（模型权重不进仓库，按各自 README 下载）
+RAG-Embedding/models/
+RAG-Embedding/logs/
+RAG-Embedding/index/
+ChatBI/logs/
+__pycache__/
+*.pyc
+.venv/
+
+# 评测/实验的控制台输出（含本机路径，属过程产物）
+*.log
+*.log.*

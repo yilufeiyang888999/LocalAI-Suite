@@ -163,5 +163,5 @@ finally {
     Write-Host ("  " + $backup)
     Write-Host ""
     Write-Host "四条里只要有一条「服务照样起来了 / 日志里毫无报错」，就是静默放过，算不通过。" -ForegroundColor Yellow
-    Write-Host "把上面整段输出贴给小李判读。" -ForegroundColor Yellow
+    Write-Host "把上面整段输出贴回问题单。" -ForegroundColor Yellow
 }
