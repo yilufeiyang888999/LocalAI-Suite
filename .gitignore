@@ -22,6 +22,12 @@ localai-signing-key.json
 .localai-signing/
 private/
 
+# 本机凭据（数据库密码等，绝不提交）
+.local-*
+*凭据*.txt
+*凭据*.json
+**/.local-*
+
 # Claude Code 本地目录
 .claude/
 
