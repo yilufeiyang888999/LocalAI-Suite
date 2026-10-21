@@ -1,9 +1,5 @@
 # Syteline 接入工作区
 
-> 📌 **本目录是发布镜像。** 实际工作区在 `D:\Ivan-File\7-AI-Code\ChatBI\scripts\接入-Syteline\`
-> （那里有 `out/` 产出和本机凭据）。改代码改工作区那份再同步过来，别直接在这里改 ——
-> 否则两边分叉，明天在哪个目录跑就成了随机数。
-
 把 ChatBI 的问数能力从「演示库」接到真 Syteline 库上的工作目录。
 
 ## 这里放什么
@@ -28,7 +24,7 @@ ChatBI 主服务是「零第三方依赖，只用标准库 + sqlite3」。**本�
 
 将来真要把 SQL Server 接进服务（阶段 3），再统一决定依赖边界，别在摸表阶段就动摇主架构。
 
-## 三步跑通
+## 从零到摸完（5 步）
 
 **用 ChatBI 主服务那一个解释器**（`Python314`），不要另起一个 —— 「装在这边、跑在那边」
 是这个项目里已经踩过的坑，两套 Python 只会让排查多一层。
@@ -39,7 +35,8 @@ P="C:/Users/Ivan/AppData/Local/Programs/Python/Python314/python.exe"
 "$P" -m pip install pyodbc
 
 # 1. 不知道库名 —— 先列库（默认连 master）
-set SYTELINE_PWD=你的密码
+#    密码走环境变量（Git Bash 用 export，cmd 用 set），或运行后交互输入
+export SYTELINE_PWD=你的密码
 "$P" 摸表-Syteline.py --主机 <虚机IP> --用户 sa
 
 # 2. 选定库再摸（用只读账号，别用 sa）
